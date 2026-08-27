@@ -330,7 +330,8 @@ impl Worker {
             all_dismissed_concerns: Vec::new(),
             deduplicated_concerns: Vec::new(),
             deduplicated_dismissed_concerns: Vec::new(),
-            conflict_resolved_concerns: Vec::new(),
+            patch_concerns: Vec::new(),
+            concerns: Vec::new(),
             findings: Vec::new(),
             review_inline: String::new(),
             fixes: String::new(),
@@ -422,6 +423,7 @@ impl Worker {
         let final_output = json!({
             "findings": state.findings,
             "dismissed_concerns": dismissed_concerns,
+            "concerns": state.concerns,
             "review_inline": review_inline,
             "fixes": state.fixes,
             "concerns_count": concerns_count,

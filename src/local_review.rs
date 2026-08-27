@@ -689,6 +689,26 @@ async fn review_single_patch(
     Err(last_error.unwrap_or_else(|| anyhow!("Patch review failed")))
 }
 
+/// Assembles the combined review payload for a local review.
+///
+/// Pre-existing concerns are intentionally absent. Local review has no
+/// database and therefore cannot run the standalone Linux bug pipeline that
+/// verifies and deduplicates them, so the raw candidates are dropped rather
+/// than reported unverified. Only their count is carried, for benchmarking.
+fn build_review_output(
+    findings: Vec<Value>,
+    dismissed_concerns: Vec<Value>,
+    concerns_count: u64,
+    dismissed_concerns_count: u64,
+) -> Value {
+    json!({
+        "findings": findings,
+        "dismissed_concerns": dismissed_concerns,
+        "concerns_count": concerns_count,
+        "dismissed_concerns_count": dismissed_concerns_count
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_worker_in_worktree(
     worktree: &GitWorktree,
@@ -952,6 +972,14 @@ async fn run_worker_in_worktree(
             if let Some(dismissed) = review.get("dismissed_concerns").and_then(|v| v.as_array()) {
                 combined_dismissed_concerns.extend(dismissed.clone());
             }
+            // Pre-existing concerns are deliberately dropped here. Stage 9 of
+            // the shared workflow splits them out of patch_concerns, and the
+            // server hands each one to the standalone Linux bug pipeline for
+            // verification, deduplication and reporting. That pipeline needs a
+            // database, which local review does not have, so surfacing the
+            // raw candidates would report unverified findings that the
+            // pipeline's verification stage exists to reject.
+
             if let Some(cc) = review.get("concerns_count").and_then(|v| v.as_u64()) {
                 total_concerns_count += cc;
             }
@@ -995,12 +1023,12 @@ async fn run_worker_in_worktree(
         total_tokens_cached += res["tokens_cached"].as_u64().unwrap_or(0);
     }
 
-    let review_output = json!({
-        "findings": combined_findings,
-        "dismissed_concerns": combined_dismissed_concerns,
-        "concerns_count": total_concerns_count,
-        "dismissed_concerns_count": total_dismissed_concerns_count
-    });
+    let review_output = build_review_output(
+        combined_findings,
+        combined_dismissed_concerns,
+        total_concerns_count,
+        total_dismissed_concerns_count,
+    );
 
     let combined_result = json!({
         "patchset_id": patchset_id,
@@ -1810,5 +1838,18 @@ mod tests {
             combined_multi
                 .contains("--- Patch [2]: [PATCH 2/2] test second ---\nComment on patch 2")
         );
+    }
+
+    #[test]
+    fn test_local_review_output_drops_preexisting_concerns() {
+        let output = build_review_output(vec![json!({"problem": "new regression"})], vec![], 3, 0);
+
+        // Pre-existing candidates must not reach local output: they are only
+        // meaningful after the Linux bug pipeline verifies them, and local
+        // review cannot run it.
+        assert!(output.get("concerns").is_none());
+        // The count is still reported so benchmarks can track pipeline volume.
+        assert_eq!(output["concerns_count"], 3);
+        assert_eq!(output["findings"].as_array().unwrap().len(), 1);
     }
 }
