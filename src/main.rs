@@ -1059,7 +1059,7 @@ struct ProgressState {
 /// Display label for a stage. Held in the stage tables so that adding a stage
 /// needs no edit here.
 fn stage_short_name(stage: &str) -> &'static str {
-    sashiko::worker::kernel_workflow::stage_short_label(stage).unwrap_or("Unknown")
+    sashiko::workflows::linux_patch_review::stage_short_label(stage).unwrap_or("Unknown")
 }
 
 struct TruncatingWriter {
@@ -1219,8 +1219,8 @@ fn render_progress(state: &mut ProgressState) {
                     // Nothing resolved yet: assume every stage will run, which
                     // is what the fan-out settles on when the planner is not
                     // narrowing it.
-                    sashiko::worker::kernel_workflow::ANALYSIS_STAGES.len()
-                        + sashiko::worker::kernel_workflow::CONSOLIDATION_STAGES.len()
+                    sashiko::workflows::linux_patch_review::ANALYSIS_STAGES.len()
+                        + sashiko::workflows::linux_patch_review::CONSOLIDATION_STAGES.len()
                 } else {
                     p.planned_stages.len()
                 }

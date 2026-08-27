@@ -47,10 +47,10 @@ impl ClassifyAiError for ReviewError {
     }
 }
 
-use crate::worker::kernel_workflow::{
-    KernelReviewState, build_kernel_review_workflow_with_options, kernel_system_prompt,
-};
 use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
+use crate::workflows::linux_patch_review::{
+    LinuxPatchReviewState, build_linux_patch_review_workflow_with_options, linux_system_prompt,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -311,7 +311,7 @@ impl Worker {
             &target_commit_sha,
         );
 
-        let mut state = KernelReviewState {
+        let mut state = LinuxPatchReviewState {
             ps_id,
             p_id,
             target_commit_sha,
@@ -337,7 +337,7 @@ impl Worker {
         };
 
         if self.global_history.is_empty() {
-            let sys_template = kernel_system_prompt(true);
+            let sys_template = linux_system_prompt(true);
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
                 role: crate::ai::AiRole::System,
@@ -350,7 +350,7 @@ impl Worker {
         }
 
         let workflow =
-            build_kernel_review_workflow_with_options(self.max_interactions, self.temperature);
+            build_linux_patch_review_workflow_with_options(self.max_interactions, self.temperature);
         let env = WorkflowEnv {
             provider: self.provider.clone(),
             tools: self.tools.clone(),
@@ -449,7 +449,7 @@ impl Worker {
 /// A stage counted in the total has to report finishing, or the bar stops
 /// short of the work it did.
 fn is_counted_stage(name: &str) -> bool {
-    crate::worker::kernel_workflow::stage_short_label(name).is_some()
+    crate::workflows::linux_patch_review::stage_short_label(name).is_some()
 }
 
 /// The stages a review will run: the analysis stages the fan-out resolved, then
@@ -458,12 +458,12 @@ fn is_counted_stage(name: &str) -> bool {
 fn planned_stages_from(stage_names: &[&'static str]) -> Vec<String> {
     let mut planned: Vec<String> = stage_names
         .iter()
-        .filter(|n| crate::worker::kernel_workflow::analysis_stage_by_name(n).is_some())
+        .filter(|n| crate::workflows::linux_patch_review::analysis_stage_by_name(n).is_some())
         .map(|n| n.to_string())
         .collect();
     if !planned.is_empty() {
         planned.extend(
-            crate::worker::kernel_workflow::CONSOLIDATION_STAGES
+            crate::workflows::linux_patch_review::CONSOLIDATION_STAGES
                 .iter()
                 .map(|s| s.name.to_string()),
         );
