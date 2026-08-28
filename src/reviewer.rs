@@ -2571,7 +2571,7 @@ impl Reviewer {
                                 "- [{}] {}: https://sashiko.dev/bug/{}\n",
                                 bug.severity.as_str(),
                                 bug.problem.trim(),
-                                bug.slug
+                                bug.bugid
                             ));
                         }
                     } else if !new_findings.is_empty() {
@@ -2588,7 +2588,7 @@ impl Reviewer {
                                 "- [{}] {}: https://sashiko.dev/bug/{}\n",
                                 bug.severity.as_str(),
                                 bug.problem.trim(),
-                                bug.slug
+                                bug.bugid
                             ));
                         }
                     }
@@ -3632,7 +3632,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .create_bug(&crate::db::NewBug {
                 verified_on_sha: None,
                 status: "raw".to_string(),
-                slug: "pb-deadbeef".to_string(),
+                bugid: "linux-deadbeef".to_string(),
                 problem: " High UAF in cleanup".to_string(),
                 severity: Severity::High,
                 severity_explanation: Some("Reasoning".to_string()),
@@ -3701,7 +3701,7 @@ New issues:
 - [Low] New Low issue
 
 Pre-existing issues:
-- [High] High UAF in cleanup: https://sashiko.dev/bug/pb-deadbeef
+- [High] High UAF in cleanup: https://sashiko.dev/bug/linux-deadbeef
 --
 
 inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchset/msg_id_1?part=4";
