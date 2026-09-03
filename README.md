@@ -213,7 +213,7 @@ usage.
 ## Security & Data Privacy
 
 Sashiko implements stateless JWT-based authorization and login via sign-in links.
-API mutations are strictly controlled by a fine-grained, capability-based Access Control List (ACL) configured in `Settings.toml` (`[server.acl]`). Administrators assign user identities directly to specific capability arrays (`ingest`, `cancel`, `review`, `action`), adhering strictly to the principle of least privilege. If the ACL configuration is omitted or the arrays are empty, the server transparently falls back to a completely secure, "Fail-Closed" mode where no remote mutations are permitted.
+API mutations are strictly controlled by a fine-grained, capability-based Access Control List (ACL) configured in `Settings.toml` (`[server.acl]`). Administrators assign user identities directly to specific capability arrays (`ingest`, `cancel`, `review`, `action`), adhering strictly to the principle of least privilege. In addition, an explicit `blocklist` array denies access unconditionally, taking precedence over all capabilities and admin rights. If the ACL configuration is omitted or the arrays are empty, the server transparently falls back to a completely secure, "Fail-Closed" mode where no remote mutations are permitted.
 The server operates without persistent traditional user accounts and retains **no user data** aside from the explicit comments, actions, and review history metadata submitted directly onto the hosted bugs.
 
 ## Communication

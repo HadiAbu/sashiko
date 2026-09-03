@@ -2207,6 +2207,206 @@ mod tests {
         // Note: comments are mapped differently in get_bug_logs now? Wait, get_bug_logs returns BugEvent-like logs.
         // Actually, just validating 200 response is good enough for now.
     }
+
+    #[tokio::test]
+    async fn test_acl_blocklist_authorization_and_auth_endpoints() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let mut base_settings = crate::settings::Settings::new().unwrap();
+        base_settings.server.jwt_secret = Some("test_jwt_secret_12345678901234567890".to_string());
+        base_settings.server.testing_mode = false;
+        base_settings.server.acl.admins = vec!["admin@example.com".to_string()];
+        base_settings.server.acl.review = vec!["reviewer@example.com".to_string()];
+        base_settings.server.acl.blocklist = vec![
+            "blocked@example.com".to_string(),
+            "admin@example.com".to_string(),
+        ];
+
+        let settings = Arc::new(base_settings);
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+
+        let app = build_router(
+            settings.clone(),
+            db.clone(),
+            event_tx.clone(),
+            fetch_tx.clone(),
+            false,
+            false,
+            true,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+
+        // 1. request_link for blocklisted email (even though it's in admins) -> 403 Forbidden
+        let res_blocked_admin = client
+            .post(format!("http://{}/api/auth/request-link", addr))
+            .json(&serde_json::json!({ "email": "admin@example.com" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_blocked_admin.status(), 403);
+
+        // 2. request_link for blocklisted email with case variations -> 403 Forbidden
+        let res_blocked_case = client
+            .post(format!("http://{}/api/auth/request-link", addr))
+            .json(&serde_json::json!({ "email": "BLOCKED@example.com" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_blocked_case.status(), 403);
+
+        // 3. request_link for allowed email -> 200 OK
+        let res_allowed = client
+            .post(format!("http://{}/api/auth/request-link", addr))
+            .json(&serde_json::json!({ "email": "reviewer@example.com" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_allowed.status(), 200);
+
+        // 4. verify_link for blocklisted email -> 403 Forbidden
+        let secret = "test_jwt_secret_12345678901234567890";
+        let blocked_token = crate::auth::create_token(
+            "blocked@example.com",
+            secret,
+            Some("sign_in_link".to_string()),
+            1800,
+        )
+        .unwrap();
+
+        let res_verify_blocked = client
+            .get(format!(
+                "http://{}/api/auth/verify?token={}",
+                addr, blocked_token
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_verify_blocked.status(), 403);
+
+        // 5. verify_link for allowed email -> 200 OK and returns session token
+        let allowed_token = crate::auth::create_token(
+            "reviewer@example.com",
+            secret,
+            Some("sign_in_link".to_string()),
+            1800,
+        )
+        .unwrap();
+
+        let res_verify_allowed = client
+            .get(format!(
+                "http://{}/api/auth/verify?token={}",
+                addr, allowed_token
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_verify_allowed.status(), 200);
+        let session_json: serde_json::Value = res_verify_allowed.json().await.unwrap();
+        let session_token = session_json["token"].as_str().unwrap();
+
+        // 6. refresh_token for blocklisted email session -> 403 Forbidden
+        let blocked_session_token = crate::auth::create_token(
+            "blocked@example.com",
+            secret,
+            Some("session".to_string()),
+            86400,
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("JWT_SECRET", secret);
+        }
+
+        let res_refresh_blocked = client
+            .post(format!("http://{}/api/auth/refresh", addr))
+            .header("Authorization", format!("Bearer {}", blocked_session_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_refresh_blocked.status(), 403);
+
+        // 7. refresh_token for allowed email session -> 200 OK
+        let res_refresh_allowed = client
+            .post(format!("http://{}/api/auth/refresh", addr))
+            .header("Authorization", format!("Bearer {}", session_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_refresh_allowed.status(), 200);
+
+        // 8. Test is_authorized directly:
+        let mut proxy_headers = axum::http::HeaderMap::new();
+        proxy_headers.insert("x-forwarded-for", "203.0.113.195".parse().unwrap());
+        let dummy_addr = "127.0.0.1:12345".parse().unwrap();
+        let state_arc = Arc::new(AppState {
+            settings: settings.clone(),
+            db: db.clone(),
+            sender: event_tx,
+            fetch_sender: fetch_tx,
+            read_only: false,
+            forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
+            allow_all_submit: false,
+            smtp_enabled: false,
+            dry_run: true,
+            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
+            stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
+            messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
+            patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
+            patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+            messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+            bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+        });
+
+        let blocked_user = crate::auth::AuthUser {
+            email: "blocked@example.com".to_string(),
+        };
+        assert!(!is_authorized(
+            &dummy_addr,
+            &state_arc,
+            &proxy_headers,
+            Some(&blocked_user),
+            crate::settings::Permission::Review
+        ));
+
+        let empty_headers = axum::http::HeaderMap::new();
+        assert!(!is_authorized(
+            &dummy_addr,
+            &state_arc,
+            &empty_headers,
+            Some(&blocked_user),
+            crate::settings::Permission::Review
+        ));
+
+        let allowed_user = crate::auth::AuthUser {
+            email: "reviewer@example.com".to_string(),
+        };
+        assert!(is_authorized(
+            &dummy_addr,
+            &state_arc,
+            &proxy_headers,
+            Some(&allowed_user),
+            crate::settings::Permission::Review
+        ));
+    }
 }
 
 pub fn is_authorized(
@@ -2221,6 +2421,9 @@ pub fn is_authorized(
     }
     if state.allow_all_submit {
         return true;
+    }
+    if auth.is_some_and(|user| state.settings.server.acl.is_blocklisted(&user.email)) {
+        return false;
     }
     if addr.ip().to_canonical().is_loopback() {
         let has_proxy = headers.contains_key("x-forwarded-for")
@@ -2250,11 +2453,33 @@ async fn request_link(
     if let Some(secret) = &state.settings.server.jwt_secret {
         // Enforce that only identities explicitly configured in our ACL get sign-in links sent to them
         let acl = &state.settings.server.acl;
-        let is_known = acl.admins.contains(&payload.email)
-            || acl.ingest.contains(&payload.email)
-            || acl.cancel.contains(&payload.email)
-            || acl.review.contains(&payload.email)
-            || acl.action.contains(&payload.email);
+        if acl.is_blocklisted(&payload.email) {
+            tracing::warn!(
+                "Login attempt denied for blocklisted identity: {}",
+                payload.email
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let is_known = acl
+            .admins
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(&payload.email))
+            || acl
+                .ingest
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&payload.email))
+            || acl
+                .cancel
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&payload.email))
+            || acl
+                .review
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&payload.email))
+            || acl
+                .action
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&payload.email));
 
         if !is_known {
             tracing::warn!(
@@ -2294,6 +2519,9 @@ async fn verify_link(
         if claims.typ.as_deref() != Some("sign_in_link") {
             return Err((StatusCode::UNAUTHORIZED, "Invalid token type"));
         }
+        if state.settings.server.acl.is_blocklisted(&claims.sub) {
+            return Err((StatusCode::FORBIDDEN, "User is blocklisted"));
+        }
         let session_token =
             crate::auth::create_token(&claims.sub, secret, Some("session".to_string()), 86400)
                 .map_err(|_| {
@@ -2314,6 +2542,9 @@ async fn refresh_token(
 ) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
     if let Some(secret) = &state.settings.server.jwt_secret {
         if let Some(user) = auth.0 {
+            if state.settings.server.acl.is_blocklisted(&user.email) {
+                return Err((StatusCode::FORBIDDEN, "User is blocklisted"));
+            }
             let session_token =
                 crate::auth::create_token(&user.email, secret, Some("session".to_string()), 86400)
                     .map_err(|_| {

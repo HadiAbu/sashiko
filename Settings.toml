@@ -146,6 +146,8 @@ cancel = []
 review = []
 # Action allows collaborating on bugs (posting comments, marking duplicates, attaching reproducers).
 action = []
+# Blocklist explicitly denies all capabilities and access, overriding any grants.
+blocklist = []
 
 [git]
 repository_path = "third_party/linux"
