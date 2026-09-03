@@ -406,8 +406,12 @@ pub enum Permission {
     Ingest,
     Cancel,
     Review,
+    Action,
 }
 
+/// Access Control List settings utilizing fine-grained capability endpoints.
+/// By default (if omitted), all vectors are safely initialized empty (Fail-Closed).
+/// Users must explicitly be added to the necessary capability lists to perform mutations.
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
@@ -415,9 +419,13 @@ pub struct AclSettings {
     #[serde(default)]
     pub admins: Vec<String>,
     #[serde(default)]
-    pub maintainers: Vec<String>,
+    pub ingest: Vec<String>,
     #[serde(default)]
-    pub bots: Vec<String>,
+    pub cancel: Vec<String>,
+    #[serde(default)]
+    pub review: Vec<String>,
+    #[serde(default)]
+    pub action: Vec<String>,
 }
 
 impl AclSettings {
@@ -426,8 +434,10 @@ impl AclSettings {
             return true;
         }
         match perm {
-            Permission::Ingest | Permission::Cancel => self.bots.iter().any(|e| e == email),
-            Permission::Review => self.maintainers.iter().any(|e| e == email),
+            Permission::Ingest => self.ingest.iter().any(|e| e == email),
+            Permission::Cancel => self.cancel.iter().any(|e| e == email),
+            Permission::Review => self.review.iter().any(|e| e == email),
+            Permission::Action => self.action.iter().any(|e| e == email),
         }
     }
 }

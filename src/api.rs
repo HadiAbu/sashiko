@@ -1740,7 +1740,7 @@ async fn bug_action(
         &state,
         &headers,
         auth.0.as_ref(),
-        crate::settings::Permission::Review,
+        crate::settings::Permission::Action,
     ) {
         return Err((StatusCode::FORBIDDEN, "Remote mutations disallowed".into()));
     }

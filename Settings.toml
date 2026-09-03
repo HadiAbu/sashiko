@@ -132,6 +132,21 @@ prompt_caching = true
 host = "::"
 port = 8080
 
+# Identity-based Capabilities: Defines what authenticated (JWT) entities can do.
+# If these lists are empty or the section is missing, nobody is allowed to perform any mutations (Fail-Closed secure default).
+# Do NOT list arbitrary users here.
+[server.acl]
+# Admins have all capabilities, including root-level maintenance operations.
+admins = []
+# Ingest limits users/bots to only submit new patches into the system (/api/submit).
+ingest = []
+# Cancel permits halting workloads (useful for automation / cron scripts).
+cancel = []
+# Review allows triggering intensive AI analyses on existing patches.
+review = []
+# Action allows collaborating on bugs (posting comments, marking duplicates, attaching reproducers).
+action = []
+
 [git]
 repository_path = "third_party/linux"
 
