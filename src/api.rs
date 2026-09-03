@@ -407,6 +407,7 @@ fn generate_synthetic_id(prefix: &str) -> String {
 async fn submit_patch(
     auth: crate::auth::OptionalAuthUser,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<SubmitRequest>,
 ) -> Result<Json<SubmitResponse>, StatusCode> {
@@ -417,6 +418,7 @@ async fn submit_patch(
     if !is_authorized(
         &addr,
         &state,
+        &headers,
         auth.0.as_ref(),
         crate::settings::Permission::Ingest,
     ) {
@@ -1098,6 +1100,7 @@ async fn get_bug_logs(
 async fn analyze_bug(
     auth: crate::auth::OptionalAuthUser,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<crate::workflows::linux_bug::BugInput>,
 ) -> Result<Json<crate::workflows::linux_bug::BugOutcome>, (StatusCode, String)> {
@@ -1111,6 +1114,7 @@ async fn analyze_bug(
     if !is_authorized(
         &addr,
         &state,
+        &headers,
         auth.0.as_ref(),
         crate::settings::Permission::Review,
     ) {
@@ -1328,6 +1332,7 @@ async fn stats_tools(
 async fn rerun_patchset(
     auth: crate::auth::OptionalAuthUser,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1338,6 +1343,7 @@ async fn rerun_patchset(
     if !is_authorized(
         &addr,
         &state,
+        &headers,
         auth.0.as_ref(),
         crate::settings::Permission::Review,
     ) {
@@ -1360,6 +1366,7 @@ async fn rerun_patchset(
 async fn cancel_patchset(
     auth: crate::auth::OptionalAuthUser,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<CancelQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1370,6 +1377,7 @@ async fn cancel_patchset(
     if !is_authorized(
         &addr,
         &state,
+        &headers,
         auth.0.as_ref(),
         crate::settings::Permission::Cancel,
     ) {
@@ -1404,6 +1412,7 @@ async fn cancel_patchset(
 async fn rerun_patch(
     auth: crate::auth::OptionalAuthUser,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<RerunPatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1414,6 +1423,7 @@ async fn rerun_patch(
     if !is_authorized(
         &addr,
         &state,
+        &headers,
         auth.0.as_ref(),
         crate::settings::Permission::Review,
     ) {
@@ -1716,6 +1726,7 @@ pub enum BugAction {
 async fn bug_action(
     auth: crate::auth::OptionalAuthUser,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<BugQuery>,
     axum::extract::Json(payload): axum::extract::Json<BugActionPayload>,
@@ -1727,6 +1738,7 @@ async fn bug_action(
     if !is_authorized(
         &addr,
         &state,
+        &headers,
         auth.0.as_ref(),
         crate::settings::Permission::Review,
     ) {
@@ -2199,6 +2211,7 @@ mod tests {
 pub fn is_authorized(
     addr: &std::net::SocketAddr,
     state: &std::sync::Arc<AppState>,
+    headers: &axum::http::HeaderMap,
     auth: Option<&crate::auth::AuthUser>,
     perm: crate::settings::Permission,
 ) -> bool {
@@ -2209,7 +2222,12 @@ pub fn is_authorized(
         return true;
     }
     if addr.ip().to_canonical().is_loopback() {
-        return true;
+        let has_proxy = headers.contains_key("x-forwarded-for")
+            || headers.contains_key("x-real-ip")
+            || headers.contains_key("forwarded");
+        if !has_proxy {
+            return true;
+        }
     }
 
     if let Some(user) = auth {
