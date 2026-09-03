@@ -1508,6 +1508,13 @@
                 } catch (e) {
                     console.warn("localStorage is not available:", e);
                 }
+            },
+            removeItem(key) {
+                try {
+                    localStorage.removeItem(key);
+                } catch (e) {
+                    console.warn("localStorage is not available:", e);
+                }
             }
         };
 
@@ -4673,46 +4680,130 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         const API_TOKEN_KEY = 'sashiko_session_token';
         const API_USER_KEY = 'sashiko_session_email';
 
-        function getAuthToken() { return safeStorage.getItem(API_TOKEN_KEY); }
-        function getAuthEmail() { return safeStorage.getItem(API_USER_KEY); }
-        
-        // Enhance fetch globally to attach Authorization if token exists
+        function parseJwtPayload(token) {
+            if (!token || typeof token !== 'string') return null;
+            try {
+                const parts = token.split('.');
+                if (parts.length !== 3) return null;
+                const base64Url = parts[1];
+                const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+                const jsonPayload = decodeURIComponent(
+                    atob(base64)
+                        .split('')
+                        .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+                        .join('')
+                );
+                return JSON.parse(jsonPayload);
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function isTokenExpired(token) {
+            const payload = parseJwtPayload(token);
+            if (!payload || typeof payload.exp !== 'number') return true;
+            // Mark expired if within 5 seconds of expiration timestamp to avoid race conditions
+            return (Date.now() / 1000) >= (payload.exp - 5);
+        }
+
+        function clearAuthSession() {
+            safeStorage.removeItem(API_TOKEN_KEY);
+            safeStorage.removeItem(API_USER_KEY);
+            updateAuthUI();
+        }
+
+        function getAuthToken() {
+            const token = safeStorage.getItem(API_TOKEN_KEY);
+            if (!token) return null;
+            if (isTokenExpired(token)) {
+                clearAuthSession();
+                return null;
+            }
+            return token;
+        }
+
+        function getAuthEmail() {
+            if (!getAuthToken()) return null;
+            return safeStorage.getItem(API_USER_KEY);
+        }
+
+        let isLoggingOut = false;
+        function logoutAuth() {
+            if (isLoggingOut) return;
+            isLoggingOut = true;
+            try {
+                const hadToken = !!safeStorage.getItem(API_TOKEN_KEY);
+                clearAuthSession();
+                if (hadToken) {
+                    refreshPageData();
+                }
+            } finally {
+                setTimeout(() => { isLoggingOut = false; }, 100);
+            }
+        }
+
+        function refreshPageData() {
+            if (typeof router === 'function') {
+                router();
+            } else {
+                window.location.reload();
+            }
+        }
+
+        // Enhance fetch globally to attach Authorization if token exists and handle expiration/rejection
         const originalFetch = window.fetch;
         window.fetch = async function() {
             let [resource, config] = arguments;
             const token = getAuthToken();
-            if (token && resource && resource.startsWith('/api/')) {
+            if (token && resource && typeof resource === 'string' && resource.startsWith('/api/')) {
                 config = config || {};
                 config.headers = config.headers || {};
-                config.headers['Authorization'] = `Bearer ${token}`;
+                if (!config.headers['Authorization']) {
+                    config.headers['Authorization'] = `Bearer ${token}`;
+                }
             }
-            return await originalFetch(resource, config);
+            const res = await originalFetch(resource, config);
+
+            // Handle token rejection or expiration by the server
+            if (token && resource && typeof resource === 'string' && resource.startsWith('/api/')) {
+                if (res.status === 401) {
+                    // Token expired or invalid signature/revoked
+                    console.warn("Session token expired or rejected by server (401 Unauthorized), logging out.");
+                    logoutAuth();
+                } else if (res.status === 403 && resource === '/api/auth/refresh') {
+                    // Token refresh rejected (e.g. blocklisted or revoked permissions)
+                    console.warn("Session refresh forbidden (403 Forbidden), logging out.");
+                    logoutAuth();
+                }
+            }
+            return res;
         };
-        
+
         async function fetchNewSessionToken(signInToken) {
             try {
                 const res = await originalFetch(`/api/auth/verify?token=${encodeURIComponent(signInToken)}`);
                 if (res.ok) {
                     const data = await res.json();
                     if (data.token) {
+                        const payload = parseJwtPayload(data.token);
                         safeStorage.setItem(API_TOKEN_KEY, data.token);
-                        try {
-                            const payload = JSON.parse(atob(data.token.split('.')[1]));
-                            safeStorage.setItem(API_USER_KEY, payload.sub || 'Authorized User');
-                        } catch(e) {
-                            safeStorage.setItem(API_USER_KEY, 'Authorized User');
-                        }
+                        safeStorage.setItem(API_USER_KEY, (payload && payload.sub) ? payload.sub : 'Authorized User');
                         updateAuthUI();
                         refreshPageData();
                     }
                 } else {
-                    alert("Sign-in link invalid or expired.");
+                    let msg = "Sign-in link is invalid or has expired.";
+                    if (res.status === 403) {
+                        msg = "Sign-in rejected: this account is not authorized or is blocked.";
+                    }
+                    alert(msg);
+                    clearAuthSession();
                 }
             } catch(e) {
                 console.error(e);
             }
         }
-        
+
         async function runTokenRefresher() {
             const token = getAuthToken();
             if (!token) return;
@@ -4724,14 +4815,18 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 if (res.ok) {
                     const data = await res.json();
                     if (data.token) {
+                        const payload = parseJwtPayload(data.token);
                         safeStorage.setItem(API_TOKEN_KEY, data.token);
+                        if (payload && payload.sub) {
+                            safeStorage.setItem(API_USER_KEY, payload.sub);
+                        }
                     }
                 } else if (res.status === 401 || res.status === 403) {
                     logoutAuth();
                 }
             } catch(e) {}
         }
-        
+
         function updateAuthUI() {
             const email = getAuthEmail();
             const emailSpan = document.getElementById('auth-email');
@@ -4761,20 +4856,16 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             }
         }
 
-        function logoutAuth() {
-            safeStorage.removeItem(API_TOKEN_KEY);
-            safeStorage.removeItem(API_USER_KEY);
-            updateAuthUI();
-            if (typeof render === 'function') { render(); } else { window.location.reload(); }
-        }
-
-        function refreshPageData() {
-            if (typeof render === 'function') { render(); } else { window.location.reload(); }
-        }
-
-        function openAuthModal() {
+        function openAuthModal(noticeMessage) {
             document.getElementById('authEmailInput').value = '';
-            document.getElementById('authMessage').style.display = 'none';
+            const msg = document.getElementById('authMessage');
+            if (noticeMessage) {
+                msg.style.color = 'var(--status-failed)';
+                msg.textContent = noticeMessage;
+                msg.style.display = 'block';
+            } else {
+                msg.style.display = 'none';
+            }
             document.getElementById('authModal').style.display = 'flex';
         }
 
@@ -4785,19 +4876,19 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         async function submitAuthRequest() {
             const email = document.getElementById('authEmailInput').value.trim();
             if (!email) return;
-            
+
             const btn = document.getElementById('authSubmitBtn');
             const msg = document.getElementById('authMessage');
             btn.disabled = true;
             msg.style.display = 'none';
-            
+
             try {
                 const res = await originalFetch('/api/auth/request-link', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ email })
                 });
-                
+
                 if (res.ok) {
                     msg.style.color = 'var(--status-reviewed)';
                     msg.innerHTML = "<b>Sign-in link sent!</b><br>Please check your inbox (or server logs) to sign in.";
@@ -4823,11 +4914,30 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
                 fetchNewSessionToken(signInToken);
             } else {
+                // Ensure expired token is purged on load
+                getAuthToken();
                 updateAuthUI();
             }
-            
-            setInterval(runTokenRefresher, 3600 * 1000); 
-            setTimeout(runTokenRefresher, 2000); 
+
+            // Check for local expiration periodically so idle tabs log out promptly
+            setInterval(() => {
+                const token = safeStorage.getItem(API_TOKEN_KEY);
+                if (token && isTokenExpired(token)) {
+                    logoutAuth();
+                }
+            }, 30 * 1000);
+
+            // Periodically refresh the session token before it expires
+            setInterval(() => {
+                if (getAuthToken()) {
+                    runTokenRefresher();
+                }
+            }, 3600 * 1000);
+            setTimeout(() => {
+                if (getAuthToken()) {
+                    runTokenRefresher();
+                }
+            }, 2000);
         });
     </script>
 </body>
