@@ -921,7 +921,41 @@ impl Database {
 
         self.migrate_patches_unique_constraint_if_needed().await?;
         self.ensure_extensible_bug_schema_if_needed().await?;
+        self.migrate_audit_triggers().await?;
 
+        Ok(())
+    }
+
+    async fn migrate_audit_triggers(&self) -> Result<()> {
+        let triggers = [
+            ("trg_bugs_audit_status", "status", "status"),
+            ("trg_bugs_audit_title", "title", "title"),
+            (
+                "trg_bugs_audit_dup_of_id",
+                "duplicate_of_id",
+                "duplicate_of_id",
+            ),
+        ];
+
+        for (trigger_name, field, json_key) in triggers.iter() {
+            let sql = format!(
+                "CREATE TRIGGER IF NOT EXISTS {}
+                AFTER UPDATE OF {} ON bugs
+                FOR EACH ROW
+                WHEN (old.{} != new.{}) OR (old.{} IS NULL AND new.{} IS NOT NULL) OR (old.{} IS NOT NULL AND new.{} IS NULL)
+                BEGIN
+                    INSERT INTO bug_enrichments (
+                        bug_id, kind, tool, created_at, content, data_json
+                    ) VALUES (
+                        new.id, 'audit', 'system', strftime('%s', 'now'),
+                        'Field \"{}\" changed from \"' || substr(IFNULL(CAST(old.{} AS TEXT), 'null'), 1, 50) || '\" to \"' || substr(IFNULL(CAST(new.{} AS TEXT), 'null'), 1, 50) || '\"',
+                        json_object('field', '{}', 'old', old.{}, 'new', new.{})
+                    );
+                END;",
+                trigger_name, field, field, field, field, field, field, field, field, field, field, json_key, field, field
+            );
+            self.conn.execute(&sql, ()).await?;
+        }
         Ok(())
     }
 
@@ -5961,6 +5995,46 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn test_bug_audit_log_triggers() -> Result<()> {
+        let db = setup_db().await;
+
+        let bug = crate::db::NewBug {
+            bugid: "AUDIT-123".to_string(),
+            title: "Initial problem".to_string(),
+            status: "raw".to_string(),
+            reporter: "test@example.com".to_string(),
+            reported_at: chrono::Utc::now().timestamp(),
+            source_ref: None,
+            duplicate_of_id: None,
+            discovered_in_commit: None,
+            discovered_in_patch_id: None,
+            discovered_in_patchset_id: None,
+            vector_json: None,
+            subsystems: vec![],
+        };
+        let bug_id = db.create_bug(&bug).await?;
+
+        // 1. Update status
+        db.update_bug_status(bug_id, "processing").await?;
+
+        // Fetch enrichments
+        let bug = db.get_bug(bug_id).await?.unwrap();
+        assert_eq!(bug.status, "processing");
+
+        let enrichments = bug.enrichments;
+        assert_eq!(enrichments.len(), 1); // status
+
+        assert!(enrichments.iter().any(|e| {
+            e.kind == "audit"
+                && e.content
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("Field \"status\" changed")
+        }));
+
+        Ok(())
+    }
     use super::*;
     use crate::settings::DatabaseSettings;
     use std::sync::Arc;
