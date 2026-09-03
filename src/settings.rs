@@ -412,6 +412,7 @@ pub enum Permission {
 /// Access Control List settings utilizing fine-grained capability endpoints.
 /// By default (if omitted), all vectors are safely initialized empty (Fail-Closed).
 /// Users must explicitly be added to the necessary capability lists to perform mutations.
+/// The `blocklist` explicitly denies all capabilities, overriding any grants.
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
@@ -426,18 +427,27 @@ pub struct AclSettings {
     pub review: Vec<String>,
     #[serde(default)]
     pub action: Vec<String>,
+    #[serde(default)]
+    pub blocklist: Vec<String>,
 }
 
 impl AclSettings {
+    pub fn is_blocklisted(&self, email: &str) -> bool {
+        self.blocklist.iter().any(|e| e.eq_ignore_ascii_case(email))
+    }
+
     pub fn has_permission(&self, email: &str, perm: Permission) -> bool {
-        if self.admins.iter().any(|e| e == email) {
+        if self.is_blocklisted(email) {
+            return false;
+        }
+        if self.admins.iter().any(|e| e.eq_ignore_ascii_case(email)) {
             return true;
         }
         match perm {
-            Permission::Ingest => self.ingest.iter().any(|e| e == email),
-            Permission::Cancel => self.cancel.iter().any(|e| e == email),
-            Permission::Review => self.review.iter().any(|e| e == email),
-            Permission::Action => self.action.iter().any(|e| e == email),
+            Permission::Ingest => self.ingest.iter().any(|e| e.eq_ignore_ascii_case(email)),
+            Permission::Cancel => self.cancel.iter().any(|e| e.eq_ignore_ascii_case(email)),
+            Permission::Review => self.review.iter().any(|e| e.eq_ignore_ascii_case(email)),
+            Permission::Action => self.action.iter().any(|e| e.eq_ignore_ascii_case(email)),
         }
     }
 }
@@ -734,5 +744,91 @@ mod tests {
                 std::env::remove_var("XDG_CONFIG_HOME");
             }
         }
+    }
+
+    #[test]
+    fn test_acl_default_fails_closed() {
+        let acl = AclSettings::default();
+        let email = "user@example.com";
+        assert!(!acl.is_blocklisted(email));
+        assert!(!acl.has_permission(email, Permission::Ingest));
+        assert!(!acl.has_permission(email, Permission::Cancel));
+        assert!(!acl.has_permission(email, Permission::Review));
+        assert!(!acl.has_permission(email, Permission::Action));
+    }
+
+    #[test]
+    fn test_acl_admin_grants_all_permissions() {
+        let acl = AclSettings {
+            admins: vec!["admin@example.com".to_string()],
+            ..Default::default()
+        };
+        assert!(acl.has_permission("admin@example.com", Permission::Ingest));
+        assert!(acl.has_permission("admin@example.com", Permission::Cancel));
+        assert!(acl.has_permission("admin@example.com", Permission::Review));
+        assert!(acl.has_permission("admin@example.com", Permission::Action));
+    }
+
+    #[test]
+    fn test_acl_granular_capabilities() {
+        let acl = AclSettings {
+            ingest: vec!["bot@example.com".to_string()],
+            cancel: vec!["cron@example.com".to_string()],
+            review: vec!["reviewer@example.com".to_string()],
+            action: vec!["collab@example.com".to_string()],
+            ..Default::default()
+        };
+
+        assert!(acl.has_permission("bot@example.com", Permission::Ingest));
+        assert!(!acl.has_permission("bot@example.com", Permission::Cancel));
+        assert!(!acl.has_permission("bot@example.com", Permission::Review));
+        assert!(!acl.has_permission("bot@example.com", Permission::Action));
+
+        assert!(acl.has_permission("reviewer@example.com", Permission::Review));
+        assert!(!acl.has_permission("reviewer@example.com", Permission::Ingest));
+    }
+
+    #[test]
+    fn test_acl_blocklist_preempts_all_capabilities_and_admin() {
+        let acl = AclSettings {
+            admins: vec!["rogue_admin@example.com".to_string()],
+            ingest: vec!["rogue_admin@example.com".to_string()],
+            cancel: vec!["rogue_admin@example.com".to_string()],
+            review: vec!["rogue_admin@example.com".to_string()],
+            action: vec!["rogue_admin@example.com".to_string()],
+            blocklist: vec!["rogue_admin@example.com".to_string()],
+        };
+
+        assert!(acl.is_blocklisted("rogue_admin@example.com"));
+        assert!(!acl.has_permission("rogue_admin@example.com", Permission::Ingest));
+        assert!(!acl.has_permission("rogue_admin@example.com", Permission::Cancel));
+        assert!(!acl.has_permission("rogue_admin@example.com", Permission::Review));
+        assert!(!acl.has_permission("rogue_admin@example.com", Permission::Action));
+    }
+
+    #[test]
+    fn test_acl_blocklist_case_insensitivity() {
+        let acl = AclSettings {
+            admins: vec!["User@Example.COM".to_string()],
+            blocklist: vec!["User@Example.COM".to_string()],
+            ..Default::default()
+        };
+
+        assert!(acl.is_blocklisted("user@example.com"));
+        assert!(acl.is_blocklisted("USER@EXAMPLE.COM"));
+        assert!(acl.is_blocklisted("uSeR@eXaMpLe.CoM"));
+        assert!(!acl.has_permission("user@example.com", Permission::Review));
+        assert!(!acl.has_permission("USER@EXAMPLE.COM", Permission::Review));
+    }
+
+    #[test]
+    fn test_acl_deserialization_with_blocklist() {
+        let toml_blocklist = r#"
+            admins = ["alice@example.com"]
+            blocklist = ["mallory@example.com"]
+        "#;
+        let acl: AclSettings = toml::from_str(toml_blocklist).expect("deserialization failed");
+        assert_eq!(acl.blocklist, vec!["mallory@example.com"]);
+        assert!(acl.is_blocklisted("mallory@example.com"));
     }
 }
