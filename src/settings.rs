@@ -401,6 +401,37 @@ fn default_max_interactions() -> usize {
     100
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Permission {
+    Ingest,
+    Cancel,
+    Review,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
+pub struct AclSettings {
+    #[serde(default)]
+    pub admins: Vec<String>,
+    #[serde(default)]
+    pub maintainers: Vec<String>,
+    #[serde(default)]
+    pub bots: Vec<String>,
+}
+
+impl AclSettings {
+    pub fn has_permission(&self, email: &str, perm: Permission) -> bool {
+        if self.admins.iter().any(|e| e == email) {
+            return true;
+        }
+        match perm {
+            Permission::Ingest | Permission::Cancel => self.bots.iter().any(|e| e == email),
+            Permission::Review => self.maintainers.iter().any(|e| e == email),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
@@ -413,7 +444,7 @@ pub struct ServerSettings {
     pub testing_mode: bool,
     pub jwt_secret: Option<String>,
     #[serde(default)]
-    pub admin_emails: Vec<String>,
+    pub acl: AclSettings,
 }
 
 #[derive(Debug, Deserialize, Clone)]

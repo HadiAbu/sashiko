@@ -414,7 +414,12 @@ async fn submit_patch(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !is_authorized(&addr, &state, auth.0.as_ref()) {
+    if !is_authorized(
+        &addr,
+        &state,
+        auth.0.as_ref(),
+        crate::settings::Permission::Ingest,
+    ) {
         info!("Refused patch submission from non-localhost: {}", addr);
         return Err(StatusCode::FORBIDDEN);
     }
@@ -1103,7 +1108,12 @@ async fn analyze_bug(
         ));
     }
 
-    if !is_authorized(&addr, &state, auth.0.as_ref()) {
+    if !is_authorized(
+        &addr,
+        &state,
+        auth.0.as_ref(),
+        crate::settings::Permission::Review,
+    ) {
         return Err((
             StatusCode::FORBIDDEN,
             "Remote mutations disallowed".to_string(),
@@ -1325,7 +1335,12 @@ async fn rerun_patchset(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !is_authorized(&addr, &state, auth.0.as_ref()) {
+    if !is_authorized(
+        &addr,
+        &state,
+        auth.0.as_ref(),
+        crate::settings::Permission::Review,
+    ) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1352,7 +1367,12 @@ async fn cancel_patchset(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !is_authorized(&addr, &state, auth.0.as_ref()) {
+    if !is_authorized(
+        &addr,
+        &state,
+        auth.0.as_ref(),
+        crate::settings::Permission::Cancel,
+    ) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1391,7 +1411,12 @@ async fn rerun_patch(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !is_authorized(&addr, &state, auth.0.as_ref()) {
+    if !is_authorized(
+        &addr,
+        &state,
+        auth.0.as_ref(),
+        crate::settings::Permission::Review,
+    ) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1699,7 +1724,12 @@ async fn bug_action(
         return Err((StatusCode::FORBIDDEN, "Read-only mode".into()));
     }
 
-    if !is_authorized(&addr, &state, auth.0.as_ref()) {
+    if !is_authorized(
+        &addr,
+        &state,
+        auth.0.as_ref(),
+        crate::settings::Permission::Review,
+    ) {
         return Err((StatusCode::FORBIDDEN, "Remote mutations disallowed".into()));
     }
 
@@ -2170,6 +2200,7 @@ pub fn is_authorized(
     addr: &std::net::SocketAddr,
     state: &std::sync::Arc<AppState>,
     auth: Option<&crate::auth::AuthUser>,
+    perm: crate::settings::Permission,
 ) -> bool {
     if state.settings.server.testing_mode {
         return true;
@@ -2181,11 +2212,8 @@ pub fn is_authorized(
         return true;
     }
 
-    if let Some(user) = auth
-        && (state.settings.server.admin_emails.is_empty()
-            || state.settings.server.admin_emails.contains(&user.email))
-    {
-        return true;
+    if let Some(user) = auth {
+        return state.settings.server.acl.has_permission(&user.email, perm);
     }
 
     false
