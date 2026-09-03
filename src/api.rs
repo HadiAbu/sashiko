@@ -333,6 +333,7 @@ pub fn build_router(
         .route("/api/submit", post(submit_patch))
         .route("/api/auth/request-link", post(request_link))
         .route("/api/auth/verify", get(verify_link))
+        .route("/api/auth/refresh", post(refresh_token))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
@@ -2247,11 +2248,26 @@ async fn request_link(
     axum::extract::Json(payload): axum::extract::Json<RequestLinkRequest>,
 ) -> Result<StatusCode, StatusCode> {
     if let Some(secret) = &state.settings.server.jwt_secret {
+        // Enforce that only identities explicitly configured in our ACL get sign-in links sent to them
+        let acl = &state.settings.server.acl;
+        let is_known = acl.admins.contains(&payload.email)
+            || acl.ingest.contains(&payload.email)
+            || acl.cancel.contains(&payload.email)
+            || acl.review.contains(&payload.email)
+            || acl.action.contains(&payload.email);
+
+        if !is_known {
+            tracing::warn!(
+                "Unauthorized login attempt for unknown identity: {}",
+                payload.email
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
         let token =
-            crate::auth::create_token(&payload.email, secret, Some("sign_in_link".to_string()), 3600)
+            crate::auth::create_token(&payload.email, secret, Some("sign_in_link".to_string()), 1800)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         tracing::info!(
-            "SIGN-IN LINK REQUESTED for {}: http://{}:{}/api/auth/verify?token={}",
+            "SIGN-IN LINK REQUESTED for {}: http://{}:{}/?magic_token={}",
             payload.email,
             state.settings.server.host,
             state.settings.server.port,
@@ -2279,7 +2295,7 @@ async fn verify_link(
             return Err((StatusCode::UNAUTHORIZED, "Invalid token type"));
         }
         let session_token =
-            crate::auth::create_token(&claims.sub, secret, Some("session".to_string()), 86400 * 30)
+            crate::auth::create_token(&claims.sub, secret, Some("session".to_string()), 86400)
                 .map_err(|_| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2287,6 +2303,29 @@ async fn verify_link(
                     )
                 })?;
         Ok(Json(serde_json::json!({ "token": session_token })))
+    } else {
+        Err((StatusCode::NOT_IMPLEMENTED, "JWT not configured"))
+    }
+}
+
+async fn refresh_token(
+    auth: crate::auth::OptionalAuthUser,
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    if let Some(secret) = &state.settings.server.jwt_secret {
+        if let Some(user) = auth.0 {
+            let session_token =
+                crate::auth::create_token(&user.email, secret, Some("session".to_string()), 86400)
+                    .map_err(|_| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to create session",
+                        )
+                    })?;
+            Ok(Json(serde_json::json!({ "token": session_token })))
+        } else {
+            Err((StatusCode::UNAUTHORIZED, "Missing or invalid token"))
+        }
     } else {
         Err((StatusCode::NOT_IMPLEMENTED, "JWT not configured"))
     }

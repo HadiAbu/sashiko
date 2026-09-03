@@ -287,6 +287,7 @@
         }
 
         body {
+            position: relative;
             color-scheme: light dark;
             font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
             font-size: 13px;
@@ -331,7 +332,10 @@
 
         /* Navigation */
         .nav {
-            margin-bottom: 10px;
+            margin-bottom: 20px;
+            min-height: 28px;
+            display: flex;
+            align-items: center;
         }
 
         .nav a {
@@ -1251,11 +1255,93 @@
             white-space: pre-wrap;
             font-size: 0.9em;
         }
-    </style>
+    
+        /* Auth UI */
+        #auth-header {
+            position: absolute;
+            top: 32px;
+            right: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            z-index: 10;
+        }
+        #auth-user {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            color: var(--text-muted);
+            font-size: 12px;
+        }
+        #auth-user svg {
+            opacity: 0.6;
+            vertical-align: middle;
+        }
+        #auth-email {
+            max-width: 180px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-style: italic;
+        }
+        #auth-header button {
+            background: transparent;
+            border: 1px solid var(--border);
+            border-radius: 3px;
+            padding: 2px 8px;
+            font-size: 11px;
+            line-height: 1.4;
+            cursor: pointer;
+            color: var(--text-muted);
+            transition: all 0.15s ease;
+        }
+        #auth-header button:hover {
+            background: var(--hover);
+            color: var(--text);
+            border-color: var(--text-muted);
+        }
+        #authModal .modal-content { max-width: 450px; }
+        #authModal .note {
+            font-size: 13px;
+            color: var(--text);
+            line-height: 1.5;
+            margin-bottom: 20px;
+        }
+</style>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 </head>
 
 <body>
+    <div id="auth-header">
+        <div id="auth-user">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                <circle cx="12" cy="7" r="4"></circle>
+            </svg>
+            <span id="auth-email">Guest</span>
+        </div>
+        <button id="auth-btn" class="btn" onclick="toggleAuth()">Login</button>
+    </div>
+
+    <div id="authModal" class="modal-overlay" onclick="if(event.target===this) closeAuthModal()">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeAuthModal()">&times;</span>
+            <div class="about-logo" style="margin-bottom: 16px;">Sign In</div>
+            <div class="note">
+                Enter your email address below to receive a secure sign-in link.
+                <br><br>
+                If your account is authorized, we will email you a link to log in directly without a password.
+            </div>
+            <input type="email" id="authEmailInput" class="search-input" placeholder="Email address (e.g., maintainer@kernel.org)" onkeydown="if(event.key==='Enter') submitAuthRequest()" style="width: 100%; border: 1px solid var(--border); box-sizing: border-box; margin-bottom: 12px; font-size: 14px;">
+            <div id="authMessage" style="font-size: 13px; width: 100%; margin-bottom: 12px; display: none; line-height: 1.4;"></div>
+            <div style="display: flex; justify-content: flex-end; gap: 8px;">
+                <button type="button" class="btn" onclick="closeAuthModal()">Cancel</button>
+                <button type="button" class="btn primary" id="authSubmitBtn" onclick="submitAuthRequest()">Send Link</button>
+            </div>
+        </div>
+    </div>
+
     <div id="app"></div>
 
     <div class="kbd-hint">
@@ -4581,6 +4667,169 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             </form>
         </div>
     </div>
+
+    <!-- AUTH LOGIC -->
+    <script>
+        const API_TOKEN_KEY = 'sashiko_session_token';
+        const API_USER_KEY = 'sashiko_session_email';
+
+        function getAuthToken() { return safeStorage.getItem(API_TOKEN_KEY); }
+        function getAuthEmail() { return safeStorage.getItem(API_USER_KEY); }
+        
+        // Enhance fetch globally to attach Authorization if token exists
+        const originalFetch = window.fetch;
+        window.fetch = async function() {
+            let [resource, config] = arguments;
+            const token = getAuthToken();
+            if (token && resource && resource.startsWith('/api/')) {
+                config = config || {};
+                config.headers = config.headers || {};
+                config.headers['Authorization'] = `Bearer ${token}`;
+            }
+            return await originalFetch(resource, config);
+        };
+        
+        async function fetchNewSessionToken(signInToken) {
+            try {
+                const res = await originalFetch(`/api/auth/verify?token=${encodeURIComponent(signInToken)}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.token) {
+                        safeStorage.setItem(API_TOKEN_KEY, data.token);
+                        try {
+                            const payload = JSON.parse(atob(data.token.split('.')[1]));
+                            safeStorage.setItem(API_USER_KEY, payload.sub || 'Authorized User');
+                        } catch(e) {
+                            safeStorage.setItem(API_USER_KEY, 'Authorized User');
+                        }
+                        updateAuthUI();
+                        refreshPageData();
+                    }
+                } else {
+                    alert("Sign-in link invalid or expired.");
+                }
+            } catch(e) {
+                console.error(e);
+            }
+        }
+        
+        async function runTokenRefresher() {
+            const token = getAuthToken();
+            if (!token) return;
+            try {
+                const res = await originalFetch(`/api/auth/refresh`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.token) {
+                        safeStorage.setItem(API_TOKEN_KEY, data.token);
+                    }
+                } else if (res.status === 401 || res.status === 403) {
+                    logoutAuth();
+                }
+            } catch(e) {}
+        }
+        
+        function updateAuthUI() {
+            const email = getAuthEmail();
+            const emailSpan = document.getElementById('auth-email');
+            const btn = document.getElementById('auth-btn');
+            if (email) {
+                emailSpan.textContent = email;
+                emailSpan.title = email;
+                btn.textContent = 'Logout';
+                emailSpan.style.color = 'var(--status-reviewed)';
+                emailSpan.style.fontWeight = 'bold';
+                emailSpan.style.fontStyle = 'normal';
+            } else {
+                emailSpan.textContent = 'Guest';
+                emailSpan.title = '';
+                btn.textContent = 'Login';
+                emailSpan.style.color = 'var(--text-muted)';
+                emailSpan.style.fontWeight = 'normal';
+                emailSpan.style.fontStyle = 'italic';
+            }
+        }
+
+        function toggleAuth() {
+            if (getAuthToken()) {
+                logoutAuth();
+            } else {
+                openAuthModal();
+            }
+        }
+
+        function logoutAuth() {
+            safeStorage.removeItem(API_TOKEN_KEY);
+            safeStorage.removeItem(API_USER_KEY);
+            updateAuthUI();
+            if (typeof render === 'function') { render(); } else { window.location.reload(); }
+        }
+
+        function refreshPageData() {
+            if (typeof render === 'function') { render(); } else { window.location.reload(); }
+        }
+
+        function openAuthModal() {
+            document.getElementById('authEmailInput').value = '';
+            document.getElementById('authMessage').style.display = 'none';
+            document.getElementById('authModal').style.display = 'flex';
+        }
+
+        function closeAuthModal() {
+            document.getElementById('authModal').style.display = 'none';
+        }
+
+        async function submitAuthRequest() {
+            const email = document.getElementById('authEmailInput').value.trim();
+            if (!email) return;
+            
+            const btn = document.getElementById('authSubmitBtn');
+            const msg = document.getElementById('authMessage');
+            btn.disabled = true;
+            msg.style.display = 'none';
+            
+            try {
+                const res = await originalFetch('/api/auth/request-link', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email })
+                });
+                
+                if (res.ok) {
+                    msg.style.color = 'var(--status-reviewed)';
+                    msg.innerHTML = "<b>Sign-in link sent!</b><br>Please check your inbox (or server logs) to sign in.";
+                } else if (res.status === 403) {
+                    msg.style.color = 'var(--status-failed)';
+                    msg.textContent = "This email address is not authorized to sign in.";
+                } else {
+                    msg.style.color = 'var(--status-failed)';
+                    msg.textContent = "Error requesting sign-in link: " + res.statusText;
+                }
+            } catch (e) {
+                msg.style.color = 'var(--status-failed)';
+                msg.textContent = "Error: " + e.message;
+            }
+            msg.style.display = 'block';
+            btn.disabled = false;
+        }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const signInToken = urlParams.get('magic_token');
+            if (signInToken) {
+                window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+                fetchNewSessionToken(signInToken);
+            } else {
+                updateAuthUI();
+            }
+            
+            setInterval(runTokenRefresher, 3600 * 1000); 
+            setTimeout(runTokenRefresher, 2000); 
+        });
+    </script>
 </body>
 
 </html>
