@@ -824,6 +824,9 @@ Choose the representation that most clearly demonstrates the defect:
 - Paired Actions Rule (Allocations & Releases, Locks, Refcounts):
   For memory leaks or paired resource lifecycle bugs, any snippet MUST include BOTH the allocation or acquisition site (e.g. kzalloc or mutex_lock) AND the error or exit path where release was missed. Never show only the exit path without showing what was allocated or acquired.
 
+- Cross-Function Boundaries (Caller & Callee):
+  If a defect arises from incompatible assumptions between two functions (e.g., a caller passing a NULL argument to a callee that blindly dereferences it), snippets MUST include relevant context from BOTH the caller and the callee. Prove the broken contract by showing both sides of the interface, rather than describing the callee's expectations purely in prose.
+
 - Concurrency, Race Conditions, and Deadlocks (LKML Timeline Style):
   For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a clean multi-column timeline across the involved CPUs (e.g. CPU 0 and CPU 1). Format columns using whitespace separation and dashed underlines. Do NOT draw an ASCII table with vertical borders ('|'), crosses ('+'), or markdown table grids. Do NOT use multi-column timelines for non-concurrency defects (single-threaded leaks, null pointer dereferences on error paths, missing validation).
 
@@ -1004,6 +1007,7 @@ Draft the standalone technical defect description for upstream submission follow
 3. Code Presentation:
    - Include code snippets for all localized defects (including flawed logic, error paths, and paired resource handling). Omit snippets only when the bug is not localized within existing code (e.g. a missing architectural hook or high-level design omission where pure prose is clearer).
    - For paired actions (memory allocations, lock acquisitions, refcounts), the snippet MUST include BOTH the allocation/acquisition site AND the error exit where release was missed.
+   - For cross-function mismatches (e.g., a caller passing a NULL argument to a callee that expects non-NULL), snippets MUST show the relevant code from BOTH the caller and the callee to prove the disconnect.
    - For race conditions or deadlocks across CPUs, format the temporal sequence using whitespace-separated columns and dashed underlines (LKML style multi-CPU timeline diagram). Do NOT draw tables with vertical borders ('|'), crosses ('+'), or markdown table grids.
    - Strict Carets: Do NOT overuse carets (^^^^^). Carets may ONLY point to an existing defective expression. NEVER use carets to highlight a missing call (e.g. do not point carets at 'goto out;' or 'return err;' to denote missing kfree()).
    - Comments on code lines or caret lines must never exceed 75 characters per line.
