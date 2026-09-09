@@ -41,7 +41,7 @@ path = "src/bin/benchmark.rs"
 test = false
 
 [features]
-default = ["bedrock"]
+default = []
 bedrock = ["aws-config", "aws-sdk-bedrockruntime", "aws-smithy-types"]
 vertex = ["google-cloud-auth"]
 

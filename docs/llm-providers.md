@@ -140,7 +140,8 @@ cp docs/examples/Settings.copilot-cli.toml Settings.toml
 ## AWS Bedrock
 
 Uses AWS Bedrock via the Converse API. Works with any Bedrock-hosted
-model (Claude, Llama, Mistral, etc.).
+model (Claude, Llama, Mistral, etc.). Requires building with
+`--features bedrock`.
 
 **Prerequisites:** Enable model access in the
 [AWS Bedrock console](https://console.aws.amazon.com/bedrock/) for your
