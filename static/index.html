@@ -2061,9 +2061,40 @@
             return escaped;
         }
 
+        function formatDateParts(unix) {
+            if (unix === null || unix === undefined || unix === '') {
+                return { dateStr: '-', timeStr: '' };
+            }
+            const num = typeof unix === 'number' ? unix : Number(unix);
+            if (isNaN(num) || !isFinite(num) || num <= 0) {
+                return { dateStr: '-', timeStr: '' };
+            }
+            const millis = num > 1e11 ? num : num * 1000;
+            const d = new Date(millis);
+            if (isNaN(d.getTime())) {
+                return { dateStr: '-', timeStr: '' };
+            }
+            try {
+                const dateStr = d.toISOString().split('T')[0];
+                const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                return { dateStr, timeStr };
+            } catch (e) {
+                return { dateStr: '-', timeStr: '' };
+            }
+        }
+
         function formatDate(unix, full = false) {
-            const d = new Date(unix * 1000);
-            return full ? d.toLocaleString() : d.toISOString().split('T')[0];
+            if (unix === null || unix === undefined || unix === '') return '-';
+            const num = typeof unix === 'number' ? unix : Number(unix);
+            if (isNaN(num) || !isFinite(num) || num <= 0) return '-';
+            const millis = num > 1e11 ? num : num * 1000;
+            const d = new Date(millis);
+            if (isNaN(d.getTime())) return '-';
+            try {
+                return full ? d.toLocaleString() : d.toISOString().split('T')[0];
+            } catch (e) {
+                return '-';
+            }
         }
 
         function copyToClipboard(input) {
@@ -2312,11 +2343,22 @@
                 state.bugSortOrder = (field === 'problem' || field === 'bugid') ? 'asc' : 'desc';
             }
             state.currentPage = 1;
-            renderTableHeaders();
+            updateTableHeader();
             fetchListData();
         };
 
+        let listFetchAbortController = null;
+        let listFetchRequestId = 0;
+
         async function fetchListData() {
+            if (listFetchAbortController) {
+                listFetchAbortController.abort();
+            }
+            listFetchAbortController = new AbortController();
+            const signal = listFetchAbortController.signal;
+            const currentReqId = ++listFetchRequestId;
+            const requestedMode = state.listMode;
+
             const endpoint = state.listMode === 'patchsets' ? '/api/patchsets' : (state.listMode === 'bugs' ? '/api/bugs' : '/api/messages');
             let url = `${endpoint}?page=${state.currentPage}&per_page=${state.perPage}`;
             if (state.searchQuery) {
@@ -2331,9 +2373,9 @@
                         state.totalPages = 1;
                         const tbody = document.getElementById('tableBody');
                         if (tbody) {
-                            tbody.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 32px 16px;">No subsystems selected. Check one or more subsystems to view bugs.</td></tr>';
+                            tbody.innerHTML = '<tr><td colspan="100%" style="text-align: center; color: var(--text-muted); padding: 32px 16px;">No subsystems selected. Check one or more subsystems to view bugs.</td></tr>';
                         }
-                        renderPagination();
+                        updatePagination(0);
                         return;
                     }
                     if (state.selectedSubsystems.size < state.bugSubsystemsList.length) {
@@ -2356,152 +2398,179 @@
                 }
             }
 
-            const res = await fetch(url);
-            const data = await res.json();
-
-            const items = data.items || [];
-            const total = data.total || 0;
-
-            state.totalPages = Math.ceil(total / state.perPage) || 1;
-
             const tbody = document.getElementById('tableBody');
-            tbody.innerHTML = '';
+            if (tbody) {
+                tbody.innerHTML = '<tr><td colspan="100%" style="text-align: center; color: var(--text-muted); padding: 48px 16px;">Loading...</td></tr>';
+            }
 
-            items.forEach((p, idx) => {
-                const row = document.createElement('tr');
+            try {
+                const res = await fetch(url, { signal });
+                if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+                const data = await res.json();
 
-                if (state.listMode === 'patchsets') {
-                    const d = new Date(p.date * 1000);
-                    const dateStr = d.toISOString().split('T')[0];
-                    const timeStr = d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-                    const dateHtml = `
-                        <div>${dateStr}</div>
-                        <div class="text-muted-sm">${timeStr}</div>
-                    `;
-                    const author = parseAuthor(p.author);
-                    const nameToDisplay = author.name || author.email;
-                    const emailToDisplay = author.name ? author.email : '';
-                    const authorHtml = `
-                        <div>${escapeHtml(nameToDisplay)}</div>
-                        ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
-                    `;
-
-                    const parts = (p.received_parts === p.total_parts && p.total_parts > 0)
-                        ? `${p.total_parts}`
-                        : `${p.received_parts || 0}/${p.total_parts || 0}`;
-
-                    const clickHandler = (e) => {
-                        if (e.target.closest('.copy-btn')) return;
-                        const target = `#/patchset/${encodeURIComponent(p.slug || p.message_id || p.id)}`;
-                        if (e.button === 1 || e.ctrlKey || e.metaKey) {
-                            window.open(target, '_blank');
-                        } else if (e.button === 0) {
-                            navigate(target);
-                        }
-                    };
-                    row.onclick = clickHandler;
-                    row.onauxclick = clickHandler;
-
-                    let tagsHtml = '';
-                    const lists = p.mailing_lists || p.subsystems;
-                    if (lists && Array.isArray(lists) && lists.length > 0) {
-                        tagsHtml = '<div style="margin-top:2px">' + lists.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
-                    }
-
-                    let statusLabel = p.status || 'Pending';
-                    let findingsHtml = '-';
-                    if (p.findings_low !== undefined || p.findings_medium !== undefined || p.findings_high !== undefined || p.findings_critical !== undefined) {
-                        const counts = {
-                            low: p.findings_low || 0,
-                            medium: p.findings_medium || 0,
-                            high: p.findings_high || 0,
-                            critical: p.findings_critical || 0
-                        };
-                        findingsHtml = renderFindingsBadges(counts, statusLabel);
-                    }
-
-                    row.innerHTML = `
-                        <td><div>${escapeHtml(p.subject) || '(no subject)'}</div>${tagsHtml}</td>
-                        <td style="line-height:1.2;">${authorHtml}</td>
-                        <td style="line-height:1.2;">${dateHtml}</td>
-                        <td>${parts}</td>
-                        <td><span class="status-badge status-${statusLabel.replace(/ /g, '')}">${statusLabel}</span></td>
-                        <td>${findingsHtml}</td>
-                    `;
-                } else if (state.listMode === 'bugs') {
-                    const clickHandler = (e) => {
-                        if (e.target.closest('.copy-btn')) return;
-                        const target = `#/bug/${encodeURIComponent(p.bugid || p.slug || p.id)}`;
-                        if (e.button === 1 || e.ctrlKey || e.metaKey) {
-                            window.open(target, '_blank');
-                        } else if (e.button === 0) {
-                            navigate(target);
-                        }
-                    };
-                    row.onclick = clickHandler;
-                    row.onauxclick = clickHandler;
-
-                    let tagsHtml = '';
-                    if (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0) {
-                        tagsHtml = '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
-                    }
-                    
-                    const sevStr = p.severity || 'Unknown';
-                    const sevColor = getSeverityColor(sevStr);
-                    const sevHtml = `<span style="color: ${sevColor}; font-weight: bold;">${escapeHtml(sevStr)}</span>`;
-                    
-                    const statusInfo = getBugStatus(p);
-
-                    // Use created_at for bugs
-                    let dBug = new Date((p.created_at || (p.date || 0)) * 1000);
-                    let dateStr = dBug.toISOString().split('T')[0];
-                    let timeStr = dBug.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-
-                    row.innerHTML = `
-                        <td><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}</td>
-                        <td style="line-height:1.2;">${sevHtml}</td>
-                        <td style="line-height:1.2;"><div>${dateStr}</div><div class="text-muted-sm">${timeStr}</div></td>
-                        <td><span class="status-badge ${statusInfo.cls}">${statusInfo.label}</span></td>
-                    `;
-                } else {
-                    const d = new Date(p.date * 1000);
-                    const dateStr = d.toISOString().split('T')[0];
-                    const timeStr = d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-                    const dateHtml = `
-                        <div>${dateStr}</div>
-                        <div class="text-muted-sm">${timeStr}</div>
-                    `;
-                    const author = parseAuthor(p.author);
-                    const nameToDisplay = author.name || author.email;
-                    const emailToDisplay = author.name ? author.email : '';
-                    const authorHtml = `
-                        <div>${escapeHtml(nameToDisplay)}</div>
-                        ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
-                    `;
-                    
-                    const clickHandler = (e) => {
-                        if (e.target.closest('.copy-btn')) return;
-                        const target = `#/message/${encodeURIComponent(p.message_id)}`;
-                        if (e.button === 1 || e.ctrlKey || e.metaKey) {
-                            window.open(target, '_blank');
-                        } else if (e.button === 0) {
-                            navigate(target);
-                        }
-                    };
-                    row.onclick = clickHandler;
-                    row.onauxclick = clickHandler;
-
-                    row.innerHTML = `
-                        <td>${escapeHtml(p.subject) || '(no subject)'}</td>
-                        <td style="line-height:1.2;">${authorHtml}</td>
-                        <td style="line-height:1.2;">${dateHtml}</td>
-                        <td><button class="copy-btn" onclick="event.stopPropagation(); copyToClipboard('${escapeHtml(p.message_id)}')">📋</button></td>
-                    `;
+                if (currentReqId !== listFetchRequestId || state.listMode !== requestedMode) {
+                    return;
                 }
-                tbody.appendChild(row);
-            });
 
-            updatePagination(total);
+                const items = data.items || [];
+                const total = data.total || 0;
+
+                state.totalPages = Math.ceil(total / state.perPage) || 1;
+
+                if (tbody) {
+                    tbody.innerHTML = '';
+                }
+
+                if (items.length === 0) {
+                    if (tbody) {
+                        tbody.innerHTML = '<tr><td colspan="100%" style="text-align: center; color: var(--text-muted); padding: 32px 16px;">No items found.</td></tr>';
+                    }
+                    updatePagination(0);
+                    return;
+                }
+
+                items.forEach((p, idx) => {
+                    const row = document.createElement('tr');
+
+                    if (state.listMode === 'patchsets') {
+                        const { dateStr, timeStr } = formatDateParts(p.date);
+                        const dateHtml = `
+                            <div>${dateStr}</div>
+                            ${timeStr ? `<div class="text-muted-sm">${timeStr}</div>` : ''}
+                        `;
+                        const author = parseAuthor(p.author);
+                        const nameToDisplay = author.name || author.email;
+                        const emailToDisplay = author.name ? author.email : '';
+                        const authorHtml = `
+                            <div>${escapeHtml(nameToDisplay)}</div>
+                            ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
+                        `;
+
+                        const parts = (p.received_parts === p.total_parts && p.total_parts > 0)
+                            ? `${p.total_parts}`
+                            : `${p.received_parts || 0}/${p.total_parts || 0}`;
+
+                        const clickHandler = (e) => {
+                            if (e.target.closest('.copy-btn')) return;
+                            const target = `#/patchset/${encodeURIComponent(p.slug || p.message_id || p.id)}`;
+                            if (e.button === 1 || e.ctrlKey || e.metaKey) {
+                                window.open(target, '_blank');
+                            } else if (e.button === 0) {
+                                navigate(target);
+                            }
+                        };
+                        row.onclick = clickHandler;
+                        row.onauxclick = clickHandler;
+
+                        let tagsHtml = '';
+                        const lists = p.mailing_lists || p.subsystems;
+                        if (lists && Array.isArray(lists) && lists.length > 0) {
+                            tagsHtml = '<div style="margin-top:2px">' + lists.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
+                        }
+
+                        let statusLabel = p.status || 'Pending';
+                        let findingsHtml = '-';
+                        if (p.findings_low !== undefined || p.findings_medium !== undefined || p.findings_high !== undefined || p.findings_critical !== undefined) {
+                            const counts = {
+                                low: p.findings_low || 0,
+                                medium: p.findings_medium || 0,
+                                high: p.findings_high || 0,
+                                critical: p.findings_critical || 0
+                            };
+                            findingsHtml = renderFindingsBadges(counts, statusLabel);
+                        }
+
+                        row.innerHTML = `
+                            <td><div>${escapeHtml(p.subject) || '(no subject)'}</div>${tagsHtml}</td>
+                            <td style="line-height:1.2;">${authorHtml}</td>
+                            <td style="line-height:1.2;">${dateHtml}</td>
+                            <td>${parts}</td>
+                            <td><span class="status-badge status-${statusLabel.replace(/ /g, '')}">${statusLabel}</span></td>
+                            <td>${findingsHtml}</td>
+                        `;
+                    } else if (state.listMode === 'bugs') {
+                        const clickHandler = (e) => {
+                            if (e.target.closest('.copy-btn')) return;
+                            const target = `#/bug/${encodeURIComponent(p.bugid || p.slug || p.id)}`;
+                            if (e.button === 1 || e.ctrlKey || e.metaKey) {
+                                window.open(target, '_blank');
+                            } else if (e.button === 0) {
+                                navigate(target);
+                            }
+                        };
+                        row.onclick = clickHandler;
+                        row.onauxclick = clickHandler;
+
+                        let tagsHtml = '';
+                        if (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0) {
+                            tagsHtml = '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
+                        }
+                        
+                        const sevStr = p.severity || 'Unknown';
+                        const sevColor = getSeverityColor(sevStr);
+                        const sevHtml = `<span style="color: ${sevColor}; font-weight: bold;">${escapeHtml(sevStr)}</span>`;
+                        
+                        const statusInfo = getBugStatus(p);
+
+                        const { dateStr, timeStr } = formatDateParts(p.created_at || p.date);
+
+                        row.innerHTML = `
+                            <td><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}</td>
+                            <td style="line-height:1.2;">${sevHtml}</td>
+                            <td style="line-height:1.2;"><div>${dateStr}</div>${timeStr ? `<div class="text-muted-sm">${timeStr}</div>` : ''}</td>
+                            <td><span class="status-badge ${statusInfo.cls}">${statusInfo.label}</span></td>
+                        `;
+                    } else {
+                        const { dateStr, timeStr } = formatDateParts(p.date);
+                        const dateHtml = `
+                            <div>${dateStr}</div>
+                            ${timeStr ? `<div class="text-muted-sm">${timeStr}</div>` : ''}
+                        `;
+                        const author = parseAuthor(p.author);
+                        const nameToDisplay = author.name || author.email;
+                        const emailToDisplay = author.name ? author.email : '';
+                        const authorHtml = `
+                            <div>${escapeHtml(nameToDisplay)}</div>
+                            ${emailToDisplay ? `<div class="text-muted-sm">${escapeHtml(emailToDisplay)}</div>` : ''}
+                        `;
+                        
+                        const clickHandler = (e) => {
+                            if (e.target.closest('.copy-btn')) return;
+                            const target = `#/message/${encodeURIComponent(p.message_id)}`;
+                            if (e.button === 1 || e.ctrlKey || e.metaKey) {
+                                window.open(target, '_blank');
+                            } else if (e.button === 0) {
+                                navigate(target);
+                            }
+                        };
+                        row.onclick = clickHandler;
+                        row.onauxclick = clickHandler;
+
+                        row.innerHTML = `
+                            <td>${escapeHtml(p.subject) || '(no subject)'}</td>
+                            <td style="line-height:1.2;">${authorHtml}</td>
+                            <td style="line-height:1.2;">${dateHtml}</td>
+                            <td><button class="copy-btn" onclick="event.stopPropagation(); copyToClipboard('${escapeHtml(p.message_id)}')">📋</button></td>
+                        `;
+                    }
+                    if (tbody) {
+                        tbody.appendChild(row);
+                    }
+                });
+
+                updatePagination(total);
+            } catch (err) {
+                if (err.name === 'AbortError') {
+                    // Intentionally aborted due to superseded request
+                    return;
+                }
+                console.error("fetchListData failed:", err);
+                if (currentReqId === listFetchRequestId && state.listMode === requestedMode) {
+                    if (tbody) {
+                        tbody.innerHTML = `<tr><td colspan="100%" style="text-align: center; color: var(--text-danger, #d73a49); padding: 32px 16px;">Failed to load data: ${escapeHtml(err.message)}</td></tr>`;
+                    }
+                }
+            }
         }
 
         function updatePagination(total) {
@@ -2714,6 +2783,7 @@
             if (state.listMode === mode) return;
             state.listMode = mode;
             state.currentPage = 1;
+
             if (mode === 'bugs') {
                 if (!state.bugStatus) {
                     state.bugStatus = 'open';
@@ -2724,11 +2794,11 @@
                     state.bugSortBy = 'severity';
                     state.bugSortOrder = 'desc';
                 }
-                await loadBugSubsystems();
             }
-            document.getElementById('btn-patchsets').classList.toggle('active', mode === 'patchsets');
-            document.getElementById('btn-messages').classList.toggle('active', mode === 'messages');
-            document.getElementById('btn-bugs').classList.toggle('active', mode === 'bugs');
+
+            document.getElementById('btn-patchsets')?.classList.toggle('active', mode === 'patchsets');
+            document.getElementById('btn-messages')?.classList.toggle('active', mode === 'messages');
+            document.getElementById('btn-bugs')?.classList.toggle('active', mode === 'bugs');
 
             const listSel = document.getElementById('listSelector');
             const bugFilters = document.getElementById('bugFilters');
@@ -2743,6 +2813,13 @@
 
             if (mode === 'bugs') {
                 renderSubsystemDropdown();
+                if (!state.bugSubsystemsList || state.bugSubsystemsList.length === 0) {
+                    loadBugSubsystems().then(() => {
+                        if (state.listMode === 'bugs') {
+                            renderSubsystemDropdown();
+                        }
+                    });
+                }
             }
 
             updateTableHeader();
