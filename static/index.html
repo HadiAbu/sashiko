@@ -2279,6 +2279,7 @@
                         <select id="bugStatusSelector" onchange="setBugFilter('status', this.value)">
                             <option value="" ${!state.bugStatus ? 'selected' : ''}>All Statuses</option>
                             <option value="open" ${state.bugStatus === 'open' ? 'selected' : ''}>Open</option>
+                            <option value="duplicate" ${state.bugStatus === 'duplicate' ? 'selected' : ''}>Duplicate</option>
                             <option value="dismissed" ${state.bugStatus === 'dismissed' ? 'selected' : ''}>Dismissed</option>
                             <option value="fixed" ${state.bugStatus === 'fixed' ? 'selected' : ''}>Fixed</option>
                         </select>
