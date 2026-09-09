@@ -1312,7 +1312,7 @@ impl Database {
             .conn
             .query(
                 "SELECT id, bug_id, kind, tool, model, author, created_at, content, data_json,
-                        tokens_in, tokens_out, tokens_cached, logs
+                        tokens_in, tokens_out, tokens_cached, NULL as logs
                  FROM bug_enrichments
                  WHERE bug_id = ?
                  ORDER BY created_at ASC, id ASC",
@@ -1445,17 +1445,29 @@ impl Database {
     }
 
     pub async fn get_bug_logs(&self, id: i64) -> Result<Option<String>> {
-        let enrichments = self.get_bug_enrichments(id).await?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT tool, logs FROM bug_enrichments
+                 WHERE bug_id = ? AND logs IS NOT NULL
+                 ORDER BY created_at ASC, id ASC",
+                libsql::params![id],
+            )
+            .await?;
         let mut combined = Vec::new();
-        for e in enrichments {
-            if let Some(logs_str) = e.logs {
+        while let Some(row) = rows.next().await? {
+            let tool: String = row.get(0)?;
+            let logs_opt: Option<String> = crate::compression::get_compressed_string_opt(&row, 1)
+                .unwrap_or(None)
+                .or_else(|| row.get::<Option<String>>(1).ok().flatten());
+            if let Some(logs_str) = logs_opt {
                 if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&logs_str) {
                     combined.extend(entries);
                 } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(&logs_str) {
                     combined.push(val);
                 } else {
                     combined.push(serde_json::json!({
-                        "role": e.tool,
+                        "role": tool,
                         "parts": [{"text": logs_str}]
                     }));
                 }
@@ -1840,13 +1852,63 @@ impl Database {
         let mut rows = self.conn.query(&select_sql, query_params).await?;
         let mut bugs = Vec::new();
         while let Some(row) = rows.next().await? {
-            let mut bug = Self::parse_bug_row_core(&row)?;
-            bug.subsystems = self
-                .get_subsystems_for_bug(bug.id)
-                .await
-                .unwrap_or_default();
-            bug.enrichments = self.get_bug_enrichments(bug.id).await.unwrap_or_default();
-            bugs.push(bug);
+            bugs.push(Self::parse_bug_row_core(&row)?);
+        }
+
+        if !bugs.is_empty() {
+            let bug_ids: Vec<i64> = bugs.iter().map(|b| b.id).collect();
+            let placeholders = vec!["?"; bug_ids.len()].join(", ");
+
+            // Batch fetch subsystems
+            let subs_sql = format!(
+                "SELECT bug_id, subsystem FROM bugs_subsystems WHERE bug_id IN ({}) ORDER BY subsystem ASC",
+                placeholders
+            );
+            let subs_params: Vec<libsql::Value> = bug_ids
+                .iter()
+                .map(|&id| libsql::Value::Integer(id))
+                .collect();
+            let mut subs_rows = self.conn.query(&subs_sql, subs_params).await?;
+            let mut subs_map: std::collections::HashMap<i64, Vec<String>> =
+                std::collections::HashMap::new();
+            while let Some(row) = subs_rows.next().await? {
+                let bug_id: i64 = row.get(0)?;
+                let sub: String = row.get(1)?;
+                subs_map.entry(bug_id).or_default().push(sub);
+            }
+
+            // Batch fetch enrichments (NULL as logs)
+            let enrichments_sql = format!(
+                "SELECT id, bug_id, kind, tool, model, author, created_at, content, data_json,
+                        tokens_in, tokens_out, tokens_cached, NULL as logs
+                 FROM bug_enrichments
+                 WHERE bug_id IN ({})
+                 ORDER BY created_at ASC, id ASC",
+                placeholders
+            );
+            let enr_params: Vec<libsql::Value> = bug_ids
+                .iter()
+                .map(|&id| libsql::Value::Integer(id))
+                .collect();
+            let mut enr_rows = self.conn.query(&enrichments_sql, enr_params).await?;
+            let mut enrichments_map: std::collections::HashMap<i64, Vec<BugEnrichment>> =
+                std::collections::HashMap::new();
+            while let Some(row) = enr_rows.next().await? {
+                let enrichment = Self::parse_bug_enrichment_row(&row)?;
+                enrichments_map
+                    .entry(enrichment.bug_id)
+                    .or_default()
+                    .push(enrichment);
+            }
+
+            for bug in &mut bugs {
+                if let Some(subs) = subs_map.remove(&bug.id) {
+                    bug.subsystems = subs;
+                }
+                if let Some(enrs) = enrichments_map.remove(&bug.id) {
+                    bug.enrichments = enrs;
+                }
+            }
         }
 
         Ok((bugs, total))

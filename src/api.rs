@@ -1647,6 +1647,7 @@ async fn list_bugs(
                     val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
                     val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
                     val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
+                    val.as_object_mut().map(|obj| obj.remove("enrichments"));
                     val
                 })
                 .collect();
