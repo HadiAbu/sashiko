@@ -3680,7 +3680,7 @@ impl Database {
     ) -> Result<Vec<MessageRow>> {
         let (where_clause, params) = self.build_search(query, mailing_list, "message");
         let sql = format!(
-            "SELECT id, message_id, thread_id, in_reply_to, author, subject, date, body, to_recipients, cc_recipients, git_blob_hash, mailing_list, references_hdr FROM messages {} ORDER BY date DESC LIMIT ? OFFSET ?",
+            "SELECT id, message_id, thread_id, in_reply_to, author, subject, date, NULL as body, to_recipients, cc_recipients, git_blob_hash, mailing_list, references_hdr FROM messages {} ORDER BY date DESC LIMIT ? OFFSET ?",
             where_clause
         );
 
@@ -3702,7 +3702,7 @@ impl Database {
                 author: row.get(4).ok(),
                 subject: row.get(5).ok(),
                 date: row.get(6).ok(),
-                body: crate::compression::get_compressed_string_opt(&row, 7).unwrap_or(None),
+                body: None,
                 to: row.get(8).ok(),
                 cc: row.get(9).ok(),
                 git_blob_hash: row.get(10).ok(),
