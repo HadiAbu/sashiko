@@ -2403,8 +2403,9 @@
                     row.onauxclick = clickHandler;
 
                     let tagsHtml = '';
-                    if (p.subsystems && Array.isArray(p.subsystems) && p.subsystems.length > 0) {
-                        tagsHtml = '<div style="margin-top:2px">' + p.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
+                    const lists = p.mailing_lists || p.subsystems;
+                    if (lists && Array.isArray(lists) && lists.length > 0) {
+                        tagsHtml = '<div style="margin-top:2px">' + lists.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
                     }
 
                     let statusLabel = p.status || 'Pending';
@@ -2988,8 +2989,9 @@
             const isGitSubmission = (data.message_id && (/^[0-9a-f]{40}$/.test(data.message_id) || data.message_id.includes('@sashiko.local'))) || (data.subject && data.subject.startsWith('Git Import:'));
 
             const threadHtml = isGitSubmission ? '' : renderThreadTree(data.thread);
-            const subsystemsHtml = data.subsystems?.length > 0
-                ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')
+            const mailingLists = data.mailing_lists || data.subsystems;
+            const mailingListsHtml = mailingLists?.length > 0
+                ? mailingLists.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')
                 : '-';
 
             let failureHtml = '';
@@ -3153,7 +3155,7 @@
                         return escapeHtml(a.name ? `${a.name} <${a.email}>` : a.email);
                     })()}</div></div>
                     <div class="kv"><div class="label">Date:</div><div>${date}</div></div>
-                    <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
+                    <div class="kv"><div class="label">Mailing Lists:</div><div>${mailingListsHtml}</div></div>
                     <div class="kv"><div class="label">Patches:</div><div>${data.received_parts || 0} / ${data.total_parts || 0}</div></div>
                     <div class="kv"><div class="label">Model:</div><div>${escapeHtml(providerModel)}</div></div>
                     <div class="kv"><div class="label">Sashiko ver.:</div><div>${escapeHtml(promptsHash)}</div></div>

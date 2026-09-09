@@ -42,6 +42,7 @@ pub struct PatchsetRow {
     pub message_id: Option<String>,
     pub total_parts: Option<u32>,
     pub received_parts: Option<u32>,
+    pub mailing_lists: Vec<String>,
     pub subsystems: Vec<String>,
     pub findings_low: Option<i64>,
     pub findings_medium: Option<i64>,
@@ -3638,6 +3639,7 @@ impl Database {
                         message_id: row.get(6).ok(),
                         total_parts: row.get(7).ok(),
                         received_parts: row.get(8).ok(),
+                        mailing_lists: subsystems.clone(),
                         subsystems,
                         findings_low: Some(low),
                         findings_medium: Some(medium),
@@ -4037,6 +4039,7 @@ impl Database {
                 "bugs": bugs_json,
                 "patches": patches,
                 "thread": messages,
+                "mailing_lists": subsystems.clone(),
                 "subsystems": subsystems,
                 "model_name": model_name,
                 "prompts_git_hash": prompts_git_hash,
@@ -4277,6 +4280,7 @@ impl Database {
                 "reviews": reviews,
                 "patches": patches,
                 "thread": messages,
+                "mailing_lists": subsystems.clone(),
                 "subsystems": subsystems,
                 "model_name": model_name,
                 "prompts_git_hash": prompts_git_hash,
@@ -4507,6 +4511,7 @@ impl Database {
                 message_id: row.get(6).ok(),
                 total_parts: row.get(7).ok(),
                 received_parts: row.get(8).ok(),
+                mailing_lists: Vec::new(),
                 subsystems: Vec::new(),
                 findings_low: None,
                 findings_medium: None,
@@ -4566,6 +4571,7 @@ impl Database {
                         message_id: row.get(6).ok(),
                         total_parts: row.get(7).ok(),
                         received_parts: row.get(8).ok(),
+                        mailing_lists: Vec::new(),
                         subsystems: Vec::new(),
                         findings_low: None,
                         findings_medium: None,
@@ -6952,6 +6958,27 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let count: i64 = row.get(0).unwrap();
         assert_eq!(count, 1);
+
+        let summary = db
+            .get_patchset_summary(ps1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["mailing_lists"], serde_json::json!(["test_sub"]));
+        assert_eq!(summary["subsystems"], serde_json::json!(["test_sub"]));
+
+        let details = db
+            .get_patchset_details(ps1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details["mailing_lists"], serde_json::json!(["test_sub"]));
+        assert_eq!(details["subsystems"], serde_json::json!(["test_sub"]));
+
+        let list_items = db.get_patchsets(50, 0, None, None).await.unwrap();
+        let found = list_items.iter().find(|p| p.id == ps1).unwrap();
+        assert_eq!(found.mailing_lists, vec!["test_sub".to_string()]);
+        assert_eq!(found.subsystems, vec!["test_sub".to_string()]);
     }
 
     #[tokio::test]
