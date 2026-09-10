@@ -4029,7 +4029,18 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             document.title = `${config.project_name || 'Sashiko'} - ${data.problem || bugid}`;
             const commit = (value, includeTag = false) => value ? `<code>${escapeHtml(formatCommitRef(value, includeTag))}</code>` : '';
 
-            const discoveryRows = (evidence.discoveries || []).map(d => `
+            const discoveryRows = (evidence.discoveries || []).map(d => {
+                let sourceHtml = 'Direct report';
+                if (d.patchset_id && d.patch_id) {
+                    const patchLabel = d.patch_part ? `Patch ${d.patch_part}` : `Patch #${d.patch_id}`;
+                    sourceHtml = `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a> (<a href="#/patchset/${encodeURIComponent(d.patchset_id)}?patch=${encodeURIComponent(d.patch_id)}">${escapeHtml(patchLabel)}</a>)`;
+                } else if (d.patchset_id) {
+                    sourceHtml = `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a>`;
+                } else if (d.commit) {
+                    sourceHtml = `Commit <code>${escapeHtml(formatCommitRef(d.commit))}</code>`;
+                }
+
+                return `
                 <div class="review-card" style="margin-bottom: 10px;">
                     <div style="display:flex; justify-content:space-between; align-items:flex-start; gap: 8px;">
                         <a href="#/bug/${encodeURIComponent(d.bugid)}" style="font-weight:bold; font-size:1.05em;">${escapeHtml(d.bugid)}</a>
@@ -4040,13 +4051,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         <div>${bugAttribution(d)}</div>
                         <div class="review-meta-label">Source:</div>
                         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-                            <span>${d.patchset_id ? `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a>` : d.commit ? `Commit <code>${escapeHtml(formatCommitRef(d.commit))}</code>` : 'Direct report'}
-                            ${d.legacy ? ' <span class="text-muted-sm">· Historical report; discovery metadata incomplete</span>' : ''}</span>
+                            <span>${sourceHtml}${d.legacy ? ' <span class="text-muted-sm">· Historical report; discovery metadata incomplete</span>' : ''}</span>
                             <a href="${bugLogLink(d.bugid, d.enrichment_id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.9em; font-weight:500;">View source ↗</a>
                         </div>
                     </div>
                 </div>
-            `).join('');
+            `;
+            }).join('');
 
             const activityRows = activity.map(e => {
                 const category = e.kind === 'comment' ? 'comments' : e.kind === 'audit' || e.kind === 'deduplication' ? 'changes' : 'analysis';

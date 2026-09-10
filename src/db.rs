@@ -1654,7 +1654,22 @@ impl Database {
 
     pub async fn bug_evidence(&self, id: i64) -> Result<serde_json::Value> {
         let family = self.bug_family(id, false).await?;
-        let mut discoveries = Vec::new();
+        struct RawDiscovery<'a> {
+            bug_id: i64,
+            bugid: String,
+            reporter: String,
+            reported_at: i64,
+            record: Option<&'a BugEnrichment>,
+            patchset_id: Option<i64>,
+            patch_id: Option<i64>,
+            commit: Option<String>,
+            model: Option<String>,
+            tool: Option<String>,
+        }
+
+        let mut raw_discoveries = Vec::new();
+        let mut patch_ids_to_query = std::collections::HashSet::new();
+        let mut bugs_needing_review_lookup = Vec::new();
         let mut activity = Vec::new();
         let mut models = std::collections::BTreeSet::new();
         let mut tools = std::collections::BTreeSet::new();
@@ -1663,7 +1678,9 @@ impl Database {
             let candidates: Vec<_> = bug
                 .enrichments
                 .iter()
-                .filter(|e| e.kind == "candidate" || e.kind == "discovery")
+                .filter(|e| {
+                    e.kind == "candidate" || e.kind == "discovery" || e.kind == "raw_candidate"
+                })
                 .collect();
             // A legacy report without a candidate still represents one discovery.
             let records: Vec<Option<&BugEnrichment>> = if candidates.is_empty() {
@@ -1701,16 +1718,42 @@ impl Database {
                 if let Some(ref t) = tool {
                     tools.insert(t.clone());
                 }
-                discoveries.push(json!({
-                    "bug_id": bug.id, "bugid": bug.bugid,
-                    "enrichment_id": record.map(|e| e.id),
-                    "author": record.and_then(|e| e.author.as_deref()).unwrap_or(&bug.reporter),
-                    "tool": tool, "model": model,
-                    "created_at": record.map(|e| e.created_at).unwrap_or(bug.reported_at),
-                    "patchset_id": bug.discovered_in_patchset_id,
-                    "commit": bug.discovered_in_commit,
-                    "legacy": record.is_none()
-                }));
+
+                let patchset_id = record
+                    .and_then(|e| e.data_json.as_ref())
+                    .and_then(|d| d.get("patchset_id"))
+                    .and_then(|v| v.as_i64())
+                    .or(bug.discovered_in_patchset_id);
+                let patch_id = record
+                    .and_then(|e| e.data_json.as_ref())
+                    .and_then(|d| d.get("patch_id"))
+                    .and_then(|v| v.as_i64())
+                    .or(bug.discovered_in_patch_id);
+                let commit = record
+                    .and_then(|e| e.data_json.as_ref())
+                    .and_then(|d| d.get("commit_sha"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| bug.discovered_in_commit.clone());
+
+                if let Some(pid) = patch_id {
+                    patch_ids_to_query.insert(pid);
+                } else if patchset_id.is_none() {
+                    bugs_needing_review_lookup.push(bug.id);
+                }
+
+                raw_discoveries.push(RawDiscovery {
+                    bug_id: bug.id,
+                    bugid: bug.bugid.clone(),
+                    reporter: bug.reporter.clone(),
+                    reported_at: bug.reported_at,
+                    record,
+                    patchset_id,
+                    patch_id,
+                    commit,
+                    model,
+                    tool,
+                });
             }
             for enrichment in &bug.enrichments {
                 let mut event = serde_json::to_value(enrichment)?;
@@ -1765,6 +1808,107 @@ impl Database {
                 activity.push(event);
             }
         }
+
+        // If some discoveries have missing patch_id and patchset_id, query review_bugs
+        if !bugs_needing_review_lookup.is_empty() {
+            let mut review_links: std::collections::HashMap<i64, (Option<i64>, Option<i64>)> =
+                std::collections::HashMap::new();
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT rb.bug_id, r.patchset_id, r.patch_id
+                     FROM review_bugs rb
+                     JOIN reviews r ON r.id = rb.review_id
+                     WHERE rb.bug_id IN (SELECT value FROM json_each(?))
+                     ORDER BY r.id ASC",
+                    libsql::params![serde_json::to_string(&bugs_needing_review_lookup)?],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let b_id: i64 = row.get(0)?;
+                let ps_id: Option<i64> = row.get(1).ok().flatten();
+                let p_id: Option<i64> = row.get(2).ok().flatten();
+                review_links.entry(b_id).or_insert((ps_id, p_id));
+            }
+            for raw in &mut raw_discoveries {
+                if raw.patch_id.is_none()
+                    && raw.patchset_id.is_none()
+                    && let Some(&(ps_id, p_id)) = review_links.get(&raw.bug_id)
+                {
+                    raw.patchset_id = ps_id;
+                    raw.patch_id = p_id;
+                    if let Some(pid) = p_id {
+                        patch_ids_to_query.insert(pid);
+                    }
+                }
+            }
+        }
+
+        // Query patches table to resolve part_index and ensure patchset_id is populated
+        let mut patch_info: std::collections::HashMap<i64, (Option<i64>, Option<i64>)> =
+            std::collections::HashMap::new();
+        if !patch_ids_to_query.is_empty() {
+            let pids: Vec<i64> = patch_ids_to_query.into_iter().collect();
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id, patchset_id, part_index
+                     FROM patches
+                     WHERE id IN (SELECT value FROM json_each(?))",
+                    libsql::params![serde_json::to_string(&pids)?],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let pid: i64 = row.get(0)?;
+                let ps_id: Option<i64> = row.get(1).ok().flatten();
+                let part: Option<i64> = row.get(2).ok().flatten();
+                patch_info.insert(pid, (ps_id, part));
+            }
+        }
+
+        let mut discoveries = Vec::new();
+        for raw in raw_discoveries {
+            let mut patchset_id = raw.patchset_id;
+            let mut patch_part = None;
+            if let Some(pid) = raw.patch_id
+                && let Some(&(p_ps_id, part)) = patch_info.get(&pid)
+            {
+                if patchset_id.is_none() {
+                    patchset_id = p_ps_id;
+                }
+                patch_part = part;
+            }
+
+            let author = raw
+                .record
+                .and_then(|e| e.author.as_deref())
+                .unwrap_or(&raw.reporter);
+            let author = if author == "sashiko" {
+                if self.has_bug_actor() {
+                    self.bug_actor()
+                } else {
+                    "sashiko.dev"
+                }
+            } else {
+                author
+            };
+
+            discoveries.push(json!({
+                "bug_id": raw.bug_id,
+                "bugid": raw.bugid,
+                "enrichment_id": raw.record.map(|e| e.id),
+                "author": author,
+                "tool": raw.tool,
+                "model": raw.model,
+                "created_at": raw.record.map(|e| e.created_at).unwrap_or(raw.reported_at),
+                "patchset_id": patchset_id,
+                "patch_id": raw.patch_id,
+                "patch_part": patch_part,
+                "commit": raw.commit,
+                "legacy": raw.record.is_none()
+            }));
+        }
+
         activity.sort_by_key(|e| {
             (
                 e["created_at"].as_i64().unwrap_or(0),
@@ -6166,6 +6310,234 @@ mod tests {
 
         let enrichments = db.get_bug_enrichments(bug_id).await?;
         assert_eq!(enrichments[0].model.as_deref(), Some("test-model"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_discoveries_record_patch_and_patchset_and_multiple_occurrences() -> Result<()>
+    {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("t1", "subj", 100).await?;
+        db.create_message(
+            "m1", thread_id, None, "auth", "subj 1", 100, "", "", "", None, None,
+        )
+        .await?;
+        db.create_message(
+            "patch1_m1",
+            thread_id,
+            Some("m1"),
+            "auth",
+            "patch 1",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_message(
+            "patch1_m2",
+            thread_id,
+            Some("m1"),
+            "auth",
+            "patch 2",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+
+        // Patchset 1 with 2 patches
+        let ps1_id = db
+            .create_patchset(
+                thread_id, None, "m1", "subj 1", "auth", 100, 2, 0, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await?
+            .unwrap();
+        let p1_id = db.create_patch(ps1_id, "patch1_m1", 1, "diff1").await?;
+        let p2_id = db.create_patch(ps1_id, "patch1_m2", 2, "diff2").await?;
+
+        db.create_message(
+            "m2", thread_id, None, "auth", "subj 2", 200, "", "", "", None, None,
+        )
+        .await?;
+        db.create_message(
+            "patch2_m1",
+            thread_id,
+            Some("m2"),
+            "auth",
+            "patch 1",
+            200,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+
+        // Patchset 2 with 1 patch
+        let ps2_id = db
+            .create_patchset(
+                thread_id, None, "m2", "subj 2", "auth", 200, 1, 0, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await?
+            .unwrap();
+        let p3_id = db.create_patch(ps2_id, "patch2_m1", 1, "diff3").await?;
+
+        // 1. Initial bug discovered while reviewing patch 1 of patchset 1
+        let bug1 = NewBug {
+            bugid: "linux-bug-multi-1".to_string(),
+            title: "Preexisting bug".to_string(),
+            status: "open".to_string(),
+            reporter: "sashiko.dev".to_string(),
+            reported_at: 1000,
+            discovered_in_patchset_id: Some(ps1_id),
+            discovered_in_patch_id: Some(p1_id),
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec!["net".to_string()],
+        };
+        let bug1_id = db
+            .create_bug_with_enrichment(
+                &bug1,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "sashiko:linux_patch_review".to_string(),
+                    model: Some("gemini-1.5-pro".to_string()),
+                    author: Some("sashiko.dev".to_string()),
+                    created_at: 1000,
+                    content: Some("First discovery".to_string()),
+                    data_json: Some(json!({
+                        "patchset_id": ps1_id,
+                        "patch_id": p1_id,
+                    })),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        // 2. Same bug discovered while reviewing patch 2 of patchset 1 -> duplicate of bug 1
+        let bug2 = NewBug {
+            bugid: "linux-bug-multi-2".to_string(),
+            title: "Preexisting bug copy 2".to_string(),
+            status: "raw".to_string(),
+            reporter: "sashiko.dev".to_string(),
+            reported_at: 2000,
+            discovered_in_patchset_id: Some(ps1_id),
+            discovered_in_patch_id: Some(p2_id),
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec!["net".to_string()],
+        };
+        let bug2_id = db
+            .create_bug_with_enrichment(
+                &bug2,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "sashiko:linux_patch_review".to_string(),
+                    model: Some("gemini-1.5-pro".to_string()),
+                    author: Some("sashiko.dev".to_string()),
+                    created_at: 2000,
+                    content: Some("Second discovery".to_string()),
+                    data_json: Some(json!({
+                        "patchset_id": ps1_id,
+                        "patch_id": p2_id,
+                    })),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: bug2_id,
+            canonical_id: bug1_id,
+            reasoning: "Duplicate of bug 1",
+            ..Default::default()
+        })
+        .await?;
+
+        // 3. Same bug discovered while reviewing patch 1 of patchset 2 -> duplicate of bug 1
+        let bug3 = NewBug {
+            bugid: "linux-bug-multi-3".to_string(),
+            title: "Preexisting bug copy 3".to_string(),
+            status: "raw".to_string(),
+            reporter: "sashiko.dev".to_string(),
+            reported_at: 3000,
+            discovered_in_patchset_id: Some(ps2_id),
+            discovered_in_patch_id: Some(p3_id),
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec!["net".to_string()],
+        };
+        let bug3_id = db
+            .create_bug_with_enrichment(
+                &bug3,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "sashiko:linux_patch_review".to_string(),
+                    model: Some("gemini-2.0-flash".to_string()),
+                    author: Some("sashiko.dev".to_string()),
+                    created_at: 3000,
+                    content: Some("Third discovery".to_string()),
+                    data_json: Some(json!({
+                        "patchset_id": ps2_id,
+                        "patch_id": p3_id,
+                    })),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: bug3_id,
+            canonical_id: bug1_id,
+            reasoning: "Duplicate of bug 1",
+            ..Default::default()
+        })
+        .await?;
+
+        // Query bug_evidence for canonical bug 1
+        let evidence = db.bug_evidence(bug1_id).await?;
+        assert_eq!(evidence["count"], 3);
+
+        let discoveries = evidence["discoveries"].as_array().unwrap();
+        assert_eq!(discoveries.len(), 3);
+
+        // First discovery
+        assert_eq!(discoveries[0]["bug_id"], bug1_id);
+        assert_eq!(discoveries[0]["author"], "sashiko.dev");
+        assert_eq!(discoveries[0]["tool"], "sashiko:linux_patch_review");
+        assert_eq!(discoveries[0]["patchset_id"], ps1_id);
+        assert_eq!(discoveries[0]["patch_id"], p1_id);
+        assert_eq!(discoveries[0]["patch_part"], 1);
+
+        // Second discovery
+        assert_eq!(discoveries[1]["bug_id"], bug2_id);
+        assert_eq!(discoveries[1]["author"], "sashiko.dev");
+        assert_eq!(discoveries[1]["tool"], "sashiko:linux_patch_review");
+        assert_eq!(discoveries[1]["patchset_id"], ps1_id);
+        assert_eq!(discoveries[1]["patch_id"], p2_id);
+        assert_eq!(discoveries[1]["patch_part"], 2);
+
+        // Third discovery
+        assert_eq!(discoveries[2]["bug_id"], bug3_id);
+        assert_eq!(discoveries[2]["author"], "sashiko.dev");
+        assert_eq!(discoveries[2]["tool"], "sashiko:linux_patch_review");
+        assert_eq!(discoveries[2]["patchset_id"], ps2_id);
+        assert_eq!(discoveries[2]["patch_id"], p3_id);
+        assert_eq!(discoveries[2]["patch_part"], 1);
 
         Ok(())
     }
