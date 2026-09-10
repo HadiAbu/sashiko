@@ -4125,27 +4125,17 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 </div>
 
                 <div class="controls" style="margin-top: 20px; margin-bottom: 16px; border-bottom: 1px solid var(--border-light); padding-bottom: 8px;" role="tablist" aria-label="Bug details" onkeydown="bugTabKeydown(event)">
-                    <button class="active" id="bug-tab-overview" role="tab" data-bug-tab="overview" aria-controls="bug-panel-overview" aria-selected="true" tabindex="0" onclick="setBugTab('overview')">Overview</button>
+                    <button class="active" id="bug-tab-description" role="tab" data-bug-tab="description" aria-controls="bug-panel-description" aria-selected="true" tabindex="0" onclick="setBugTab('description')">Description</button>
                     <button id="bug-tab-discoveries" role="tab" data-bug-tab="discoveries" aria-controls="bug-panel-discoveries" aria-selected="false" tabindex="-1" onclick="setBugTab('discoveries')">Discoveries (${evidence.count})</button>
                     <button id="bug-tab-activity" role="tab" data-bug-tab="activity" aria-controls="bug-panel-activity" aria-selected="false" tabindex="-1" onclick="setBugTab('activity')">Activity &amp; Audit (${activity.length})</button>
                 </div>
 
-                <div id="bug-panel-overview" data-bug-panel="overview" role="tabpanel" aria-labelledby="bug-tab-overview">
+                <div id="bug-panel-description" data-bug-panel="description" role="tabpanel" aria-labelledby="bug-tab-description">
                     <div class="section">
-                        <h2>Finding</h2>
                         ${report ? `
-                            <div class="review-card" style="border-left: 3px solid ${sevColor}; margin-top: 10px;">
-                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                                    <span class="review-meta-label">Defect Report</span>
-                                    <button class="copy-btn" onclick="copyToClipboard(this.closest('.review-card').querySelector('.log-inline-block'))">Copy</button>
-                                </div>
-                                <div class="log-inline-block">${escapeHtml(report, true, false)}</div>
-                                ${data.severity_explanation ? `
-                                    <div style="margin-top: 16px;">
-                                        <div class="review-meta-label" style="margin-bottom: 8px;">Impact Assessment</div>
-                                        <div class="log-inline-block">${escapeHtml(data.severity_explanation, true, false)}</div>
-                                    </div>
-                                ` : ''}
+                            <div style="position: relative; margin-top: 10px;">
+                                <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                <div class="log-inline-block" style="padding-right: 55px;">${escapeHtml(report, true, false)}</div>
                             </div>
                         ` : `
                             <p class="status-placeholder">${data.status === 'raw' || data.status === 'processing' ? 'Analysis is in progress. The report will appear here when it is ready.' : 'No report has been recorded. Check the activity history for available findings.'}</p>
