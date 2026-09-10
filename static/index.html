@@ -1308,56 +1308,25 @@
             line-height: 1.5;
             margin-bottom: 20px;
         }
-        .bug-eyebrow, .bug-attribution, .bug-row-heading, .bug-toolbar, .bug-source { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; }
-        .bug-eyebrow, .bug-attribution, .bug-row-heading time { color: var(--text-muted); font-size: 12px; }
-        .bug-eyebrow { margin-top: 20px; overflow-wrap: anywhere; }
-        .bug-toolbar { margin: 18px 0 24px; }
-        .bug-log-link { margin-left: auto; text-decoration: none; }
-        .bug-actions { position: relative; }
-        .bug-actions summary, .bug-log-link { cursor: pointer; border: 1px solid var(--border); background: var(--btn-bg); border-radius: 3px; padding: 4px 10px; }
-        .bug-action-menu { position: absolute; top: 100%; left: 0; z-index: 20; background: var(--card-bg); border: 1px solid var(--border); padding: 8px; min-width: 180px; box-shadow: 0 4px 12px #0002; }
-        .bug-action-menu .btn { display: block; width: 100%; text-align: left; margin: 4px 0; }
-        .bug-notice { margin-bottom: 20px; }
-        .bug-evidence-strip { display: flex; align-items: stretch; background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; margin: 20px 0; }
-        .bug-evidence-strip button { font: inherit; color: var(--text); background: transparent; border: 0; border-right: 1px solid var(--border); padding: 16px 24px; cursor: pointer; min-width: 110px; }
-        .bug-evidence-strip button:hover { background: var(--hover); }
-        .bug-evidence-strip strong { display: block; font-size: 24px; margin-bottom: 4px; }
-        .bug-evidence-strip span { color: var(--text-muted); font-size: 12px; }
-        .bug-evidence-strip p { align-self: center; padding: 0 20px; color: var(--text-muted); font-size: 12px; max-width: 480px; line-height: 1.6; }
-        .bug-tabs { display: flex; gap: 8px; border-bottom: 1px solid var(--border); margin-bottom: 24px; padding-bottom: 12px; }
-        .bug-tabs .active { border-color: var(--link); color: var(--link); }
-        .bug-overview-grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr); gap: 32px; }
-        .bug-overview-grid aside { border-left: 1px solid var(--border); padding-left: 24px; }
-        .bug-overview-grid .kv { flex-wrap: wrap; }
-        .bug-overview-grid .kv .label { min-width: 100px; }
-        .bug-prose { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; margin: 12px 0; }
-        .bug-empty { color: var(--text-muted); line-height: 1.6; }
-        .bug-file, .bug-diversity { margin: 12px 0; overflow-wrap: anywhere; }
-        .bug-row-heading { justify-content: space-between; }
-        .bug-row-heading h2 { margin-bottom: 8px; }
-        .bug-discovery, .bug-activity { border-bottom: 1px solid var(--border); padding: 18px 0; overflow-wrap: anywhere; }
-        .bug-discovery .bug-attribution, .bug-activity .bug-attribution { margin: 8px 0; }
-        .bug-source { font-size: 12px; margin-top: 12px; }
-        .bug-source > a:last-child { margin-left: auto; }
-        .bug-event-kind { text-transform: capitalize; }
-        .bug-event-detail summary, .bug-raw-event summary { cursor: pointer; padding: 8px 0; }
-        .bug-record-link { font-size: 12px; display: inline-block; margin-top: 8px; }
-        .bug-raw-event { margin: 16px 0; }
-        .bug-raw-block { position: relative; }
-        .bug-raw-block > .copy-btn { position: absolute; right: 8px; top: 8px; }
-        .bug-raw-block pre { padding-top: 36px; white-space: pre-wrap; overflow-wrap: anywhere; }
-        [data-bug-panel][hidden], [data-bug-activity][hidden] { display: none; }
-        @media (max-width: 700px) {
-            .bug-title { flex-direction: column; align-items: flex-start; gap: 8px; }
-            body:has([data-bug-tab]) .kbd-hint { display: none; }
-            .bug-overview-grid { grid-template-columns: minmax(0, 1fr); gap: 12px; }
-            .bug-overview-grid aside { border-left: 0; padding-left: 0; }
-            .bug-evidence-strip { flex-wrap: wrap; }
-            .bug-evidence-strip button { min-width: 0; flex: 1; padding: 14px 8px; }
-            .bug-evidence-strip p { padding: 0 14px; }
-            .bug-log-link { margin-left: 0; }
-            .bug-tabs { gap: 4px; }
-            .bug-tabs .btn { padding-left: 8px; padding-right: 8px; }
+        #bugActionModal .modal-content { max-width: 480px; }
+        button.primary,
+        .btn.primary {
+            background: var(--link);
+            color: #fff;
+            border-color: var(--link);
+        }
+        button.primary:hover,
+        .btn.primary:hover {
+            opacity: 0.9;
+        }
+        .subsystem-dropdown summary::-webkit-details-marker {
+            display: none;
+        }
+        .subsystem-dropdown summary {
+            list-style: none;
+        }
+        [data-bug-panel][hidden], [data-bug-activity][hidden] {
+            display: none;
         }
 </style>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
@@ -3668,9 +3637,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         }
 
         function bugAttribution(record) {
-            return `<span>By <strong>${escapeHtml(record.author || 'Not recorded')}</strong></span>
-                <span>Tool: ${escapeHtml(record.tool || 'Not recorded')}</span>
-                <span>Model: ${escapeHtml(record.model || (['web', 'api', 'human'].includes(record.tool) ? 'Not used' : 'Not recorded'))}</span>`;
+            const author = escapeHtml(record.author || 'Not recorded');
+            const tool = escapeHtml(record.tool || 'Not recorded');
+            const model = escapeHtml(record.model || (['web', 'api', 'human'].includes(record.tool) ? 'Not used' : 'Not recorded'));
+            return `<strong>${author}</strong> <span class="text-muted-sm">&middot; Tool: <code>${tool}</code> &middot; Model: <code>${model}</code></span>`;
         }
 
         function setBugTab(tab) {
@@ -3713,90 +3683,194 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             if (!res.ok) throw new Error('Bug could not be loaded');
             const data = await res.json();
             const bugid = data.bugid || data.slug || data.internal_id;
-            const id = Number(data.internal_id);
+            const id = Number(data.internal_id || data.id);
             const evidence = data.evidence || { count: 0, models: [], tools: [], discoveries: [], activity: [] };
             const status = getBugStatus(data);
             const severity = data.severity || 'Unknown';
+            const sevColor = getSeverityColor(severity);
             const report = data.description || data.inline_review;
             const activity = evidence.activity || [];
             document.title = `${config.project_name || 'Sashiko'} - ${data.problem || bugid}`;
-            const kv = (label, value) => value ? `<div class="kv"><div class="label">${label}</div><div>${value}</div></div>` : '';
             const commit = value => value ? `<code>${escapeHtml(formatCommitRef(value))}</code>` : '';
-            const discoveryRows = evidence.discoveries.map(d => `<article class="bug-discovery">
-                <div class="bug-row-heading"><a href="#/bug/${encodeURIComponent(d.bugid)}">${escapeHtml(d.bugid)}</a><time>${formatDate(d.created_at, true)}</time></div>
-                <div class="bug-attribution">${bugAttribution(d)}</div>
-                <div class="bug-source">${d.patchset_id ? `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a>` : d.commit ? `Commit ${commit(d.commit)}` : 'Direct report'}
-                    ${d.legacy ? '<span class="text-muted-sm"> · Historical report; discovery metadata incomplete</span>' : ''}
-                    <a href="${bugLogLink(d.bugid, d.enrichment_id)}" target="_blank" rel="noopener noreferrer">View source ↗</a>
+
+            const discoveryRows = (evidence.discoveries || []).map(d => `
+                <div class="review-card" style="margin-bottom: 10px;">
+                    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap: 8px;">
+                        <a href="#/bug/${encodeURIComponent(d.bugid)}" style="font-weight:bold; font-size:1.05em;">${escapeHtml(d.bugid)}</a>
+                        <span class="text-muted-sm">${formatDate(d.created_at, true)}</span>
+                    </div>
+                    <div class="review-meta" style="margin-top: 6px;">
+                        <div class="review-meta-label">Attribution:</div>
+                        <div>${bugAttribution(d)}</div>
+                        <div class="review-meta-label">Source:</div>
+                        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                            <span>${d.patchset_id ? `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a>` : d.commit ? `Commit <code>${escapeHtml(formatCommitRef(d.commit))}</code>` : 'Direct report'}
+                            ${d.legacy ? ' <span class="text-muted-sm">· Historical report; discovery metadata incomplete</span>' : ''}</span>
+                            <a href="${bugLogLink(d.bugid, d.enrichment_id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.9em; font-weight:500;">View source ↗</a>
+                        </div>
+                    </div>
                 </div>
-            </article>`).join('');
+            `).join('');
+
             const activityRows = activity.map(e => {
                 const category = e.kind === 'comment' ? 'comments' : e.kind === 'audit' || e.kind === 'deduplication' ? 'changes' : 'analysis';
                 const label = (e.kind || 'enrichment').replace(/_run$/, '').replace(/_/g, ' ');
-                return `<article class="bug-activity" data-bug-activity="${category}">
-                    <div class="bug-row-heading"><strong class="bug-event-kind">${escapeHtml(label)}</strong><time>${formatDate(e.created_at, true)}</time></div>
-                    <div class="bug-attribution">${bugAttribution(e)}</div>
-                    ${e.bugid !== bugid ? `<div class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(e.bugid)}">${escapeHtml(e.bugid)}</a></div>` : ''}
-                    ${e.content ? (category === 'comments' || category === 'changes'
-                        ? `<div class="bug-prose">${escapeHtml(e.content)}</div>`
-                        : `<details class="bug-event-detail"><summary>Read ${escapeHtml(label)}</summary><div class="bug-prose">${escapeHtml(e.content)}</div></details>`) : ''}
-                    <a class="bug-record-link" href="${bugLogLink(e.bugid, e.id)}" target="_blank" rel="noopener noreferrer">Full record ↗</a>
-                </article>`;
+                return `
+                    <div class="review-card" data-bug-activity="${category}" style="margin-bottom: 10px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                            <div style="display:flex; align-items:center; gap: 8px;">
+                                <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(label)}</span>
+                                ${e.bugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(e.bugid)}">${escapeHtml(e.bugid)}</a></span>` : ''}
+                            </div>
+                            <span class="text-muted-sm">${formatDate(e.created_at, true)}</span>
+                        </div>
+                        <div class="review-meta" style="margin-top: 4px;">
+                            <div class="review-meta-label">Actor:</div>
+                            <div>${bugAttribution(e)}</div>
+                        </div>
+                        ${e.content ? (category === 'comments' || category === 'changes'
+                            ? `<div class="log-inline-block" style="margin-top: 8px;">${escapeHtml(e.content, true, false)}</div>`
+                            : `<div style="margin-top: 8px;">
+                                <button class="toggle-btn" onclick="toggleCollapsible('act-${e.id}', this)">▶ Read ${escapeHtml(label)}</button>
+                                <div id="act-${e.id}" class="collapsible" style="position: relative; margin-top: 6px;">
+                                    <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                    <div class="log-inline-block">${escapeHtml(e.content, true, false)}</div>
+                                </div>
+                            </div>`) : ''}
+                        <div style="margin-top: 8px; text-align: right;">
+                            <a href="${bugLogLink(e.bugid, e.id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.85em; color:var(--text-dim);">Full record ↗</a>
+                        </div>
+                    </div>
+                `;
             }).join('');
+
+            const subsystemsHtml = (data.subsystems && data.subsystems.length > 0)
+                ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')
+                : '<span class="status-placeholder">None</span>';
+
+            const locationsHtml = formatLocations(data.locations) || (data.source_files || []).map(f => `<code>${escapeHtml(f)}</code>`).join(' ');
+
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
-                <div class="bug-eyebrow"><code>${escapeHtml(bugid)}</code> <strong style="color:${getSeverityColor(severity)}">${escapeHtml(severity)} severity</strong> <span>Reported ${formatDate(data.reported_at || data.created_at, true)}</span></div>
-                <h1 class="bug-title"><span>${escapeHtml(data.problem || data.title || 'Untitled bug')}</span><span class="status-badge ${status.cls}">${status.label}</span></h1>
-                <div class="bug-toolbar">
-                    <button class="btn primary" onclick="openBugActionModal('comment', '${id}')">Add comment</button>
-                    <details class="bug-actions"><summary class="btn">Change status</summary><div class="bug-action-menu">
-                        ${!['closed', 'fixed'].includes(data.status) ? `<button class="btn" onclick="openBugActionModal('close', '${id}')">Close bug</button>` : ''}
-                        ${data.status !== 'dismissed' ? `<button class="btn" onclick="openBugActionModal('dismiss', '${id}')">Dismiss finding</button>` : ''}
-                        ${data.status !== 'duplicate' ? `<button class="btn" onclick="openBugActionModal('mark_duplicate', '${id}')">Mark as duplicate</button>` : ''}
-                    </div></details>
-                    <a class="btn bug-log-link" href="${bugLogLink(bugid)}" target="_blank" rel="noopener noreferrer">Full logs &amp; raw data ↗</a>
+                <h1>
+                    <span>${escapeHtml(data.problem || data.title || 'Untitled bug')}</span>
+                    <span class="status-badge ${status.cls}">${status.label}</span>
+                </h1>
+
+                <div class="controls" style="margin-bottom: 16px;">
+                    <button class="primary" onclick="openBugActionModal('comment', '${id}')">Add Comment</button>
+                    <details class="subsystem-dropdown" id="bugStatusDropdown" style="position:relative; display:inline-block;">
+                        <summary class="subsystem-dropdown-btn">Change Status ▾</summary>
+                        <div class="subsystem-dropdown-menu" style="display:block; min-width:180px;">
+                            ${!['closed', 'fixed'].includes(data.status) ? `<div class="subsystem-item" onclick="openBugActionModal('close', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Close bug</div>` : ''}
+                            ${data.status !== 'dismissed' ? `<div class="subsystem-item" onclick="openBugActionModal('dismiss', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Dismiss finding</div>` : ''}
+                            ${data.status !== 'duplicate' ? `<div class="subsystem-item" onclick="openBugActionModal('mark_duplicate', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Mark as duplicate</div>` : ''}
+                        </div>
+                    </details>
+                    <a href="${bugLogLink(bugid)}" target="_blank" rel="noopener noreferrer" style="margin-left: auto; font-size: 0.9em; font-weight: 600;">Full logs &amp; raw data ↗</a>
                 </div>
-                ${data.duplicate_of ? `<div class="review-card bug-notice">This discovery belongs to <a href="#/bug/${encodeURIComponent(data.duplicate_of.bugid)}">${escapeHtml(data.duplicate_of.problem || data.duplicate_of.bugid)}</a>. Evidence below includes the linked discoveries.</div>` : ''}
-                <div class="bug-evidence-strip" aria-label="Discovery evidence">
-                    <button onclick="setBugTab('discoveries')"><strong>${evidence.count}</strong><span>${evidence.count === 1 ? 'discovery' : 'discoveries'}</span></button>
-                    <button onclick="setBugTab('discoveries')"><strong>${evidence.models.length}</strong><span>${evidence.models.length === 1 ? 'known model' : 'known models'}</span></button>
-                    <button onclick="setBugTab('discoveries')"><strong>${evidence.tools.length}</strong><span>${evidence.tools.length === 1 ? 'known tool' : 'known tools'}</span></button>
-                    <p>Repeated findings and model diversity help assess a bug. Discoveries may share context; they do not prove correctness.</p>
+
+                ${data.duplicate_of ? `
+                <div class="section" style="margin-bottom: 16px;">
+                    <div class="review-card" style="border-left: 3px solid var(--status-inreview);">
+                        This discovery belongs to <a href="#/bug/${encodeURIComponent(data.duplicate_of.bugid)}"><strong>${escapeHtml(data.duplicate_of.problem || data.duplicate_of.bugid)}</strong></a>. Evidence below includes the linked discoveries.
+                    </div>
+                </div>` : ''}
+
+                <div class="section">
+                    <div class="kv"><div class="label">Bug ID:</div><div><code>${escapeHtml(bugid)}</code> <button class="copy-btn" onclick="copyToClipboard('${escapeHtml(bugid)}')">Copy</button></div></div>
+                    <div class="kv"><div class="label">Severity:</div><div><span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(severity)}</span></div></div>
+                    <div class="kv"><div class="label">Status:</div><div><span class="status-badge ${status.cls}">${status.label}</span></div></div>
+                    <div class="kv"><div class="label">Reported:</div><div>${formatDate(data.reported_at || data.created_at, true)}</div></div>
+                    <div class="kv"><div class="label">Updated:</div><div>${formatDate(data.updated_at, true)}</div></div>
+                    <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
+                    ${data.introduced_in_commit ? `<div class="kv"><div class="label">Introduced by:</div><div>${commit(data.introduced_in_commit)}</div></div>` : ''}
+                    ${data.fixed_in_commit ? `<div class="kv"><div class="label">Fixed in:</div><div>${commit(data.fixed_in_commit)}</div></div>` : ''}
+                    ${data.verified_on_sha ? `<div class="kv"><div class="label">Verified on:</div><div>${commit(data.verified_on_sha)}</div></div>` : ''}
+                    ${locationsHtml ? `<div class="kv"><div class="label">Affected code:</div><div>${locationsHtml}</div></div>` : ''}
+                    ${(data.duplicates && data.duplicates.length > 0) ? `<div class="kv"><div class="label">Duplicates (${data.duplicates.length}):</div><div>${data.duplicates.map(d => `<a href="#/bug/${encodeURIComponent(d.bugid || d.id)}" class="tag" style="text-decoration:none;" title="${escapeHtml(d.problem || '')}">${escapeHtml(d.bugid || d.id)}</a>`).join('')}</div></div>` : ''}
                 </div>
-                <div class="bug-tabs" role="tablist" aria-label="Bug details" onkeydown="bugTabKeydown(event)">
-                    ${[['overview','Overview'], ['discoveries','Discoveries'], ['activity','Activity & audit']].map(([key,label]) => `<button class="btn ${key === 'overview' ? 'active' : ''}" id="bug-tab-${key}" role="tab" data-bug-tab="${key}" aria-controls="bug-panel-${key}" aria-selected="${key === 'overview'}" tabindex="${key === 'overview' ? '0' : '-1'}" onclick="setBugTab('${key}')">${label}${key === 'activity' ? ` (${activity.length})` : ''}</button>`).join('')}
+
+                <div class="section">
+                    <h2>Discovery Evidence</h2>
+                    <div class="stat-card-grid" style="margin-top: 10px; margin-bottom: 12px;">
+                        <div class="stat-card" style="cursor: pointer;" onclick="setBugTab('discoveries')" title="View discoveries">
+                            <h3>Discoveries</h3>
+                            <div class="value">${evidence.count}</div>
+                            <div class="text-muted-sm" style="margin-top: 4px;">${evidence.count === 1 ? 'Initial finding' : 'Initial findings'}</div>
+                        </div>
+                        <div class="stat-card" style="cursor: pointer;" onclick="setBugTab('discoveries')" title="View model diversity">
+                            <h3>Known Models</h3>
+                            <div class="value">${evidence.models.length}</div>
+                            <div class="text-muted-sm" style="margin-top: 4px;">${evidence.models.length === 1 ? 'Unique model' : 'Unique models'}</div>
+                        </div>
+                        <div class="stat-card" style="cursor: pointer;" onclick="setBugTab('discoveries')" title="View tool diversity">
+                            <h3>Known Tools</h3>
+                            <div class="value">${evidence.tools.length}</div>
+                            <div class="text-muted-sm" style="margin-top: 4px;">${evidence.tools.length === 1 ? 'Unique tool' : 'Unique tools'}</div>
+                        </div>
+                    </div>
+                    <div class="text-muted-sm" style="margin-bottom: 8px;">Repeated findings and model diversity help assess a bug. Discoveries may share context; they do not prove correctness.</div>
                 </div>
+
+                <div class="controls" style="margin-top: 20px; margin-bottom: 16px; border-bottom: 1px solid var(--border-light); padding-bottom: 8px;" role="tablist" aria-label="Bug details" onkeydown="bugTabKeydown(event)">
+                    <button class="active" id="bug-tab-overview" role="tab" data-bug-tab="overview" aria-controls="bug-panel-overview" aria-selected="true" tabindex="0" onclick="setBugTab('overview')">Overview</button>
+                    <button id="bug-tab-discoveries" role="tab" data-bug-tab="discoveries" aria-controls="bug-panel-discoveries" aria-selected="false" tabindex="-1" onclick="setBugTab('discoveries')">Discoveries (${evidence.count})</button>
+                    <button id="bug-tab-activity" role="tab" data-bug-tab="activity" aria-controls="bug-panel-activity" aria-selected="false" tabindex="-1" onclick="setBugTab('activity')">Activity &amp; Audit (${activity.length})</button>
+                </div>
+
                 <div id="bug-panel-overview" data-bug-panel="overview" role="tabpanel" aria-labelledby="bug-tab-overview">
-                    <div class="bug-overview-grid">
-                        <section class="section"><h2>Finding</h2>
-                            ${report ? `<div class="bug-prose">${escapeHtml(report)}</div>` : `<p class="bug-empty">${data.status === 'raw' || data.status === 'processing' ? 'Analysis is in progress. The report will appear here when it is ready.' : 'No report has been recorded. Check the activity history for available findings.'}</p>`}
-                            ${data.severity_explanation ? `<h3>Impact assessment</h3><div class="bug-prose">${escapeHtml(data.severity_explanation)}</div>` : ''}
-                        </section>
-                        <aside class="section"><h2>At a glance</h2>
-                            ${kv('Severity', `<strong style="color:${getSeverityColor(severity)}">${escapeHtml(severity)}</strong>`)}
-                            ${kv('Status', status.label)}
-                            ${kv('Updated', formatDate(data.updated_at, true))}
-                            ${kv('Subsystems', (data.subsystems || []).map(s => `<span class="tag">${escapeHtml(s)}</span>`).join(' '))}
-                            ${kv('Verified on', commit(data.verified_on_sha))}
-                            ${kv('Introduced by', commit(data.introduced_in_commit))}
-                            ${kv('Fixed in', commit(data.fixed_in_commit))}
-                            <h3>Affected code</h3>
-                            ${formatLocations(data.locations) || (data.source_files || []).map(f => `<div class="bug-file"><code>${escapeHtml(f)}</code></div>`).join('') || '<p class="bug-empty">No code locations recorded yet.</p>'}
-                        </aside>
+                    <div class="section">
+                        <h2>Finding</h2>
+                        ${report ? `
+                            <div class="review-card" style="border-left: 3px solid ${sevColor}; margin-top: 10px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                                    <span class="review-meta-label">Defect Report</span>
+                                    <button class="copy-btn" onclick="copyToClipboard(this.closest('.review-card').querySelector('.log-inline-block'))">Copy</button>
+                                </div>
+                                <div class="log-inline-block">${escapeHtml(report, true, false)}</div>
+                                ${data.severity_explanation ? `
+                                    <div style="margin-top: 16px;">
+                                        <div class="review-meta-label" style="margin-bottom: 8px;">Impact Assessment</div>
+                                        <div class="log-inline-block">${escapeHtml(data.severity_explanation, true, false)}</div>
+                                    </div>
+                                ` : ''}
+                            </div>
+                        ` : `
+                            <p class="status-placeholder">${data.status === 'raw' || data.status === 'processing' ? 'Analysis is in progress. The report will appear here when it is ready.' : 'No report has been recorded. Check the activity history for available findings.'}</p>
+                        `}
                     </div>
                 </div>
-                <section class="section" id="bug-panel-discoveries" data-bug-panel="discoveries" role="tabpanel" aria-labelledby="bug-tab-discoveries" hidden>
-                    <h2>Discovery evidence</h2>
-                    <p class="bug-empty">Each initial finding is counted once, including reports later matched to this bug. Verification and enrichment stages do not add discoveries.</p>
-                    <div class="bug-diversity">${kv('Models', evidence.models.length ? evidence.models.map(m => `<span class="tag">${escapeHtml(m)}</span>`).join(' ') : 'Not recorded')}${kv('Tools', evidence.tools.length ? evidence.tools.map(t => `<span class="tag">${escapeHtml(t)}</span>`).join(' ') : 'Not recorded')}</div>
-                    ${evidence.unknown_models ? `<p class="text-muted-sm">Model not recorded for ${evidence.unknown_models} ${evidence.unknown_models === 1 ? 'discovery' : 'discoveries'}. Unknown values are excluded from model diversity.</p>` : ''}
-                    ${discoveryRows || '<p class="bug-empty">No discoveries recorded.</p>'}
-                </section>
-                <section class="section" id="bug-panel-activity" data-bug-panel="activity" role="tabpanel" aria-labelledby="bug-tab-activity" hidden>
-                    <div class="bug-row-heading"><h2>Activity &amp; audit</h2><label>Show <select class="search-input" aria-label="Filter activity" onchange="filterBugActivity(this.value)"><option value="all">All activity</option><option value="comments">Comments</option><option value="changes">Changes</option><option value="analysis">Analysis</option></select></label></div>
-                    <p class="text-muted-sm">Newest first · Includes linked discoveries. Missing attribution on historical records is shown as “Not recorded”.</p>
-                    ${activityRows}<p id="bug-activity-empty" class="bug-empty" ${activity.length ? 'hidden' : ''}>No activity in this category.</p>
-                </section>`;
+
+                <div class="section" id="bug-panel-discoveries" data-bug-panel="discoveries" role="tabpanel" aria-labelledby="bug-tab-discoveries" hidden>
+                    <h2>Discovery Evidence</h2>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">Each initial finding is counted once, including reports later matched to this bug. Verification and enrichment stages do not add discoveries.</p>
+                    <div class="section" style="margin: 12px 0;">
+                        <div class="kv"><div class="label">Models:</div><div>${evidence.models.length ? evidence.models.map(m => `<span class="tag">${escapeHtml(m)}</span>`).join('') : '<span class="status-placeholder">Not recorded</span>'}</div></div>
+                        <div class="kv"><div class="label">Tools:</div><div>${evidence.tools.length ? evidence.tools.map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('') : '<span class="status-placeholder">Not recorded</span>'}</div></div>
+                    </div>
+                    ${evidence.unknown_models ? `<p class="text-muted-sm" style="margin-bottom: 12px;">Model not recorded for ${evidence.unknown_models} ${evidence.unknown_models === 1 ? 'discovery' : 'discoveries'}. Unknown values are excluded from model diversity.</p>` : ''}
+                    ${discoveryRows || '<p class="status-placeholder">No discoveries recorded.</p>'}
+                </div>
+
+                <div class="section" id="bug-panel-activity" data-bug-panel="activity" role="tabpanel" aria-labelledby="bug-tab-activity" hidden>
+                    <div class="controls" style="justify-content:space-between; margin-bottom: 8px;">
+                        <h2 style="border:none; margin:0; padding:0;">Activity &amp; Audit</h2>
+                        <div style="display:flex; align-items:center; gap:8px;">
+                            <span class="text-muted-sm">Filter:</span>
+                            <select aria-label="Filter activity" onchange="filterBugActivity(this.value)">
+                                <option value="all">All activity</option>
+                                <option value="comments">Comments</option>
+                                <option value="changes">Changes</option>
+                                <option value="analysis">Analysis</option>
+                            </select>
+                        </div>
+                    </div>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">Newest first · Includes linked discoveries. Missing attribution on historical records is shown as “Not recorded”.</p>
+                    ${activityRows}
+                    <p id="bug-activity-empty" class="status-placeholder" ${activity.length ? 'hidden' : ''}>No activity in this category.</p>
+                </div>
+            `;
         }
 
         async function renderBugLogView(slugOrId) {
@@ -3808,30 +3882,65 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const bugid = payload.bugid;
             document.title = `${config.project_name || 'Sashiko'} - Full records for ${bugid}`;
             const selected = new URLSearchParams(location.hash.split('?')[1] || '').get('event');
-            const rawBlock = value => `<div class="bug-raw-block"><button class="copy-btn" onclick="copyToClipboard(this.nextElementSibling)">Copy</button><pre class="log-block">${escapeHtml(typeof value === 'string' ? value : JSON.stringify(value, null, 2))}</pre></div>`;
-            const html = records.map(bug => `<section class="section"><h2>${escapeHtml(bug.title)}</h2><a href="#/bug/${encodeURIComponent(bug.bugid)}">${escapeHtml(bug.bugid)}</a>
-                <details><summary>Raw bug metadata</summary>${rawBlock(Object.fromEntries(Object.entries(bug).filter(([key]) => key !== 'enrichments')))}</details>
+            const rawBlock = value => `<div style="position: relative; margin-top: 6px;"><button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button><div class="log-block" style="max-height: 350px;">${escapeHtml(typeof value === 'string' ? value : JSON.stringify(value, null, 2))}</div></div>`;
+            const html = records.map(bug => `<div class="section"><h2>${escapeHtml(bug.title || bug.bugid)}</h2><div style="margin-bottom: 8px;"><a href="#/bug/${encodeURIComponent(bug.bugid)}"><code>${escapeHtml(bug.bugid)}</code></a></div>
+                <div style="margin-top: 8px;">
+                    <button class="toggle-btn" onclick="toggleCollapsible('raw-meta-${Number(bug.id)}', this)">▶ Raw Bug Metadata</button>
+                    <div id="raw-meta-${Number(bug.id)}" class="collapsible">
+                        ${rawBlock(Object.fromEntries(Object.entries(bug).filter(([key]) => key !== 'enrichments')))}
+                    </div>
+                </div>
                 ${bug.enrichments.map(e => {
                     let entries = [];
                     if (e.logs) { try { const parsed = JSON.parse(e.logs); entries = Array.isArray(parsed) ? parsed : [parsed]; } catch (_) {} }
                     entries = entries.filter(entry => entry && typeof entry === 'object');
-                    return `<details class="review-card bug-raw-event" id="bug-event-${Number(e.id)}" ${selected === String(e.id) ? 'open' : ''}>
-                        <summary><strong>${escapeHtml(e.kind.replace(/_/g, ' '))}</strong> · ${formatDate(e.created_at, true)}${e.logs ? ' · Interaction log available' : ''}</summary>
-                        <div class="bug-attribution">${bugAttribution(e)}</div>
-                        ${e.content ? `<div class="bug-prose">${escapeHtml(e.content)}</div>` : ''}
-                        ${entries.length ? `<h3>Interaction log</h3>${renderInteractionLogEntries(entries, `bug-${Number(e.id)}-`)}` : ''}
-                        <h3>Complete raw record</h3>${rawBlock(e)}
-                    </details>`;
-                }).join('')}</section>`).join('');
+                    return `<div class="review-card" id="bug-event-${Number(e.id)}" style="margin-top: 12px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                            <div style="display:flex; align-items:center; gap: 8px;">
+                                <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(e.kind.replace(/_/g, ' '))}</span>
+                                ${e.logs ? '<span class="tag" style="background:var(--diff-add-bg); color:var(--status-reviewed);">Interaction log</span>' : ''}
+                            </div>
+                            <span class="text-muted-sm">${formatDate(e.created_at, true)}</span>
+                        </div>
+                        <div class="review-meta" style="margin-top: 4px;">
+                            <div class="review-meta-label">Actor:</div>
+                            <div>${bugAttribution(e)}</div>
+                        </div>
+                        ${e.content ? `<div class="log-inline-block" style="margin-top: 8px;">${escapeHtml(e.content, true, false)}</div>` : ''}
+                        ${entries.length ? `<div style="margin-top: 12px;"><h3>Interaction Log</h3>${renderInteractionLogEntries(entries, `bug-${Number(e.id)}-`)}</div>` : ''}
+                        <div style="margin-top: 12px;">
+                            <button class="toggle-btn" onclick="toggleCollapsible('raw-enrich-${Number(e.id)}', this)">▶ Complete Raw Record</button>
+                            <div id="raw-enrich-${Number(e.id)}" class="collapsible">
+                                ${rawBlock(e)}
+                            </div>
+                        </div>
+                    </div>`;
+                }).join('')}</div>`).join('');
             document.getElementById('app').innerHTML = `<div class="nav"><a href="#/bug/${encodeURIComponent(bugid)}">← Back to bug</a></div>
-                <h1>Full logs &amp; raw data</h1><p>Original inputs, enrichment payloads, interaction logs, token usage, and attribution for every linked discovery.</p>
-                <button class="btn" id="download-bug-records">Download all records (JSON)</button>${html || '<p>No records available.</p>'}`;
+                <h1><span>Full Logs &amp; Raw Data</span></h1>
+                <p class="text-muted-sm" style="margin-bottom: 12px;">Original inputs, enrichment payloads, interaction logs, token usage, and attribution for every linked discovery.</p>
+                <div class="controls" style="margin-bottom: 16px;">
+                    <button id="download-bug-records">Download all records (JSON)</button>
+                </div>
+                ${html || '<p class="status-placeholder">No records available.</p>'}`;
             document.getElementById('download-bug-records').onclick = () => {
                 const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
                 const a = document.createElement('a'); a.href = url; a.download = `${bugid}-records.json`; a.click();
                 setTimeout(() => URL.revokeObjectURL(url), 1000);
             };
-            if (selected && /^\d+$/.test(selected)) document.getElementById(`bug-event-${selected}`)?.scrollIntoView({ block: 'start' });
+            if (selected && /^\d+$/.test(selected)) {
+                setTimeout(() => {
+                    const el = document.getElementById(`bug-event-${selected}`);
+                    if (el) {
+                        el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+                        const coll = document.getElementById(`raw-enrich-${selected}`);
+                        if (coll && !coll.classList.contains('open')) {
+                            const btn = coll.previousElementSibling;
+                            toggleCollapsible(`raw-enrich-${selected}`, btn);
+                        }
+                    }
+                }, 100);
+            }
         }
 
         function renderInteractionLogEntries(logs, prefix = '') {
@@ -4441,6 +4550,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 if (!dropdown || !dropdown.contains(e.target)) {
                     menu.style.display = 'none';
                 }
+            }
+            const bugStatus = document.getElementById('bugStatusDropdown');
+            if (bugStatus && bugStatus.hasAttribute('open') && !bugStatus.contains(e.target)) {
+                bugStatus.removeAttribute('open');
             }
         });
 
