@@ -3615,11 +3615,11 @@
             if (query.patch || query.part) {
                 setTimeout(() => {
                     let el = null;
-                    if (query.patch) {
-                        el = document.getElementById(`patch-${query.patch}`);
-                    }
-                    if (!el && query.part) {
+                    if (query.part) {
                         el = document.querySelector(`[data-part="${query.part}"]`);
+                    }
+                    if (!el && query.patch) {
+                        el = document.querySelector(`[data-part="${query.patch}"]`) || document.getElementById(`patch-${query.patch}`);
                     }
                     if (el) {
                         el.scrollIntoView({behavior: 'smooth', block: 'center'});
@@ -4033,9 +4033,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             const discoveryRows = (evidence.discoveries || []).map(d => {
                 let sourceHtml = 'Direct report';
-                if (d.patchset_id && d.patch_id) {
-                    const patchLabel = d.patch_part ? `Patch ${d.patch_part}` : `Patch #${d.patch_id}`;
-                    sourceHtml = `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a> (<a href="#/patchset/${encodeURIComponent(d.patchset_id)}?patch=${encodeURIComponent(d.patch_id)}">${escapeHtml(patchLabel)}</a>)`;
+                if (d.patchset_id && (d.patch_part || d.patch_id)) {
+                    const patchLabel = d.patch_part ? `Patch ${d.patch_part}` : `Patch ID ${d.patch_id}`;
+                    const patchParam = d.patch_part ? `part=${encodeURIComponent(d.patch_part)}` : `patch=${encodeURIComponent(d.patch_id)}`;
+                    sourceHtml = `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a> (<a href="#/patchset/${encodeURIComponent(d.patchset_id)}?${patchParam}">${escapeHtml(patchLabel)}</a>)`;
                 } else if (d.patchset_id) {
                     sourceHtml = `<a href="#/patchset/${encodeURIComponent(d.patchset_id)}">Patchset #${escapeHtml(d.patchset_id)}</a>`;
                 } else if (d.commit) {

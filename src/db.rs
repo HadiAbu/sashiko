@@ -1738,7 +1738,8 @@ impl Database {
 
                 if let Some(pid) = patch_id {
                     patch_ids_to_query.insert(pid);
-                } else if patchset_id.is_none() {
+                }
+                if patch_id.is_none() || patchset_id.is_none() {
                     bugs_needing_review_lookup.push(bug.id);
                 }
 
@@ -1831,14 +1832,17 @@ impl Database {
                 review_links.entry(b_id).or_insert((ps_id, p_id));
             }
             for raw in &mut raw_discoveries {
-                if raw.patch_id.is_none()
-                    && raw.patchset_id.is_none()
+                if (raw.patch_id.is_none() || raw.patchset_id.is_none())
                     && let Some(&(ps_id, p_id)) = review_links.get(&raw.bug_id)
                 {
-                    raw.patchset_id = ps_id;
-                    raw.patch_id = p_id;
-                    if let Some(pid) = p_id {
-                        patch_ids_to_query.insert(pid);
+                    if raw.patchset_id.is_none() {
+                        raw.patchset_id = ps_id;
+                    }
+                    if raw.patch_id.is_none() {
+                        raw.patch_id = p_id;
+                        if let Some(pid) = p_id {
+                            patch_ids_to_query.insert(pid);
+                        }
                     }
                 }
             }
@@ -6504,12 +6508,36 @@ mod tests {
         })
         .await?;
 
+        // 4. Same bug discovered with patchset and patch set on bug
+        let bug4 = NewBug {
+            bugid: "linux-bug-multi-4".to_string(),
+            title: "Preexisting bug copy 4".to_string(),
+            status: "raw".to_string(),
+            reporter: "sashiko.dev".to_string(),
+            reported_at: 4000,
+            discovered_in_patchset_id: Some(ps1_id),
+            discovered_in_patch_id: Some(p2_id),
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec!["net".to_string()],
+        };
+        let bug4_id = db.create_bug(&bug4).await?;
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: bug4_id,
+            canonical_id: bug1_id,
+            reasoning: "Duplicate of bug 1",
+            ..Default::default()
+        })
+        .await?;
+
         // Query bug_evidence for canonical bug 1
         let evidence = db.bug_evidence(bug1_id).await?;
-        assert_eq!(evidence["count"], 3);
+        assert_eq!(evidence["count"], 4);
 
         let discoveries = evidence["discoveries"].as_array().unwrap();
-        assert_eq!(discoveries.len(), 3);
+        assert_eq!(discoveries.len(), 4);
 
         // First discovery
         assert_eq!(discoveries[0]["bug_id"], bug1_id);
@@ -6534,6 +6562,12 @@ mod tests {
         assert_eq!(discoveries[2]["patchset_id"], ps2_id);
         assert_eq!(discoveries[2]["patch_id"], p3_id);
         assert_eq!(discoveries[2]["patch_part"], 1);
+
+        // Fourth discovery (resolved via review link)
+        assert_eq!(discoveries[3]["bug_id"], bug4_id);
+        assert_eq!(discoveries[3]["patchset_id"], ps1_id);
+        assert_eq!(discoveries[3]["patch_id"], p2_id);
+        assert_eq!(discoveries[3]["patch_part"], 2);
 
         Ok(())
     }
