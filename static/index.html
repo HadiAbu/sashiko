@@ -1325,8 +1325,8 @@
         .subsystem-dropdown summary {
             list-style: none;
         }
-        [data-bug-panel][hidden], [data-bug-activity][hidden] {
-            display: none;
+        [data-bug-panel][hidden] {
+            display: none !important;
         }
 </style>
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
@@ -2032,7 +2032,7 @@
                         await renderPatchsetView(route.id, route.query || {});
                         break;
                     case 'bug':
-                        await renderBugView(route.id);
+                        await renderBugView(route.id, route.query ? route.query.tab : null);
                         break;
                     case 'bug_log':
                         await renderBugLogView(route.id);
@@ -4006,16 +4006,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             tabs[next].focus();
         }
 
-        function filterBugActivity(value) {
-            let visible = 0;
-            document.querySelectorAll('[data-bug-activity]').forEach(row => {
-                row.hidden = value !== 'all' && row.dataset.bugActivity !== value;
-                if (!row.hidden) visible++;
-            });
-            document.getElementById('bug-activity-empty').hidden = visible > 0;
-        }
-
-        async function renderBugView(slugOrId) {
+        async function renderBugView(slugOrId, initialTab) {
             const queryParam = /^\d+$/.test(slugOrId) ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
             const res = await fetch(`/api/bug?${queryParam}`);
             if (!res.ok) throw new Error('Bug could not be loaded');
@@ -4062,37 +4053,57 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             `;
             }).join('');
 
-            const activityRows = activity.map(e => {
-                const category = e.kind === 'comment' ? 'comments' : e.kind === 'audit' || e.kind === 'deduplication' ? 'changes' : 'analysis';
-                const label = (e.kind || 'enrichment').replace(/_run$/, '').replace(/_/g, ' ');
-                return `
-                    <div class="review-card" data-bug-activity="${category}" style="margin-bottom: 10px;">
-                        <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
-                            <div style="display:flex; align-items:center; gap: 8px;">
-                                <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(label)}</span>
-                                ${e.bugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(e.bugid)}">${escapeHtml(e.bugid)}</a></span>` : ''}
-                            </div>
-                            <span class="text-muted-sm">${formatDate(e.created_at, true)}</span>
-                        </div>
-                        <div class="review-meta" style="margin-top: 4px;">
-                            <div class="review-meta-label">Actor:</div>
-                            <div>${bugAttribution(e)}</div>
-                        </div>
-                        ${e.content ? (category === 'comments' || category === 'changes'
-                            ? `<div class="log-inline-block" style="margin-top: 8px;">${escapeHtml(e.content, true, false)}</div>`
-                            : `<div style="margin-top: 8px;">
-                                <button class="toggle-btn" onclick="toggleCollapsible('act-${e.id}', this)">▶ Read ${escapeHtml(label)}</button>
-                                <div id="act-${e.id}" class="collapsible" style="position: relative; margin-top: 6px;">
-                                    <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                                    <div class="log-inline-block">${escapeHtml(e.content, true, false)}</div>
-                                </div>
-                            </div>`) : ''}
-                        <div style="margin-top: 8px; text-align: right;">
-                            <a href="${bugLogLink(e.bugid, e.id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.85em; color:var(--text-dim);">Full record ↗</a>
-                        </div>
-                    </div>
-                `;
-            }).join('');
+            const comments = [];
+            const fixes = [];
+            const reproducers = [];
+            const analysis = [];
+            const auditEvents = [];
+
+            for (const e of activity) {
+                if (e.kind === 'audit' || e.kind === 'deduplication') {
+                    auditEvents.push(e);
+                } else if (e.kind === 'comment') {
+                    comments.push(e);
+                } else if (e.kind === 'fix' || e.kind === 'fix_candidate' || (e.kind && e.kind.startsWith('fix_')) || e.kind === 'proposed_fix' || e.kind === 'suggested_fix') {
+                    fixes.push(e);
+                } else if (e.kind === 'reproducer' || e.kind === 'testcase' || e.kind === 'poc') {
+                    reproducers.push(e);
+                } else if (e.kind === 'report' || e.kind === 'candidate' || e.kind === 'discovery' || e.kind === 'raw_candidate') {
+                    // Exclude primary report and raw discovery candidates from enrichment tabs
+                    continue;
+                } else {
+                    analysis.push(e);
+                }
+            }
+
+            const sortedComments = [...comments].sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+
+            const availableTabs = [
+                { id: 'description', label: 'Description' },
+                { id: 'discoveries', label: `Discoveries (${evidence.count})` }
+            ];
+            if (sortedComments.length > 0) {
+                availableTabs.push({ id: 'comments', label: `Comments (${sortedComments.length})` });
+            }
+            if (fixes.length > 0) {
+                availableTabs.push({ id: 'fixes', label: `Fixes (${fixes.length})` });
+            }
+            if (reproducers.length > 0) {
+                availableTabs.push({ id: 'reproducers', label: `Reproducers (${reproducers.length})` });
+            }
+            if (analysis.length > 0) {
+                availableTabs.push({ id: 'analysis', label: `Analysis (${analysis.length})` });
+            }
+            availableTabs.push({ id: 'audit', label: `Audit (${auditEvents.length})` });
+
+            const prevActiveTab = document.querySelector('[data-bug-tab].active')?.dataset?.bugTab;
+            const targetTab = initialTab || prevActiveTab;
+            const activeTab = (targetTab && availableTabs.some(t => t.id === targetTab)) ? targetTab : 'description';
+
+            const tabButtonsHtml = availableTabs.map(t => {
+                const isSelected = t.id === activeTab;
+                return `<button class="${isSelected ? 'active' : ''}" id="bug-tab-${t.id}" role="tab" data-bug-tab="${t.id}" aria-controls="bug-panel-${t.id}" aria-selected="${isSelected}" tabindex="${isSelected ? 0 : -1}" onclick="setBugTab('${t.id}')">${t.label}</button>`;
+            }).join('\n                    ');
 
             const subsystemsHtml = (data.subsystems && data.subsystems.length > 0)
                 ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')
@@ -4116,6 +4127,181 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 <button class="btn" disabled title="${escapeHtml(actionDisabledTitle)}">Change Status ▾</button>
             `;
 
+            const commentsPanelHtml = sortedComments.length > 0 ? `
+                <div class="section" id="bug-panel-comments" data-bug-panel="comments" role="tabpanel" aria-labelledby="bug-tab-comments" ${activeTab === 'comments' ? '' : 'hidden'}>
+                    <div class="controls" style="justify-content:space-between; margin-bottom: 12px;">
+                        <h2 style="border:none; margin:0; padding:0;">Comments (${sortedComments.length})</h2>
+                        ${canAct ? `<button class="primary" onclick="openBugActionModal('comment', '${id}')">Add Comment</button>` : ''}
+                    </div>
+                    ${sortedComments.map(c => `
+                        <div class="review-card" style="margin-bottom: 10px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                                <div style="display:flex; align-items:center; gap: 8px;">
+                                    <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border);">Comment</span>
+                                    ${c.bugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(c.bugid)}">${escapeHtml(c.bugid)}</a></span>` : ''}
+                                </div>
+                                <span class="text-muted-sm">${formatDate(c.created_at, true)}</span>
+                            </div>
+                            <div class="review-meta" style="margin-top: 4px;">
+                                <div class="review-meta-label">Author:</div>
+                                <div>${bugAttribution(c)}</div>
+                            </div>
+                            ${c.content ? `<div class="log-inline-block" style="margin-top: 8px;">${escapeHtml(c.content, true, false)}</div>` : ''}
+                            <div style="margin-top: 8px; text-align: right;">
+                                <a href="${bugLogLink(c.bugid, c.id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.85em; color:var(--text-dim);">Full record ↗</a>
+                            </div>
+                        </div>
+                    `).join('')}
+                    ${canAct ? `
+                        <div style="margin-top: 16px;">
+                            <button class="btn" onclick="openBugActionModal('comment', '${id}')">Add another comment...</button>
+                        </div>
+                    ` : ''}
+                </div>
+            ` : '';
+
+            const fixesPanelHtml = fixes.length > 0 ? `
+                <div class="section" id="bug-panel-fixes" data-bug-panel="fixes" role="tabpanel" aria-labelledby="bug-tab-fixes" ${activeTab === 'fixes' ? '' : 'hidden'}>
+                    <h2 style="margin-top:0;">Fixes &amp; Patches (${fixes.length})</h2>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">Proposed patches, fix commits, and resolution candidates.</p>
+                    ${fixes.map(f => {
+                        const fixLabel = (f.kind || 'fix').replace(/_/g, ' ');
+                        return `
+                        <div class="review-card" style="margin-bottom: 10px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                                <div style="display:flex; align-items:center; gap: 8px;">
+                                    <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(fixLabel)}</span>
+                                    ${f.bugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(f.bugid)}">${escapeHtml(f.bugid)}</a></span>` : ''}
+                                </div>
+                                <span class="text-muted-sm">${formatDate(f.created_at, true)}</span>
+                            </div>
+                            <div class="review-meta" style="margin-top: 4px;">
+                                <div class="review-meta-label">Actor:</div>
+                                <div>${bugAttribution(f)}</div>
+                            </div>
+                            ${f.content ? `
+                                <div style="position: relative; margin-top: 8px;">
+                                    <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                    <div class="log-inline-block">${escapeHtml(f.content, true, false)}</div>
+                                </div>
+                            ` : ''}
+                            <div style="margin-top: 8px; text-align: right;">
+                                <a href="${bugLogLink(f.bugid, f.id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.85em; color:var(--text-dim);">Full record ↗</a>
+                            </div>
+                        </div>
+                        `;
+                    }).join('')}
+                </div>
+            ` : '';
+
+            const reproducersPanelHtml = reproducers.length > 0 ? `
+                <div class="section" id="bug-panel-reproducers" data-bug-panel="reproducers" role="tabpanel" aria-labelledby="bug-tab-reproducers" ${activeTab === 'reproducers' ? '' : 'hidden'}>
+                    <h2 style="margin-top:0;">Reproducers (${reproducers.length})</h2>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">Programs, scripts, and testcases to reproduce the defect.</p>
+                    ${reproducers.map(r => {
+                        const reproLabel = (r.kind || 'reproducer').replace(/_/g, ' ');
+                        return `
+                        <div class="review-card" style="margin-bottom: 10px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                                <div style="display:flex; align-items:center; gap: 8px;">
+                                    <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(reproLabel)}</span>
+                                    ${r.bugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(r.bugid)}">${escapeHtml(r.bugid)}</a></span>` : ''}
+                                </div>
+                                <span class="text-muted-sm">${formatDate(r.created_at, true)}</span>
+                            </div>
+                            <div class="review-meta" style="margin-top: 4px;">
+                                <div class="review-meta-label">Actor:</div>
+                                <div>${bugAttribution(r)}</div>
+                            </div>
+                            ${r.content ? `
+                                <div style="position: relative; margin-top: 8px;">
+                                    <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                    <div class="log-inline-block" style="font-family: monospace;">${escapeHtml(r.content, true, false)}</div>
+                                </div>
+                            ` : ''}
+                            <div style="margin-top: 8px; text-align: right;">
+                                <a href="${bugLogLink(r.bugid, r.id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.85em; color:var(--text-dim);">Full record ↗</a>
+                            </div>
+                        </div>
+                        `;
+                    }).join('')}
+                </div>
+            ` : '';
+
+            const analysisPanelHtml = analysis.length > 0 ? `
+                <div class="section" id="bug-panel-analysis" data-bug-panel="analysis" role="tabpanel" aria-labelledby="bug-tab-analysis" ${activeTab === 'analysis' ? '' : 'hidden'}>
+                    <h2 style="margin-top:0;">Analysis &amp; Verification (${analysis.length})</h2>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">Automated bug verification, origin discovery, and severity calibration stages.</p>
+                    ${analysis.map(a => {
+                        const label = (a.kind || 'analysis').replace(/_run$/, '').replace(/_/g, ' ');
+                        return `
+                        <div class="review-card" style="margin-bottom: 10px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                                <div style="display:flex; align-items:center; gap: 8px;">
+                                    <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(label)}</span>
+                                    ${a.bugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(a.bugid)}">${escapeHtml(a.bugid)}</a></span>` : ''}
+                                </div>
+                                <span class="text-muted-sm">${formatDate(a.created_at, true)}</span>
+                            </div>
+                            <div class="review-meta" style="margin-top: 4px;">
+                                <div class="review-meta-label">Actor:</div>
+                                <div>${bugAttribution(a)}</div>
+                            </div>
+                            ${a.content ? `
+                                <div style="position: relative; margin-top: 8px;">
+                                    <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                                    <div class="log-inline-block">${escapeHtml(a.content, true, false)}</div>
+                                </div>
+                            ` : ''}
+                            <div style="margin-top: 8px; text-align: right;">
+                                <a href="${bugLogLink(a.bugid, a.id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.85em; color:var(--text-dim);">Full record ↗</a>
+                            </div>
+                        </div>
+                        `;
+                    }).join('')}
+                </div>
+            ` : '';
+
+            const auditPanelHtml = `
+                <div class="section" id="bug-panel-audit" data-bug-panel="audit" role="tabpanel" aria-labelledby="bug-tab-audit" ${activeTab === 'audit' ? '' : 'hidden'}>
+                    <h2 style="margin-top:0;">Audit Log (${auditEvents.length})</h2>
+                    <p class="text-muted-sm" style="margin-bottom: 12px;">History of changes, status transitions, field updates, and deduplication events. Newest first.</p>
+                    ${auditEvents.length ? auditEvents.map(e => {
+                        let tag = 'Audit';
+                        let summary = e.content || 'Change recorded';
+                        if (e.kind === 'deduplication') {
+                            tag = 'Duplicate';
+                        } else if (summary.toLowerCase().includes('status')) {
+                            tag = 'Status';
+                        } else if (summary.toLowerCase().includes('title')) {
+                            tag = 'Title';
+                        } else if (summary.toLowerCase().includes('created')) {
+                            tag = 'Created';
+                        } else if (summary.toLowerCase().includes('subsystem')) {
+                            tag = 'Subsystem';
+                        } else if (summary.toLowerCase().includes('duplicate')) {
+                            tag = 'Duplicate';
+                        }
+                        return `
+                        <div class="review-card" style="margin-bottom: 8px; padding: 12px 16px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; flex-wrap:wrap;">
+                                <div style="display:flex; align-items:center; gap: 8px; flex-wrap:wrap;">
+                                    <span class="tag" style="font-weight:600; font-size:0.8em; text-transform:uppercase; background:var(--code-bg); border:1px solid var(--border);">${escapeHtml(tag)}</span>
+                                    <strong style="font-size:0.95em;">${escapeHtml(summary)}</strong>
+                                    ${e.bugid !== bugid ? `<span class="text-muted-sm">· From <a href="#/bug/${encodeURIComponent(e.bugid)}">${escapeHtml(e.bugid)}</a></span>` : ''}
+                                </div>
+                                <span class="text-muted-sm" style="font-size:0.85em;">${formatDate(e.created_at, true)}</span>
+                            </div>
+                            <div class="review-meta" style="margin-top: 6px; font-size:0.85em; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+                                <div>Actor: ${bugAttribution(e)}</div>
+                                <a href="${bugLogLink(e.bugid, e.id)}" target="_blank" rel="noopener noreferrer" style="color:var(--text-dim);">Full record ↗</a>
+                            </div>
+                        </div>
+                        `;
+                    }).join('') : '<p class="status-placeholder">No audit history recorded.</p>'}
+                </div>
+            `;
+
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
                 <h1>
@@ -4123,9 +4309,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <span class="status-badge ${status.cls}">${status.label}</span>
                 </h1>
 
-                <div class="controls" style="margin-bottom: 16px;">
-                    ${actionButtonsHtml}
-                    <a href="${bugLogLink(bugid)}" target="_blank" rel="noopener noreferrer" style="margin-left: auto; font-size: 0.9em; font-weight: 600;">Full logs &amp; raw data ↗</a>
+                <div class="controls" style="margin-bottom: 16px; justify-content: flex-end;">
+                    <a href="${bugLogLink(bugid)}" target="_blank" rel="noopener noreferrer" style="font-size: 0.9em; font-weight: 600;">Full logs &amp; raw data ↗</a>
                 </div>
 
                 ${data.duplicate_of ? `
@@ -4150,25 +4335,21 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 </div>
 
                 <div class="controls" style="margin-top: 20px; margin-bottom: 16px; border-bottom: 1px solid var(--border-light); padding-bottom: 8px;" role="tablist" aria-label="Bug details" onkeydown="bugTabKeydown(event)">
-                    <button class="active" id="bug-tab-description" role="tab" data-bug-tab="description" aria-controls="bug-panel-description" aria-selected="true" tabindex="0" onclick="setBugTab('description')">Description</button>
-                    <button id="bug-tab-discoveries" role="tab" data-bug-tab="discoveries" aria-controls="bug-panel-discoveries" aria-selected="false" tabindex="-1" onclick="setBugTab('discoveries')">Discoveries (${evidence.count})</button>
-                    <button id="bug-tab-activity" role="tab" data-bug-tab="activity" aria-controls="bug-panel-activity" aria-selected="false" tabindex="-1" onclick="setBugTab('activity')">Activity &amp; Audit (${activity.length})</button>
+                    ${tabButtonsHtml}
                 </div>
 
-                <div id="bug-panel-description" data-bug-panel="description" role="tabpanel" aria-labelledby="bug-tab-description">
-                    <div class="section">
-                        ${report ? `
-                            <div style="position: relative; margin-top: 10px;">
-                                <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                                <div class="log-inline-block" style="padding-right: 55px;">${escapeHtml(report, true, false)}</div>
-                            </div>
-                        ` : `
-                            <p class="status-placeholder">${data.status === 'raw' || data.status === 'processing' ? 'Analysis is in progress. The report will appear here when it is ready.' : 'No report has been recorded. Check the activity history for available findings.'}</p>
-                        `}
-                    </div>
+                <div class="section" id="bug-panel-description" data-bug-panel="description" role="tabpanel" aria-labelledby="bug-tab-description" ${activeTab === 'description' ? '' : 'hidden'}>
+                    ${report ? `
+                        <div style="position: relative; margin-top: 10px;">
+                            <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                            <div class="log-inline-block" style="padding-right: 55px;">${escapeHtml(report, true, false)}</div>
+                        </div>
+                    ` : `
+                        <p class="status-placeholder">${data.status === 'raw' || data.status === 'processing' ? 'Analysis is in progress. The report will appear here when it is ready.' : 'No report has been recorded. Check the audit history or discoveries for available findings.'}</p>
+                    `}
                 </div>
 
-                <div class="section" id="bug-panel-discoveries" data-bug-panel="discoveries" role="tabpanel" aria-labelledby="bug-tab-discoveries" hidden>
+                <div class="section" id="bug-panel-discoveries" data-bug-panel="discoveries" role="tabpanel" aria-labelledby="bug-tab-discoveries" ${activeTab === 'discoveries' ? '' : 'hidden'}>
                     <h2>Discovery Evidence</h2>
                     <p class="text-muted-sm" style="margin-bottom: 12px;">Each initial finding is counted once, including reports later matched to this bug. Verification and enrichment stages do not add discoveries.</p>
                     <div class="section" style="margin: 12px 0;">
@@ -4179,22 +4360,14 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     ${discoveryRows || '<p class="status-placeholder">No discoveries recorded.</p>'}
                 </div>
 
-                <div class="section" id="bug-panel-activity" data-bug-panel="activity" role="tabpanel" aria-labelledby="bug-tab-activity" hidden>
-                    <div class="controls" style="justify-content:space-between; margin-bottom: 8px;">
-                        <h2 style="border:none; margin:0; padding:0;">Activity &amp; Audit</h2>
-                        <div style="display:flex; align-items:center; gap:8px;">
-                            <span class="text-muted-sm">Filter:</span>
-                            <select aria-label="Filter activity" onchange="filterBugActivity(this.value)">
-                                <option value="all">All activity</option>
-                                <option value="comments">Comments</option>
-                                <option value="changes">Changes</option>
-                                <option value="analysis">Analysis</option>
-                            </select>
-                        </div>
-                    </div>
-                    <p class="text-muted-sm" style="margin-bottom: 12px;">Newest first · Includes linked discoveries. Missing attribution on historical records is shown as “Not recorded”.</p>
-                    ${activityRows}
-                    <p id="bug-activity-empty" class="status-placeholder" ${activity.length ? 'hidden' : ''}>No activity in this category.</p>
+                ${commentsPanelHtml}
+                ${fixesPanelHtml}
+                ${reproducersPanelHtml}
+                ${analysisPanelHtml}
+                ${auditPanelHtml}
+
+                <div class="controls" style="margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border-light);">
+                    ${actionButtonsHtml}
                 </div>
             `;
         }
@@ -4996,8 +5169,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 }
                 
                 closeBugActionModal();
-                await renderBugView(id);
-                if (action === 'comment') setBugTab('activity');
+                await renderBugView(id, action === 'comment' ? 'comments' : undefined);
                 
             } catch (e) {
                 errorEl.textContent = e.message;
