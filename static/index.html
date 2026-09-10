@@ -2190,20 +2190,24 @@
             return { label: 'Open', cls: 'status-Open', color: 'var(--status-pending)' };
         }
 
-        function formatCommitRef(ref) {
+        function formatCommitRef(ref, includeTag = false) {
             if (!ref) return '';
-            const m = String(ref).trim().match(/^([0-9a-fA-F]{7,40})(?:\s+\((.*?)\))?(?:\s+(\[.*?\]))?$/);
+            let s = String(ref).trim();
+            if (!includeTag) {
+                s = s.replace(/\s*\[.*?\]\s*$/, '');
+            }
+            const m = s.match(/^([0-9a-fA-F]{7,40})(?:\s+\((.*?)\))?(?:\s+(\[.*?\]))?$/);
             if (m) {
                 const shortSha = m[1].substring(0, 12);
                 const subject = m[2];
-                const tag = m[3] ? ' ' + m[3] : '';
+                const tag = (includeTag && m[3]) ? ' ' + m[3] : '';
                 if (subject) {
                     const cleanSub = subject.startsWith('"') && subject.endsWith('"') ? subject : `"${subject}"`;
                     return `${shortSha} (${cleanSub})${tag}`;
                 }
                 return `${shortSha}${tag}`;
             }
-            return String(ref).replace(/\b([0-9a-fA-F]{12})[0-9a-fA-F]{28}\b/g, '$1');
+            return s.replace(/\b([0-9a-fA-F]{12})[0-9a-fA-F]{28}\b/g, '$1');
         }
 
         function formatLocations(locs) {
@@ -4012,7 +4016,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const report = data.description || data.inline_review;
             const activity = evidence.activity || [];
             document.title = `${config.project_name || 'Sashiko'} - ${data.problem || bugid}`;
-            const commit = value => value ? `<code>${escapeHtml(formatCommitRef(value))}</code>` : '';
+            const commit = (value, includeTag = false) => value ? `<code>${escapeHtml(formatCommitRef(value, includeTag))}</code>` : '';
 
             const discoveryRows = (evidence.discoveries || []).map(d => `
                 <div class="review-card" style="margin-bottom: 10px;">
@@ -4069,8 +4073,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')
                 : '<span class="status-placeholder">None</span>';
 
-            const locationsHtml = formatLocations(data.locations) || (data.source_files || []).map(f => `<code>${escapeHtml(f)}</code>`).join(' ');
-
             const canAct = canPerformBugActions();
             const actionDisabledTitle = getActionDisabledTitle();
 
@@ -4112,36 +4114,14 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <div class="kv"><div class="label">Bug ID:</div><div><code>${escapeHtml(bugid)}</code> <button class="copy-btn" onclick="copyToClipboard('${escapeHtml(bugid)}')">Copy</button></div></div>
                     <div class="kv"><div class="label">Severity:</div><div><span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(severity)}</span></div></div>
                     <div class="kv"><div class="label">Status:</div><div><span class="status-badge ${status.cls}">${status.label}</span></div></div>
+                    <div class="kv"><div class="label">Discoveries:</div><div>${evidence.count} (${evidence.tools.length} ${evidence.tools.length === 1 ? 'tool' : 'tools'}, ${evidence.models.length} ${evidence.models.length === 1 ? 'model' : 'models'})</div></div>
                     <div class="kv"><div class="label">Reported:</div><div>${formatDate(data.reported_at || data.created_at, true)}</div></div>
                     <div class="kv"><div class="label">Updated:</div><div>${formatDate(data.updated_at, true)}</div></div>
                     <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
-                    ${data.introduced_in_commit ? `<div class="kv"><div class="label">Introduced by:</div><div>${commit(data.introduced_in_commit)}</div></div>` : ''}
+                    ${data.introduced_in_commit ? `<div class="kv"><div class="label">Introduced by:</div><div>${commit(data.introduced_in_commit)} <button class="copy-btn" onclick="copyToClipboard(this.previousElementSibling)">Copy</button></div></div>` : ''}
                     ${data.fixed_in_commit ? `<div class="kv"><div class="label">Fixed in:</div><div>${commit(data.fixed_in_commit)}</div></div>` : ''}
                     ${data.verified_on_sha ? `<div class="kv"><div class="label">Verified on:</div><div>${commit(data.verified_on_sha)}</div></div>` : ''}
-                    ${locationsHtml ? `<div class="kv"><div class="label">Affected code:</div><div>${locationsHtml}</div></div>` : ''}
                     ${(data.duplicates && data.duplicates.length > 0) ? `<div class="kv"><div class="label">Duplicates (${data.duplicates.length}):</div><div>${data.duplicates.map(d => `<a href="#/bug/${encodeURIComponent(d.bugid || d.id)}" class="tag" style="text-decoration:none;" title="${escapeHtml(d.problem || '')}">${escapeHtml(d.bugid || d.id)}</a>`).join('')}</div></div>` : ''}
-                </div>
-
-                <div class="section">
-                    <h2>Discovery Evidence</h2>
-                    <div class="stat-card-grid" style="margin-top: 10px; margin-bottom: 12px;">
-                        <div class="stat-card" style="cursor: pointer;" onclick="setBugTab('discoveries')" title="View discoveries">
-                            <h3>Discoveries</h3>
-                            <div class="value">${evidence.count}</div>
-                            <div class="text-muted-sm" style="margin-top: 4px;">${evidence.count === 1 ? 'Initial finding' : 'Initial findings'}</div>
-                        </div>
-                        <div class="stat-card" style="cursor: pointer;" onclick="setBugTab('discoveries')" title="View model diversity">
-                            <h3>Known Models</h3>
-                            <div class="value">${evidence.models.length}</div>
-                            <div class="text-muted-sm" style="margin-top: 4px;">${evidence.models.length === 1 ? 'Unique model' : 'Unique models'}</div>
-                        </div>
-                        <div class="stat-card" style="cursor: pointer;" onclick="setBugTab('discoveries')" title="View tool diversity">
-                            <h3>Known Tools</h3>
-                            <div class="value">${evidence.tools.length}</div>
-                            <div class="text-muted-sm" style="margin-top: 4px;">${evidence.tools.length === 1 ? 'Unique tool' : 'Unique tools'}</div>
-                        </div>
-                    </div>
-                    <div class="text-muted-sm" style="margin-bottom: 8px;">Repeated findings and model diversity help assess a bug. Discoveries may share context; they do not prove correctness.</div>
                 </div>
 
                 <div class="controls" style="margin-top: 20px; margin-bottom: 16px; border-bottom: 1px solid var(--border-light); padding-bottom: 8px;" role="tablist" aria-label="Bug details" onkeydown="bugTabKeydown(event)">
