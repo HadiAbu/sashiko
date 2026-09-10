@@ -73,6 +73,8 @@ spec:
               value: "/mnt/local-ssd/worktrees"
             - name: SASHIKO__SERVER__PORT
               value: "8080"
+            - name: SASHIKO__PROJECT__DOMAIN
+              value: "sashiko.dev"
             - name: SASHIKO__AI__MODEL
               value: "gemini-3.1-pro-preview"
             - name: SASHIKO__AI__MAX_INTERACTIONS

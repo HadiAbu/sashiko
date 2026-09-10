@@ -37,7 +37,7 @@ impl BugWorker {
                         let actor = if !bug.reporter.is_empty() {
                             bug.reporter.as_str()
                         } else {
-                            "sashiko.dev"
+                            "sashiko"
                         };
                         let db = db.with_bug_actor(
                             actor,

@@ -1087,7 +1087,7 @@ pub async fn process_issue(
             (db.bug_actor().to_string(), db.bug_tool().to_string())
         } else {
             (
-                "sashiko.dev".to_string(),
+                "sashiko".to_string(),
                 "sashiko:linux_patch_review".to_string(),
             )
         };
@@ -1623,7 +1623,7 @@ pub async fn process_issue_worker(
     } else if !bug_row.reporter.is_empty() {
         bug_row.reporter.clone()
     } else {
-        "sashiko.dev".to_string()
+        "sashiko".to_string()
     };
     let tool = if db.has_bug_actor() {
         db.bug_tool().to_string()
@@ -2540,7 +2540,7 @@ mod tests {
             .find(|e| e.kind == "normalization_run")
             .expect("Completed normalization must be retained");
         assert_eq!(stage.model.as_deref(), Some("mock"));
-        assert_eq!(stage.author.as_deref(), Some("sashiko.dev"));
+        assert_eq!(stage.author.as_deref(), Some("sashiko"));
         assert!(
             stage
                 .logs

@@ -529,7 +529,7 @@ fn default_bug_status() -> String {
 }
 
 fn default_bug_reporter() -> String {
-    "sashiko.dev".to_string()
+    "sashiko".to_string()
 }
 
 fn default_now() -> i64 {
@@ -1883,12 +1883,8 @@ impl Database {
                 .record
                 .and_then(|e| e.author.as_deref())
                 .unwrap_or(&raw.reporter);
-            let author = if author == "sashiko" {
-                if self.has_bug_actor() {
-                    self.bug_actor()
-                } else {
-                    "sashiko.dev"
-                }
+            let author = if author == "sashiko" && self.has_bug_actor() {
+                self.bug_actor()
             } else {
                 author
             };

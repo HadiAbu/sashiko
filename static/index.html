@@ -3963,9 +3963,11 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
         function bugAttribution(record) {
             let author = record.author;
-            const defaultAttr = config.attribution || config.project_domain || 'sashiko.dev';
-            if (!author || author === 'sashiko') {
-                author = defaultAttr;
+            const configuredAttr = config.attribution || config.project_domain;
+            if (!author) {
+                author = configuredAttr || 'sashiko';
+            } else if (author === 'sashiko' && configuredAttr) {
+                author = configuredAttr;
             }
             let tool = record.tool;
             if (tool === 'sashiko:reviewer') {
