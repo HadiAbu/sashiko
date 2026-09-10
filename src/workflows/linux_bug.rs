@@ -828,21 +828,21 @@ Choose the representation that most clearly demonstrates the defect:
   If a defect arises from incompatible assumptions between two functions (e.g., a caller passing a NULL argument to a callee that blindly dereferences it), snippets MUST include relevant context from BOTH the caller and the callee. Prove the broken contract by showing both sides of the interface, rather than describing the callee's expectations purely in prose.
 
 - Concurrency, Race Conditions, and Deadlocks (LKML Timeline Style):
-  For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a clean multi-column timeline across the involved CPUs (e.g. CPU 0 and CPU 1). Format columns using whitespace separation and dashed underlines. Do NOT draw an ASCII table with vertical borders ('|'), crosses ('+'), or markdown table grids. Do NOT use multi-column timelines for non-concurrency defects (single-threaded leaks, null pointer dereferences on error paths, missing validation).
+  For race conditions, deadlocks, lock order inversions, or multi-CPU concurrency issues—and ONLY when it clearly improves clarity—you may illustrate the temporal sequence of events using a clean multi-column timeline across the involved CPUs (e.g. CPU 0 and CPU 1). Start the leftmost column at column 0. Format columns using whitespace separation and dashed underlines. Do NOT draw an ASCII table with vertical borders ('|'), crosses ('+'), or markdown table grids. Do NOT use multi-column timelines for non-concurrency defects (single-threaded leaks, null pointer dereferences on error paths, missing validation).
 
 - Strict Caret (^^^^^) Highlighting Rules:
   Carets are overused and must be used with extreme discipline. In most reports, NO carets should be used. Carets may ONLY point to an existing defective code token or operator that is visibly present in the code (e.g. an unsigned variable compared with < 0, an inverted relational operator, or an off-by-one boundary). NEVER use carets to point at a missing thing (e.g. NEVER point carets at 'goto out;' or 'return err;' or a blank line to say "missing kfree()"). Absence of a function call cannot be highlighted with carets.
 
 - Snippet Formatting:
   When a code snippet is used, format it as:
-    // <filepath>:<start_line>-<end_line>
-    return_type func_name(args)
-    {
-    	< ... >
-    	some_code();
-    	< ... >
-    }
-  Preserve EXACT verbatim indentation (tabs/spaces) from the source code. Indent the < ... > (or <...>) omission marker to match surrounding block level.
+// <filepath>:<start_line>-<end_line>
+return_type func_name(args)
+{
+	< ... >
+	some_code();
+	< ... >
+}
+  Start every snippet line at column 0. Do NOT wrap the block in any extra leading indentation; the only whitespace at the start of a line is the verbatim indentation (tabs/spaces) copied from the source code. Indent the < ... > (or <...>) omission marker to match surrounding block level.
   Comments on code lines or caret lines must NEVER cause total line width (including indentation) to exceed 75 characters. If an explanation is needed, place it on a separate comment line or explain it in the prose below the snippet.
   Do NOT mention raw line numbers in prose; refer to function names or the snippet header instead.
 
@@ -861,22 +861,22 @@ In parse_durable_handle_context(), if ksmbd_extract_sharename() fails after
 allocating the durable handle buffer, the function returns an error code
 without freeing the allocated buffer:
 
-    // fs/smb/server/smb2pdu.c:2450-2475
-    static int parse_durable_handle_context(...)
-    {
-    	struct ksmbd_file *fp;
-    	< ... >
-    	fp = kzalloc(sizeof(*fp), GFP_KERNEL);
-    	if (!fp)
-    		return -ENOMEM;
-    	< ... >
-    	rc = ksmbd_extract_sharename(share_name, ...);
-    	if (rc) {
-    		status.ret = KSMBD_TREE_CONN_STATUS_ERROR;
-    		return rc;
-    	}
-    	< ... >
-    }
+// fs/smb/server/smb2pdu.c:2450-2475
+static int parse_durable_handle_context(...)
+{
+	struct ksmbd_file *fp;
+	< ... >
+	fp = kzalloc(sizeof(*fp), GFP_KERNEL);
+	if (!fp)
+		return -ENOMEM;
+	< ... >
+	rc = ksmbd_extract_sharename(share_name, ...);
+	if (rc) {
+		status.ret = KSMBD_TREE_CONN_STATUS_ERROR;
+		return rc;
+	}
+	< ... >
+}
 
 The allocated fp structure is abandoned on the early return path without
 calling ksmbd_fd_put() or kfree(), leading to a permanent kernel memory
@@ -888,14 +888,14 @@ In ffs_epfile_open(), opening an endpoint races with dynamic endpoint
 removal, which can leave file->private_data pointing to a freed endpoint
 object:
 
-    CPU 0 (removal thread)              CPU 1 (open thread)
-    ----------------------              -------------------
-                                        ffs_epfile_open()
-                                          ep = ffs->epfiles[i];
-    ffs_data_closed()
-      atomic_dec_and_test(&ffs->opened)
-      kfree(ep); // dynamic removal
-                                          file->private_data = ep; // UAF
+CPU 0 (removal thread)              CPU 1 (open thread)
+----------------------              -------------------
+                                    ffs_epfile_open()
+                                      ep = ffs->epfiles[i];
+ffs_data_closed()
+  atomic_dec_and_test(&ffs->opened)
+  kfree(ep); // dynamic removal
+                                      file->private_data = ep; // UAF
 
 When the total open count reaches zero, removal tears down and frees dynamic
 endpoints. If a concurrent opener reads ffs->epfiles[i] before the count is
@@ -922,15 +922,15 @@ Example 4 (Arithmetic / boundary / overflow with targeted carets and short comme
 On a 32-bit architecture, size_t is 32-bit and an integer overflow occurs
 when calculating the allocation size in snd_pcm_hw_params():
 
-    // sound/core/pcm_native.c:450-475
-    static int snd_pcm_hw_params(...)
-    {
-    	< ... >
-    	size = params->periods * params->period_bytes;
-    	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-    	       // overflows 32-bit size_t
-    	< ... >
-    }
+// sound/core/pcm_native.c:450-475
+static int snd_pcm_hw_params(...)
+{
+	< ... >
+	size = params->periods * params->period_bytes;
+	       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+	       // overflows 32-bit size_t
+	< ... >
+}
 
 Because params->periods and params->period_bytes are controlled by
 userspace ALSA configuration, multiplication of large values wraps around
@@ -942,13 +942,13 @@ Example 5 (Circular lock dependency / deadlock timeline):
 A circular locking dependency exists between slots_lock and vcpu mutex
 across multiple execution contexts:
 
-    CPU 0                               CPU 1
-    -----                               -----
-    lock(&kvm->slots_lock);
-                                        lock(&vcpu->mutex);
-                                        lock(&kvm->slots_lock); // blocks
-    sync(&kvm->srcu);
-      lock(&vcpu->mutex); // deadlock
+CPU 0                               CPU 1
+-----                               -----
+lock(&kvm->slots_lock);
+                                    lock(&vcpu->mutex);
+                                    lock(&kvm->slots_lock); // blocks
+sync(&kvm->srcu);
+  lock(&vcpu->mutex); // deadlock
 
 CPU 0 holds slots_lock while waiting for vcpu mutex via sync_srcu, while
 CPU 1 holds vcpu mutex and attempts to acquire slots_lock, creating an
@@ -1012,6 +1012,7 @@ Draft the standalone technical defect description for upstream submission follow
    - Strict Carets: Do NOT overuse carets (^^^^^). Carets may ONLY point to an existing defective expression. NEVER use carets to highlight a missing call (e.g. do not point carets at 'goto out;' or 'return err;' to denote missing kfree()).
    - Comments on code lines or caret lines must never exceed 75 characters per line.
    - Format snippets with // <filepath>:<start_line>-<end_line>, verbatim tabs, and < ... > (or <...>) omission markers.
+   - Start every snippet and timeline line at column 0. Do NOT wrap the block in any extra leading indentation; the only leading whitespace is the verbatim indentation copied from the source code.
 
 4. Formatting Constraints:
    - Raw plain text only: no markdown fences (```), no quote marks ('>'), no backticks (`).
@@ -2615,6 +2616,22 @@ mod tests {
         assert!(user_prompt.contains("multi-CPU timeline diagram"));
         assert!(user_prompt.contains("Include code snippets for all localized defects"));
         assert!(user_prompt.contains("missing architectural hook"));
+
+        // Snippets are flush left so code keeps its full 75 column budget.
+        assert!(sys_prompt.contains("Start every snippet line at column 0"));
+        assert!(user_prompt.contains("Start every snippet and timeline line at column 0"));
+        assert!(sys_prompt.contains("\n// fs/smb/server/smb2pdu.c:2450-2475\n"));
+        assert!(sys_prompt.contains("\nstatic int parse_durable_handle_context(...)\n"));
+        assert!(sys_prompt.contains("\nCPU 0 (removal thread)"));
+        // Column alignment inside multi-column timelines is still allowed, so
+        // only the four space block wrapper is rejected.
+        for line in sys_prompt.lines() {
+            let indent = line.len() - line.trim_start_matches(' ').len();
+            assert_ne!(
+                indent, 4,
+                "example blocks must not be wrapped in four space indentation: {line:?}"
+            );
+        }
     }
 
     #[tokio::test]
