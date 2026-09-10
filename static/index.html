@@ -2663,8 +2663,8 @@
                 thead.innerHTML = `<tr>
                     <th style="cursor:pointer; user-select:none;" onclick="toggleBugSort('problem')" title="Sort by Problem">Problem${sortIndicator('problem')}</th>
                     <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('severity')" title="Sort by Severity">Severity${sortIndicator('severity')}</th>
+                    <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('discoveries')" title="Sort by Discoveries">Discoveries${sortIndicator('discoveries')}</th>
                     <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('created_at')" title="Sort by Date">Date${sortIndicator('created_at')}</th>
-                    <th style="width:90px;" title="Discoveries: tools / models">Discoveries</th>
                     <th style="width:80px; cursor:pointer; user-select:none;" onclick="toggleBugSort('status')" title="Sort by Status">Status${sortIndicator('status')}</th>
                 </tr>`;
             } else {
@@ -2850,15 +2850,18 @@
                         const statusInfo = getBugStatus(p);
 
                         const { dateStr, timeStr } = formatDateParts(p.created_at || p.date);
+                        const discoveriesCount = (p.evidence && typeof p.evidence.count === 'number') ? p.evidence.count : 1;
                         const toolsCount = p.evidence?.tools?.length ?? 0;
                         const modelsCount = p.evidence?.models?.length ?? 0;
-                        const discoveriesTitle = `${toolsCount} ${toolsCount === 1 ? 'tool' : 'tools'} / ${modelsCount} ${modelsCount === 1 ? 'model' : 'models'}${p.evidence?.count ? ` (${p.evidence.count} ${p.evidence.count === 1 ? 'discovery' : 'discoveries'})` : ''}`;
+                        const toolsText = `${toolsCount} ${toolsCount === 1 ? 'tool' : 'tools'}`;
+                        const modelsText = `${modelsCount} ${modelsCount === 1 ? 'model' : 'models'}`;
+                        const discoveriesTitle = `${discoveriesCount} ${discoveriesCount === 1 ? 'discovery' : 'discoveries'} (${toolsText}, ${modelsText})`;
 
                         row.innerHTML = `
                             <td><div>${escapeHtml(p.problem) || '(no description)'}</div>${tagsHtml}</td>
                             <td style="line-height:1.2;">${sevHtml}</td>
+                            <td title="${escapeHtml(discoveriesTitle)}">${discoveriesCount}</td>
                             <td style="line-height:1.2;"><div>${dateStr}</div>${timeStr ? `<div class="text-muted-sm">${timeStr}</div>` : ''}</td>
-                            <td title="${escapeHtml(discoveriesTitle)}">${toolsCount} / ${modelsCount}</td>
                             <td><span class="status-badge ${statusInfo.cls}">${statusInfo.label}</span></td>
                         `;
                     } else {

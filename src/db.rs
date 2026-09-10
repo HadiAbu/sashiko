@@ -2188,6 +2188,24 @@ impl Database {
             Some("id") => format!("ORDER BY id {}", sort_dir),
             Some("bugid") => format!("ORDER BY bugid {}, id {}", sort_dir, sort_dir),
             Some("created_at") => format!("ORDER BY created_at {}, id {}", sort_dir, sort_dir),
+            Some("discoveries") | Some("findings") => {
+                format!(
+                    "ORDER BY COALESCE((
+                        WITH RECURSIVE ancestors(root, id, parent) AS (
+                            SELECT bugs.id, bugs.id, bugs.duplicate_of_id
+                            UNION SELECT a.root, b.id, b.duplicate_of_id FROM bugs b JOIN ancestors a ON b.id = a.parent
+                        ), family(root, id) AS (
+                            SELECT root, id FROM ancestors
+                            UNION SELECT f.root, b.id FROM bugs b JOIN family f ON b.duplicate_of_id = f.id
+                        )
+                        SELECT COUNT(*)
+                        FROM family f
+                        JOIN bugs b ON b.id = f.id
+                        LEFT JOIN bug_enrichments e ON e.bug_id = f.id AND e.kind IN ('candidate', 'discovery')
+                    ), 1) {}, id {}",
+                    sort_dir, sort_dir
+                )
+            }
             _ => format!("ORDER BY created_at {}, id {}", sort_dir, sort_dir),
         };
 
@@ -11339,6 +11357,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list_sorted.len(), 1);
+
+        let (list_disc, _) = db
+            .list_bugs(ListBugsParams {
+                page: Some(1),
+                limit: Some(10),
+                sort_by: Some("discoveries"),
+                sort_order: Some("desc"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(list_disc.len(), 1);
 
         // Test duplicate linking
         let dup_bug = NewBug {
