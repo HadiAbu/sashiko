@@ -386,7 +386,7 @@
         button:disabled,
         select:disabled {
             opacity: 0.5;
-            cursor: default;
+            cursor: not-allowed;
         }
 
         .controls button.active {
@@ -1476,6 +1476,33 @@
         </div>
     </div>
 
+    <div id="bugActionModal" class="modal-overlay" onclick="if(event.target===this) closeBugActionModal()">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeBugActionModal()">&times;</span>
+            <div class="about-logo" id="bugActionTitle" style="margin-bottom: 24px;">Action</div>
+            
+            <form id="bugActionForm" onsubmit="submitBugAction(event)">
+                <input type="hidden" id="bugActionType" value="">
+                <input type="hidden" id="bugActionTargetId" value="">
+                
+                <div id="bugActionDuplicateSection" style="display: none; margin-bottom: 16px;">
+                    <div style="margin-bottom: 8px;"><strong>Canonical Bug ID:</strong></div>
+                    <input type="text" id="bugActionDuplicateId" class="search-input" placeholder="linux-…" style="width: 100%; border: 1px solid var(--border); box-sizing: border-box;" step="1">
+                    <div style="font-size: 0.85em; color: var(--text-muted); margin-top: 4px;">Paste the bug ID shown at the top of the existing bug.</div>
+                </div>
+
+                <div style="margin-bottom: 8px;"><strong id="bugActionReasonLabel">Reason / Comment:</strong></div>
+                <textarea id="bugActionReason" class="search-input" style="width: 100%; height: 120px; border: 1px solid var(--border); box-sizing: border-box; resize: vertical;" placeholder="Add reasoning or context..."></textarea>
+                
+                <div style="margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px;">
+                    <button type="button" class="btn" onclick="closeBugActionModal()">Cancel</button>
+                    <button type="submit" class="btn primary" id="bugActionSubmitBtn">Submit</button>
+                </div>
+                <div id="bugActionError" style="color: var(--status-failed); margin-top: 12px; display: none;"></div>
+            </form>
+        </div>
+    </div>
+
     <script>
         // =====================================================================
         // STATE
@@ -1537,6 +1564,294 @@
                 }
             }
         };
+
+        // =====================================================================
+        // AUTHENTICATION & PERMISSIONS
+        // =====================================================================
+        const API_TOKEN_KEY = 'sashiko_session_token';
+        const API_USER_KEY = 'sashiko_session_email';
+
+        function parseJwtPayload(token) {
+            if (!token || typeof token !== 'string') return null;
+            try {
+                const parts = token.split('.');
+                if (parts.length !== 3) return null;
+                const base64Url = parts[1];
+                const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+                const jsonPayload = decodeURIComponent(
+                    atob(base64)
+                        .split('')
+                        .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+                        .join('')
+                );
+                return JSON.parse(jsonPayload);
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function isTokenExpired(token) {
+            const payload = parseJwtPayload(token);
+            if (!payload || typeof payload.exp !== 'number') return true;
+            // Mark expired if within 5 seconds of expiration timestamp to avoid race conditions
+            return (Date.now() / 1000) >= (payload.exp - 5);
+        }
+
+        function clearAuthSession() {
+            safeStorage.removeItem(API_TOKEN_KEY);
+            safeStorage.removeItem(API_USER_KEY);
+            updateAuthUI();
+        }
+
+        function getAuthToken() {
+            const token = safeStorage.getItem(API_TOKEN_KEY);
+            if (!token) return null;
+            if (isTokenExpired(token)) {
+                clearAuthSession();
+                return null;
+            }
+            return token;
+        }
+
+        function getAuthEmail() {
+            if (!getAuthToken()) return null;
+            return safeStorage.getItem(API_USER_KEY);
+        }
+
+        function canPerformBugActions() {
+            if (config && config.read_only) return false;
+            if (config && config.permissions && typeof config.permissions.action === 'boolean') {
+                return config.permissions.action;
+            }
+            return !!getAuthToken();
+        }
+
+        function getActionDisabledTitle() {
+            if (config && config.read_only) {
+                return "Server is running in read-only mode.";
+            }
+            const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
+            if (!isAuthed) {
+                return "You don't have permissions to perform bug actions in guest mode. Please sign in.";
+            }
+            return "You don't have permissions to perform bug actions.";
+        }
+
+        let isLoggingOut = false;
+        function logoutAuth() {
+            if (isLoggingOut) return;
+            isLoggingOut = true;
+            try {
+                const hadToken = !!safeStorage.getItem(API_TOKEN_KEY);
+                clearAuthSession();
+                if (hadToken) {
+                    fetchConfig().then(refreshPageData);
+                }
+            } finally {
+                setTimeout(() => { isLoggingOut = false; }, 100);
+            }
+        }
+
+        function refreshPageData() {
+            if (typeof router === 'function') {
+                router();
+            } else {
+                window.location.reload();
+            }
+        }
+
+        // Enhance fetch globally to attach Authorization if token exists and handle expiration/rejection
+        const originalFetch = window.fetch;
+        window.fetch = async function() {
+            let [resource, config] = arguments;
+            const token = getAuthToken();
+            if (token && resource && typeof resource === 'string' && resource.startsWith('/api/')) {
+                config = config || {};
+                config.headers = config.headers || {};
+                if (!config.headers['Authorization']) {
+                    config.headers['Authorization'] = `Bearer ${token}`;
+                }
+            }
+            const res = await originalFetch(resource, config);
+
+            // Handle token rejection or expiration by the server
+            if (token && resource && typeof resource === 'string' && resource.startsWith('/api/')) {
+                if (res.status === 401) {
+                    // Token expired or invalid signature/revoked
+                    console.warn("Session token expired or rejected by server (401 Unauthorized), logging out.");
+                    logoutAuth();
+                } else if (res.status === 403 && resource === '/api/auth/refresh') {
+                    // Token refresh rejected (e.g. blocklisted or revoked permissions)
+                    console.warn("Session refresh forbidden (403 Forbidden), logging out.");
+                    logoutAuth();
+                }
+            }
+            return res;
+        };
+
+        async function fetchNewSessionToken(signInToken) {
+            try {
+                const res = await originalFetch(`/api/auth/verify?token=${encodeURIComponent(signInToken)}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.token) {
+                        const payload = parseJwtPayload(data.token);
+                        safeStorage.setItem(API_TOKEN_KEY, data.token);
+                        safeStorage.setItem(API_USER_KEY, (payload && payload.sub) ? payload.sub : 'Authorized User');
+                        updateAuthUI();
+                        await fetchConfig();
+                        refreshPageData();
+                    }
+                } else {
+                    let msg = "Sign-in link is invalid or has expired.";
+                    if (res.status === 403) {
+                        msg = "Sign-in rejected: this account is not authorized or is blocked.";
+                    }
+                    alert(msg);
+                    clearAuthSession();
+                }
+            } catch(e) {
+                console.error(e);
+            }
+        }
+
+        async function runTokenRefresher() {
+            const token = getAuthToken();
+            if (!token) return;
+            try {
+                const res = await originalFetch(`/api/auth/refresh`, {
+                    method: 'POST',
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.token) {
+                        const payload = parseJwtPayload(data.token);
+                        safeStorage.setItem(API_TOKEN_KEY, data.token);
+                        if (payload && payload.sub) {
+                            safeStorage.setItem(API_USER_KEY, payload.sub);
+                        }
+                        await fetchConfig();
+                    }
+                } else if (res.status === 401 || res.status === 403) {
+                    logoutAuth();
+                }
+            } catch(e) {}
+        }
+
+        function updateAuthUI() {
+            const email = getAuthEmail();
+            const emailSpan = document.getElementById('auth-email');
+            const btn = document.getElementById('auth-btn');
+            if (!emailSpan || !btn) return;
+            if (email) {
+                emailSpan.textContent = email;
+                emailSpan.title = email;
+                btn.textContent = 'Logout';
+                emailSpan.style.color = 'var(--status-reviewed)';
+                emailSpan.style.fontWeight = 'bold';
+                emailSpan.style.fontStyle = 'normal';
+            } else {
+                emailSpan.textContent = 'Guest';
+                emailSpan.title = '';
+                btn.textContent = 'Login';
+                emailSpan.style.color = 'var(--text-muted)';
+                emailSpan.style.fontWeight = 'normal';
+                emailSpan.style.fontStyle = 'italic';
+            }
+        }
+
+        function toggleAuth() {
+            if (getAuthToken()) {
+                logoutAuth();
+            } else {
+                openAuthModal();
+            }
+        }
+
+        function openAuthModal(noticeMessage) {
+            document.getElementById('authEmailInput').value = '';
+            const msg = document.getElementById('authMessage');
+            if (noticeMessage) {
+                msg.style.color = 'var(--status-failed)';
+                msg.textContent = noticeMessage;
+                msg.style.display = 'block';
+            } else {
+                msg.style.display = 'none';
+            }
+            document.getElementById('authModal').style.display = 'flex';
+        }
+
+        function closeAuthModal() {
+            document.getElementById('authModal').style.display = 'none';
+        }
+
+        async function submitAuthRequest() {
+            const email = document.getElementById('authEmailInput').value.trim();
+            if (!email) return;
+
+            const btn = document.getElementById('authSubmitBtn');
+            const msg = document.getElementById('authMessage');
+            btn.disabled = true;
+            msg.style.display = 'none';
+
+            try {
+                const res = await originalFetch('/api/auth/request-link', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email })
+                });
+
+                if (res.ok) {
+                    msg.style.color = 'var(--status-reviewed)';
+                    msg.innerHTML = "<b>Sign-in link sent!</b><br>Please check your inbox (or server logs) to sign in.";
+                } else if (res.status === 403) {
+                    msg.style.color = 'var(--status-failed)';
+                    msg.textContent = "This email address is not authorized to sign in.";
+                } else {
+                    msg.style.color = 'var(--status-failed)';
+                    msg.textContent = "Error requesting sign-in link: " + res.statusText;
+                }
+            } catch (e) {
+                msg.style.color = 'var(--status-failed)';
+                msg.textContent = "Error: " + e.message;
+            }
+            msg.style.display = 'block';
+            btn.disabled = false;
+        }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            const urlParams = new URLSearchParams(window.location.search);
+            const signInToken = urlParams.get('magic_token');
+            if (signInToken) {
+                window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+                fetchNewSessionToken(signInToken);
+            } else {
+                // Ensure expired token is purged on load
+                getAuthToken();
+                updateAuthUI();
+            }
+
+            // Check for local expiration periodically so idle tabs log out promptly
+            setInterval(() => {
+                const token = safeStorage.getItem(API_TOKEN_KEY);
+                if (token && isTokenExpired(token)) {
+                    logoutAuth();
+                }
+            }, 30 * 1000);
+
+            // Periodically refresh the session token before it expires
+            setInterval(() => {
+                if (getAuthToken()) {
+                    runTokenRefresher();
+                }
+            }, 3600 * 1000);
+            setTimeout(() => {
+                if (getAuthToken()) {
+                    runTokenRefresher();
+                }
+            }, 2000);
+        });
 
         // =====================================================================
         // SETTINGS & LOCAL STORAGE
@@ -3753,6 +4068,24 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             const locationsHtml = formatLocations(data.locations) || (data.source_files || []).map(f => `<code>${escapeHtml(f)}</code>`).join(' ');
 
+            const canAct = canPerformBugActions();
+            const actionDisabledTitle = getActionDisabledTitle();
+
+            const actionButtonsHtml = canAct ? `
+                <button class="primary" onclick="openBugActionModal('comment', '${id}')">Add Comment</button>
+                <details class="subsystem-dropdown" id="bugStatusDropdown" style="position:relative; display:inline-block;">
+                    <summary class="subsystem-dropdown-btn">Change Status ▾</summary>
+                    <div class="subsystem-dropdown-menu" style="display:block; min-width:180px;">
+                        ${!['closed', 'fixed'].includes(data.status) ? `<div class="subsystem-item" onclick="openBugActionModal('close', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Close bug</div>` : ''}
+                        ${data.status !== 'dismissed' ? `<div class="subsystem-item" onclick="openBugActionModal('dismiss', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Dismiss finding</div>` : ''}
+                        ${data.status !== 'duplicate' ? `<div class="subsystem-item" onclick="openBugActionModal('mark_duplicate', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Mark as duplicate</div>` : ''}
+                    </div>
+                </details>
+            ` : `
+                <button class="primary" disabled title="${escapeHtml(actionDisabledTitle)}">Add Comment</button>
+                <button class="btn" disabled title="${escapeHtml(actionDisabledTitle)}">Change Status ▾</button>
+            `;
+
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
                 <h1>
@@ -3761,15 +4094,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 </h1>
 
                 <div class="controls" style="margin-bottom: 16px;">
-                    <button class="primary" onclick="openBugActionModal('comment', '${id}')">Add Comment</button>
-                    <details class="subsystem-dropdown" id="bugStatusDropdown" style="position:relative; display:inline-block;">
-                        <summary class="subsystem-dropdown-btn">Change Status ▾</summary>
-                        <div class="subsystem-dropdown-menu" style="display:block; min-width:180px;">
-                            ${!['closed', 'fixed'].includes(data.status) ? `<div class="subsystem-item" onclick="openBugActionModal('close', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Close bug</div>` : ''}
-                            ${data.status !== 'dismissed' ? `<div class="subsystem-item" onclick="openBugActionModal('dismiss', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Dismiss finding</div>` : ''}
-                            ${data.status !== 'duplicate' ? `<div class="subsystem-item" onclick="openBugActionModal('mark_duplicate', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Mark as duplicate</div>` : ''}
-                        </div>
-                    </details>
+                    ${actionButtonsHtml}
                     <a href="${bugLogLink(bugid)}" target="_blank" rel="noopener noreferrer" style="margin-left: auto; font-size: 0.9em; font-weight: 600;">Full logs &amp; raw data ↗</a>
                 </div>
 
@@ -4563,6 +4888,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         loadSettings();
         fetchConfig().then(router);
         function openBugActionModal(action, id) {
+            if (!canPerformBugActions()) {
+                alert(getActionDisabledTitle());
+                return;
+            }
             document.getElementById('bugActionType').value = action;
             document.getElementById('bugActionTargetId').value = id;
             document.getElementById('bugActionReason').value = '';
@@ -4614,6 +4943,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             errorEl.style.display = 'none';
             submitBtn.disabled = true;
             
+            if (!canPerformBugActions()) {
+                errorEl.textContent = getActionDisabledTitle();
+                errorEl.style.display = 'block';
+                submitBtn.disabled = false;
+                return;
+            }
+
             const payload = { action: action, tool: 'web' };
             
             if (action === 'comment') {
@@ -4653,6 +4989,11 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 if (!res.ok) {
                     let errStr = res.statusText;
                     try { errStr = (await res.text()) || errStr; } catch(e) {}
+                    if (res.status === 403) {
+                        if (!errStr || errStr === "Forbidden" || errStr.toLowerCase().includes("remote mutations disallowed")) {
+                            errStr = getActionDisabledTitle();
+                        }
+                    }
                     throw new Error(errStr);
                 }
                 
@@ -4666,298 +5007,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 submitBtn.disabled = false;
             }
         }
-    </script>
-    <div id="bugActionModal" class="modal-overlay" onclick="if(event.target===this) closeBugActionModal()">
-        <div class="modal-content">
-            <span class="modal-close" onclick="closeBugActionModal()">&times;</span>
-            <div class="about-logo" id="bugActionTitle" style="margin-bottom: 24px;">Action</div>
-            
-            <form id="bugActionForm" onsubmit="submitBugAction(event)">
-                <input type="hidden" id="bugActionType" value="">
-                <input type="hidden" id="bugActionTargetId" value="">
-                
-                <div id="bugActionDuplicateSection" style="display: none; margin-bottom: 16px;">
-                    <div style="margin-bottom: 8px;"><strong>Canonical Bug ID:</strong></div>
-                    <input type="text" id="bugActionDuplicateId" class="search-input" placeholder="linux-…" style="width: 100%; border: 1px solid var(--border); box-sizing: border-box;" step="1">
-                    <div style="font-size: 0.85em; color: var(--text-muted); margin-top: 4px;">Paste the bug ID shown at the top of the existing bug.</div>
-                </div>
-
-                <div style="margin-bottom: 8px;"><strong id="bugActionReasonLabel">Reason / Comment:</strong></div>
-                <textarea id="bugActionReason" class="search-input" style="width: 100%; height: 120px; border: 1px solid var(--border); box-sizing: border-box; resize: vertical;" placeholder="Add reasoning or context..."></textarea>
-                
-                <div style="margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px;">
-                    <button type="button" class="btn" onclick="closeBugActionModal()">Cancel</button>
-                    <button type="submit" class="btn primary" id="bugActionSubmitBtn">Submit</button>
-                </div>
-                <div id="bugActionError" style="color: var(--status-failed); margin-top: 12px; display: none;"></div>
-            </form>
-        </div>
-    </div>
-
-    <!-- AUTH LOGIC -->
-    <script>
-        const API_TOKEN_KEY = 'sashiko_session_token';
-        const API_USER_KEY = 'sashiko_session_email';
-
-        function parseJwtPayload(token) {
-            if (!token || typeof token !== 'string') return null;
-            try {
-                const parts = token.split('.');
-                if (parts.length !== 3) return null;
-                const base64Url = parts[1];
-                const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
-                const jsonPayload = decodeURIComponent(
-                    atob(base64)
-                        .split('')
-                        .map(c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
-                        .join('')
-                );
-                return JSON.parse(jsonPayload);
-            } catch (e) {
-                return null;
-            }
-        }
-
-        function isTokenExpired(token) {
-            const payload = parseJwtPayload(token);
-            if (!payload || typeof payload.exp !== 'number') return true;
-            // Mark expired if within 5 seconds of expiration timestamp to avoid race conditions
-            return (Date.now() / 1000) >= (payload.exp - 5);
-        }
-
-        function clearAuthSession() {
-            safeStorage.removeItem(API_TOKEN_KEY);
-            safeStorage.removeItem(API_USER_KEY);
-            updateAuthUI();
-        }
-
-        function getAuthToken() {
-            const token = safeStorage.getItem(API_TOKEN_KEY);
-            if (!token) return null;
-            if (isTokenExpired(token)) {
-                clearAuthSession();
-                return null;
-            }
-            return token;
-        }
-
-        function getAuthEmail() {
-            if (!getAuthToken()) return null;
-            return safeStorage.getItem(API_USER_KEY);
-        }
-
-        let isLoggingOut = false;
-        function logoutAuth() {
-            if (isLoggingOut) return;
-            isLoggingOut = true;
-            try {
-                const hadToken = !!safeStorage.getItem(API_TOKEN_KEY);
-                clearAuthSession();
-                if (hadToken) {
-                    refreshPageData();
-                }
-            } finally {
-                setTimeout(() => { isLoggingOut = false; }, 100);
-            }
-        }
-
-        function refreshPageData() {
-            if (typeof router === 'function') {
-                router();
-            } else {
-                window.location.reload();
-            }
-        }
-
-        // Enhance fetch globally to attach Authorization if token exists and handle expiration/rejection
-        const originalFetch = window.fetch;
-        window.fetch = async function() {
-            let [resource, config] = arguments;
-            const token = getAuthToken();
-            if (token && resource && typeof resource === 'string' && resource.startsWith('/api/')) {
-                config = config || {};
-                config.headers = config.headers || {};
-                if (!config.headers['Authorization']) {
-                    config.headers['Authorization'] = `Bearer ${token}`;
-                }
-            }
-            const res = await originalFetch(resource, config);
-
-            // Handle token rejection or expiration by the server
-            if (token && resource && typeof resource === 'string' && resource.startsWith('/api/')) {
-                if (res.status === 401) {
-                    // Token expired or invalid signature/revoked
-                    console.warn("Session token expired or rejected by server (401 Unauthorized), logging out.");
-                    logoutAuth();
-                } else if (res.status === 403 && resource === '/api/auth/refresh') {
-                    // Token refresh rejected (e.g. blocklisted or revoked permissions)
-                    console.warn("Session refresh forbidden (403 Forbidden), logging out.");
-                    logoutAuth();
-                }
-            }
-            return res;
-        };
-
-        async function fetchNewSessionToken(signInToken) {
-            try {
-                const res = await originalFetch(`/api/auth/verify?token=${encodeURIComponent(signInToken)}`);
-                if (res.ok) {
-                    const data = await res.json();
-                    if (data.token) {
-                        const payload = parseJwtPayload(data.token);
-                        safeStorage.setItem(API_TOKEN_KEY, data.token);
-                        safeStorage.setItem(API_USER_KEY, (payload && payload.sub) ? payload.sub : 'Authorized User');
-                        updateAuthUI();
-                        refreshPageData();
-                    }
-                } else {
-                    let msg = "Sign-in link is invalid or has expired.";
-                    if (res.status === 403) {
-                        msg = "Sign-in rejected: this account is not authorized or is blocked.";
-                    }
-                    alert(msg);
-                    clearAuthSession();
-                }
-            } catch(e) {
-                console.error(e);
-            }
-        }
-
-        async function runTokenRefresher() {
-            const token = getAuthToken();
-            if (!token) return;
-            try {
-                const res = await originalFetch(`/api/auth/refresh`, {
-                    method: 'POST',
-                    headers: { 'Authorization': `Bearer ${token}` }
-                });
-                if (res.ok) {
-                    const data = await res.json();
-                    if (data.token) {
-                        const payload = parseJwtPayload(data.token);
-                        safeStorage.setItem(API_TOKEN_KEY, data.token);
-                        if (payload && payload.sub) {
-                            safeStorage.setItem(API_USER_KEY, payload.sub);
-                        }
-                    }
-                } else if (res.status === 401 || res.status === 403) {
-                    logoutAuth();
-                }
-            } catch(e) {}
-        }
-
-        function updateAuthUI() {
-            const email = getAuthEmail();
-            const emailSpan = document.getElementById('auth-email');
-            const btn = document.getElementById('auth-btn');
-            if (email) {
-                emailSpan.textContent = email;
-                emailSpan.title = email;
-                btn.textContent = 'Logout';
-                emailSpan.style.color = 'var(--status-reviewed)';
-                emailSpan.style.fontWeight = 'bold';
-                emailSpan.style.fontStyle = 'normal';
-            } else {
-                emailSpan.textContent = 'Guest';
-                emailSpan.title = '';
-                btn.textContent = 'Login';
-                emailSpan.style.color = 'var(--text-muted)';
-                emailSpan.style.fontWeight = 'normal';
-                emailSpan.style.fontStyle = 'italic';
-            }
-        }
-
-        function toggleAuth() {
-            if (getAuthToken()) {
-                logoutAuth();
-            } else {
-                openAuthModal();
-            }
-        }
-
-        function openAuthModal(noticeMessage) {
-            document.getElementById('authEmailInput').value = '';
-            const msg = document.getElementById('authMessage');
-            if (noticeMessage) {
-                msg.style.color = 'var(--status-failed)';
-                msg.textContent = noticeMessage;
-                msg.style.display = 'block';
-            } else {
-                msg.style.display = 'none';
-            }
-            document.getElementById('authModal').style.display = 'flex';
-        }
-
-        function closeAuthModal() {
-            document.getElementById('authModal').style.display = 'none';
-        }
-
-        async function submitAuthRequest() {
-            const email = document.getElementById('authEmailInput').value.trim();
-            if (!email) return;
-
-            const btn = document.getElementById('authSubmitBtn');
-            const msg = document.getElementById('authMessage');
-            btn.disabled = true;
-            msg.style.display = 'none';
-
-            try {
-                const res = await originalFetch('/api/auth/request-link', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email })
-                });
-
-                if (res.ok) {
-                    msg.style.color = 'var(--status-reviewed)';
-                    msg.innerHTML = "<b>Sign-in link sent!</b><br>Please check your inbox (or server logs) to sign in.";
-                } else if (res.status === 403) {
-                    msg.style.color = 'var(--status-failed)';
-                    msg.textContent = "This email address is not authorized to sign in.";
-                } else {
-                    msg.style.color = 'var(--status-failed)';
-                    msg.textContent = "Error requesting sign-in link: " + res.statusText;
-                }
-            } catch (e) {
-                msg.style.color = 'var(--status-failed)';
-                msg.textContent = "Error: " + e.message;
-            }
-            msg.style.display = 'block';
-            btn.disabled = false;
-        }
-
-        window.addEventListener('DOMContentLoaded', () => {
-            const urlParams = new URLSearchParams(window.location.search);
-            const signInToken = urlParams.get('magic_token');
-            if (signInToken) {
-                window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
-                fetchNewSessionToken(signInToken);
-            } else {
-                // Ensure expired token is purged on load
-                getAuthToken();
-                updateAuthUI();
-            }
-
-            // Check for local expiration periodically so idle tabs log out promptly
-            setInterval(() => {
-                const token = safeStorage.getItem(API_TOKEN_KEY);
-                if (token && isTokenExpired(token)) {
-                    logoutAuth();
-                }
-            }, 30 * 1000);
-
-            // Periodically refresh the session token before it expires
-            setInterval(() => {
-                if (getAuthToken()) {
-                    runTokenRefresher();
-                }
-            }, 3600 * 1000);
-            setTimeout(() => {
-                if (getAuthToken()) {
-                    runTokenRefresher();
-                }
-            }, 2000);
-        });
     </script>
 </body>
 

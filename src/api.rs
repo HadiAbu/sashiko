@@ -1157,7 +1157,7 @@ async fn analyze_bug(
     if state.read_only {
         return Err((
             StatusCode::FORBIDDEN,
-            "Server is running in read-only mode".to_string(),
+            "Server is running in read-only mode.".to_string(),
         ));
     }
 
@@ -1170,7 +1170,7 @@ async fn analyze_bug(
     ) {
         return Err((
             StatusCode::FORBIDDEN,
-            "Remote mutations disallowed".to_string(),
+            "You don't have permissions to analyze bugs.".to_string(),
         ));
     }
 
@@ -1399,9 +1399,12 @@ async fn rerun_patchset(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if state.read_only {
-        return Err(StatusCode::FORBIDDEN);
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Server is running in read-only mode.".into(),
+        ));
     }
 
     if !is_authorized(
@@ -1411,17 +1414,23 @@ async fn rerun_patchset(
         auth.0.as_ref(),
         crate::settings::Permission::Review,
     ) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err((
+            StatusCode::FORBIDDEN,
+            "You don't have permissions to rerun patchsets.".into(),
+        ));
     }
 
     let id = query
         .id
         .parse::<i64>()
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid id parameter".into()))?;
 
     state.db.rerun_patchset(id).await.map_err(|e| {
         error!("Failed to rerun patchset {}: {}", id, e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to rerun patchset".into(),
+        )
     })?;
 
     Ok(Json(serde_json::json!({ "status": "accepted" })))
@@ -1433,9 +1442,12 @@ async fn cancel_patchset(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<CancelQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if state.read_only {
-        return Err(StatusCode::FORBIDDEN);
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Server is running in read-only mode.".into(),
+        ));
     }
 
     if !is_authorized(
@@ -1445,7 +1457,10 @@ async fn cancel_patchset(
         auth.0.as_ref(),
         crate::settings::Permission::Cancel,
     ) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err((
+            StatusCode::FORBIDDEN,
+            "You don't have permissions to cancel patchsets.".into(),
+        ));
     }
 
     let cancelled = state
@@ -1454,7 +1469,10 @@ async fn cancel_patchset(
         .await
         .map_err(|e| {
             error!("Failed to cancel patchset {}: {}", query.id, e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to cancel patchset".into(),
+            )
         })?;
 
     if cancelled {
@@ -1479,9 +1497,12 @@ async fn rerun_patch(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<RerunPatchQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if state.read_only {
-        return Err(StatusCode::FORBIDDEN);
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Server is running in read-only mode.".into(),
+        ));
     }
 
     if !is_authorized(
@@ -1491,7 +1512,10 @@ async fn rerun_patch(
         auth.0.as_ref(),
         crate::settings::Permission::Review,
     ) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err((
+            StatusCode::FORBIDDEN,
+            "You don't have permissions to rerun patches.".into(),
+        ));
     }
 
     state
@@ -1503,7 +1527,10 @@ async fn rerun_patch(
                 "Failed to rerun patch {} in patchset {}: {}",
                 query.patch_id, query.patchset_id, e
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to rerun patch".into(),
+            )
         })?;
 
     Ok(Json(serde_json::json!({ "status": "accepted" })))
@@ -1514,12 +1541,32 @@ async fn health_check() -> StatusCode {
 }
 
 async fn get_config(
+    auth: crate::auth::OptionalAuthUser,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let is_auth = |perm| is_authorized(&addr, &state, &headers, auth.0.as_ref(), perm);
+    let can_action = !state.read_only && is_auth(crate::settings::Permission::Action);
+    let can_review = !state.read_only && is_auth(crate::settings::Permission::Review);
+    let can_cancel = !state.read_only && is_auth(crate::settings::Permission::Cancel);
+    let can_ingest = !state.read_only && is_auth(crate::settings::Permission::Ingest);
+
     Ok(Json(serde_json::json!({
         "project_name": state.settings.project.name,
         "project_description": state.settings.project.description,
         "forge_enabled": state.settings.forge.enabled,
+        "read_only": state.read_only,
+        "permissions": {
+            "action": can_action,
+            "review": can_review,
+            "cancel": can_cancel,
+            "ingest": can_ingest,
+        },
+        "user": {
+            "email": auth.0.as_ref().map(|u| &u.email),
+            "is_authenticated": auth.0.is_some(),
+        },
         "version": env!("CARGO_PKG_VERSION"),
         "git_hash": env!("GIT_HASH"),
     })))
@@ -1808,7 +1855,10 @@ async fn bug_action(
     axum::extract::Json(payload): axum::extract::Json<BugActionPayload>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if state.read_only {
-        return Err((StatusCode::FORBIDDEN, "Read-only mode".into()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Server is running in read-only mode.".into(),
+        ));
     }
 
     if !is_authorized(
@@ -1818,7 +1868,10 @@ async fn bug_action(
         auth.0.as_ref(),
         crate::settings::Permission::Action,
     ) {
-        return Err((StatusCode::FORBIDDEN, "Remote mutations disallowed".into()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "You don't have permissions to perform bug actions.".into(),
+        ));
     }
 
     let bug_res = if let Some(id) = query.id {
@@ -2005,7 +2058,7 @@ mod tests {
             db.clone(),
             event_tx,
             fetch_tx,
-            true,
+            false,
             false,
             true,
         );
@@ -2307,6 +2360,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), 404);
+
+        // Test 6: get_config reports permissions, and remote unauthenticated action is denied with clear message
+        let cfg_loopback: serde_json::Value = reqwest::get(format!("http://{}/api/config", addr))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cfg_loopback["permissions"]["action"], true);
+
+        let client = reqwest::Client::new();
+        let cfg_remote: serde_json::Value = client
+            .get(format!("http://{}/api/config", addr))
+            .header("x-forwarded-for", "203.0.113.1")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(cfg_remote["permissions"]["action"], false);
+
+        let remote_denied = client
+            .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
+            .header("x-forwarded-for", "203.0.113.1")
+            .json(&serde_json::json!({
+                "action": "comment",
+                "content": "Attempt by remote guest"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(remote_denied.status(), 403);
+        let err_msg = remote_denied.text().await.unwrap();
+        assert_eq!(
+            err_msg,
+            "You don't have permissions to perform bug actions."
+        );
     }
 
     #[tokio::test]
