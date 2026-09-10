@@ -3962,10 +3962,21 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         }
 
         function bugAttribution(record) {
-            const author = escapeHtml(record.author || 'Not recorded');
-            const tool = escapeHtml(record.tool || 'Not recorded');
-            const model = escapeHtml(record.model || (['web', 'api', 'human'].includes(record.tool) ? 'Not used' : 'Not recorded'));
-            return `<strong>${author}</strong> <span class="text-muted-sm">&middot; Tool: <code>${tool}</code> &middot; Model: <code>${model}</code></span>`;
+            let author = record.author;
+            const defaultAttr = config.attribution || config.project_domain || 'sashiko.dev';
+            if (!author || author === 'sashiko') {
+                author = defaultAttr;
+            }
+            let tool = record.tool;
+            if (tool === 'sashiko:reviewer') {
+                tool = 'sashiko:linux_patch_review';
+            } else if (tool === 'sashiko:bug-worker') {
+                tool = 'sashiko:linux_bug';
+            }
+            const authorHtml = escapeHtml(author || 'Not recorded');
+            const toolHtml = escapeHtml(tool || 'Not recorded');
+            const modelHtml = escapeHtml(record.model || (['web', 'api', 'human'].includes(tool) ? 'Not used' : 'Not recorded'));
+            return `<strong>${authorHtml}</strong> <span class="text-muted-sm">&middot; Tool: <code>${toolHtml}</code> &middot; Model: <code>${modelHtml}</code></span>`;
         }
 
         function setBugTab(tab) {

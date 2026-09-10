@@ -33,11 +33,15 @@ impl BugWorker {
                     let provider = self.provider.clone();
                     let db = self.db.clone();
                     let repo_path = self.repo_path.clone();
-
                     tokio::spawn(async move {
+                        let actor = if !bug.reporter.is_empty() {
+                            bug.reporter.as_str()
+                        } else {
+                            "sashiko.dev"
+                        };
                         let db = db.with_bug_actor(
-                            "sashiko",
-                            "sashiko:bug-worker",
+                            actor,
+                            "sashiko:linux_bug",
                             Some(provider.get_capabilities().model_name),
                         );
                         info!("Processing raw bug ID {} ({})", bug.id, bug.bugid);

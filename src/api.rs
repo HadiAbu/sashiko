@@ -1555,6 +1555,8 @@ async fn get_config(
     Ok(Json(serde_json::json!({
         "project_name": state.settings.project.name,
         "project_description": state.settings.project.description,
+        "project_domain": state.settings.project.domain,
+        "attribution": state.settings.project.attribution(),
         "forge_enabled": state.settings.forge.enabled,
         "read_only": state.read_only,
         "permissions": {

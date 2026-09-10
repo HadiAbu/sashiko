@@ -40,6 +40,26 @@ pub struct ProjectSettings {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default = "default_project_domain")]
+    pub domain: String,
+    #[serde(default)]
+    pub attribution: Option<String>,
+}
+
+fn default_project_domain() -> String {
+    "sashiko.dev".to_string()
+}
+
+impl ProjectSettings {
+    pub fn attribution(&self) -> &str {
+        if let Some(ref attr) = self.attribution {
+            attr.as_str()
+        } else if !self.domain.is_empty() {
+            self.domain.as_str()
+        } else {
+            "sashiko.dev"
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -685,6 +705,26 @@ mod tests {
             let _ = Settings::from_file("Settings")
                 .expect("Production 'Settings.toml' failed to parse");
         }
+    }
+
+    #[test]
+    fn test_project_settings_attribution_and_domain() {
+        let default_proj = ProjectSettings::default();
+        assert_eq!(default_proj.domain, "");
+        assert_eq!(default_proj.attribution(), "sashiko.dev");
+
+        let toml_default: ProjectSettings = toml::from_str("name = \"Test\"").unwrap();
+        assert_eq!(toml_default.domain, "sashiko.dev");
+        assert_eq!(toml_default.attribution(), "sashiko.dev");
+
+        let toml_domain: ProjectSettings =
+            toml::from_str("domain = \"custom.kernel.org\"").unwrap();
+        assert_eq!(toml_domain.domain, "custom.kernel.org");
+        assert_eq!(toml_domain.attribution(), "custom.kernel.org");
+
+        let toml_attr: ProjectSettings =
+            toml::from_str("domain = \"custom.org\"\nattribution = \"custom-team\"").unwrap();
+        assert_eq!(toml_attr.attribution(), "custom-team");
     }
 
     /// concurrency is required for local reviews exactly as it is for the

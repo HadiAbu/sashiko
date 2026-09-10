@@ -3,6 +3,7 @@ log_level = "info"
 [project]
 name = "Sashiko"
 description = ""
+domain = "sashiko.dev"
 
 [forge]
 enabled = false

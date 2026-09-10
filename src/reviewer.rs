@@ -1430,8 +1430,8 @@ impl Reviewer {
                                             toolbox = Some(Arc::new(tb));
                                         }
                                         let discovery_db = ctx.db.with_bug_actor(
-                                            "sashiko",
-                                            &format!("sashiko:{}", ctx.settings.ai.provider),
+                                            ctx.settings.project.attribution(),
+                                            "sashiko:linux_patch_review",
                                             Some(ctx.provider.get_capabilities().model_name),
                                         );
                                         match crate::workflows::linux_bug::process_issue(

@@ -1086,7 +1086,10 @@ pub async fn process_issue(
         let (actor, tool) = if db.has_bug_actor() {
             (db.bug_actor().to_string(), db.bug_tool().to_string())
         } else {
-            ("sashiko".to_string(), "sashiko:reviewer".to_string())
+            (
+                "sashiko.dev".to_string(),
+                "sashiko:linux_patch_review".to_string(),
+            )
         };
         reviewer_db =
             db.with_bug_actor(&actor, &tool, Some(provider.get_capabilities().model_name));
@@ -1098,7 +1101,7 @@ pub async fn process_issue(
         bugid: bugid.clone(),
         title: input.problem.clone(),
         status: "raw".to_string(),
-        reporter: "sashiko".to_string(),
+        reporter: db.bug_actor().to_string(),
         reported_at: now,
         discovered_in_patchset_id: input.patchset_id,
         discovered_in_patch_id: input.patch_id,
@@ -1113,9 +1116,9 @@ pub async fn process_issue(
             &new_bug,
             Some(&crate::db::NewBugEnrichment {
                 kind: "candidate".to_string(),
-                tool: String::new(),
-                model: None,
-                author: None,
+                tool: db.bug_tool().to_string(),
+                model: db.bug_model().map(|s| s.to_string()),
+                author: Some(db.bug_actor().to_string()),
                 created_at: now,
                 content: Some(input.reasoning.clone()),
                 data_json: serde_json::to_value(&input).ok(),
@@ -1615,11 +1618,20 @@ pub async fn process_issue_worker(
         input.problem, input.subsystems
     );
 
-    let attributed_db = db.with_bug_actor(
-        "sashiko",
-        "sashiko:bug-worker",
-        Some(provider.get_capabilities().model_name),
-    );
+    let actor = if db.has_bug_actor() {
+        db.bug_actor().to_string()
+    } else if !bug_row.reporter.is_empty() {
+        bug_row.reporter.clone()
+    } else {
+        "sashiko.dev".to_string()
+    };
+    let tool = if db.has_bug_actor() {
+        db.bug_tool().to_string()
+    } else {
+        "sashiko:linux_bug".to_string()
+    };
+    let attributed_db =
+        db.with_bug_actor(&actor, &tool, Some(provider.get_capabilities().model_name));
     let db = &attributed_db;
     let mut full_history = Vec::new();
     let runner = SessionRunner::new(provider).with_max_turns(20);
@@ -2528,7 +2540,7 @@ mod tests {
             .find(|e| e.kind == "normalization_run")
             .expect("Completed normalization must be retained");
         assert_eq!(stage.model.as_deref(), Some("mock"));
-        assert_eq!(stage.author.as_deref(), Some("sashiko"));
+        assert_eq!(stage.author.as_deref(), Some("sashiko.dev"));
         assert!(
             stage
                 .logs

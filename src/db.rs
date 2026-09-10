@@ -529,7 +529,7 @@ fn default_bug_status() -> String {
 }
 
 fn default_bug_reporter() -> String {
-    "sashiko".to_string()
+    "sashiko.dev".to_string()
 }
 
 fn default_now() -> i64 {
@@ -1576,9 +1576,9 @@ impl Database {
                       ) AS model,
                       COALESCE(
                           NULLIF(trim(e.tool), ''),
-                          (SELECT 'sashiko:' || r.provider FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = f.id LIMIT 1),
-                          (SELECT 'sashiko:' || r.provider FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
-                          (SELECT 'sashiko:' || r.provider FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
+                          (SELECT 'sashiko:linux_patch_review' FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = f.id LIMIT 1),
+                          (SELECT 'sashiko:linux_patch_review' FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                          (SELECT 'sashiko:linux_patch_review' FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
                       ) AS tool
                FROM family f
                JOIN bugs b ON b.id = f.id
@@ -1631,9 +1631,9 @@ impl Database {
                         (SELECT r.model FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1)
                     ) AS model,
                     COALESCE(
-                        (SELECT 'sashiko:' || r.provider FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.id LIMIT 1),
-                        (SELECT 'sashiko:' || r.provider FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
-                        (SELECT 'sashiko:' || r.provider FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
+                        (SELECT 'sashiko:linux_patch_review' FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.id LIMIT 1),
+                        (SELECT 'sashiko:linux_patch_review' FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                        (SELECT 'sashiko:linux_patch_review' FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
                     ) AS tool
                  FROM bugs b WHERE b.id = ?",
                 libsql::params![bug_id],
@@ -1857,7 +1857,7 @@ impl Database {
             let now = chrono::Utc::now().timestamp();
             self.conn
                 .execute(
-                    "UPDATE bugs SET status = 'processing', updated_at = ?, audit_author = 'system', audit_tool = 'sashiko:bug-worker', audit_model = NULL WHERE id = ?",
+                    "UPDATE bugs SET status = 'processing', updated_at = ?, audit_author = 'system', audit_tool = 'sashiko:linux_bug', audit_model = NULL WHERE id = ?",
                     libsql::params![now, id],
                 )
                 .await?;
@@ -1873,7 +1873,7 @@ impl Database {
         let count = self
             .conn
             .execute(
-                "UPDATE bugs SET status = 'raw', audit_author = 'system', audit_tool = 'sashiko:bug-worker', audit_model = NULL WHERE status = 'processing'",
+                "UPDATE bugs SET status = 'raw', audit_author = 'system', audit_tool = 'sashiko:linux_bug', audit_model = NULL WHERE status = 'processing'",
                 (),
             )
             .await?;
@@ -6137,7 +6137,7 @@ mod tests {
                 &bug,
                 Some(&NewBugEnrichment {
                     kind: "candidate".to_string(),
-                    tool: "sashiko:reviewer".to_string(),
+                    tool: "sashiko:linux_patch_review".to_string(),
                     model: None,
                     created_at: 1000,
                     content: Some("test".to_string()),
@@ -6152,7 +6152,7 @@ mod tests {
         let summary = &summaries[&bug_id];
         assert_eq!(summary["count"], 1);
         assert_eq!(summary["models"], json!(["test-model"]));
-        assert_eq!(summary["tools"], json!(["sashiko:reviewer"]));
+        assert_eq!(summary["tools"], json!(["sashiko:linux_patch_review"]));
         assert_eq!(summary["unknown_models"], 0);
 
         let evidence = db.bug_evidence(bug_id).await?;
