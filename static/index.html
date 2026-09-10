@@ -3961,6 +3961,12 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             return `#/bug/${encodeURIComponent(bugid)}/log${eventId ? `?event=${encodeURIComponent(eventId)}` : ''}`;
         }
 
+        // Matches the "View Raw Log" affordance used by patch reviews so raw
+        // records are reached the same way everywhere in the UI.
+        function bugLogLinkHtml(bugid, eventId, label = 'View Raw Log') {
+            return `<a href="${bugLogLink(bugid, eventId)}" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${escapeHtml(label)}</a>`;
+        }
+
         function bugAttribution(record) {
             let author = record.author;
             const configuredAttr = config.attribution || config.project_domain;
@@ -4046,7 +4052,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         <div class="review-meta-label">Source:</div>
                         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                             <span>${sourceHtml}${d.legacy ? ' <span class="text-muted-sm">· Historical report; discovery metadata incomplete</span>' : ''}</span>
-                            <a href="${bugLogLink(d.bugid, d.enrichment_id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.9em; font-weight:500;">View source ↗</a>
+                            <span style="font-size:0.9em;">${bugLogLinkHtml(d.bugid, d.enrichment_id)}</span>
                         </div>
                     </div>
                 </div>
@@ -4147,8 +4153,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                 <div>${bugAttribution(c)}</div>
                             </div>
                             ${c.content ? `<div class="log-inline-block" style="margin-top: 8px;">${escapeHtml(c.content, true, false)}</div>` : ''}
-                            <div style="margin-top: 8px; text-align: right;">
-                                <a href="${bugLogLink(c.bugid, c.id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.85em; color:var(--text-dim);">Full record ↗</a>
+                            <div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                                ${bugLogLinkHtml(c.bugid, c.id)}
                             </div>
                         </div>
                     `).join('')}
@@ -4185,8 +4191,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                     <div class="log-inline-block">${escapeHtml(f.content, true, false)}</div>
                                 </div>
                             ` : ''}
-                            <div style="margin-top: 8px; text-align: right;">
-                                <a href="${bugLogLink(f.bugid, f.id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.85em; color:var(--text-dim);">Full record ↗</a>
+                            <div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                                ${bugLogLinkHtml(f.bugid, f.id)}
                             </div>
                         </div>
                         `;
@@ -4219,8 +4225,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                     <div class="log-inline-block" style="font-family: monospace;">${escapeHtml(r.content, true, false)}</div>
                                 </div>
                             ` : ''}
-                            <div style="margin-top: 8px; text-align: right;">
-                                <a href="${bugLogLink(r.bugid, r.id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.85em; color:var(--text-dim);">Full record ↗</a>
+                            <div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                                ${bugLogLinkHtml(r.bugid, r.id)}
                             </div>
                         </div>
                         `;
@@ -4253,8 +4259,8 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                     <div class="log-inline-block">${escapeHtml(a.content, true, false)}</div>
                                 </div>
                             ` : ''}
-                            <div style="margin-top: 8px; text-align: right;">
-                                <a href="${bugLogLink(a.bugid, a.id)}" target="_blank" rel="noopener noreferrer" style="font-size:0.85em; color:var(--text-dim);">Full record ↗</a>
+                            <div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                                ${bugLogLinkHtml(a.bugid, a.id)}
                             </div>
                         </div>
                         `;
@@ -4294,7 +4300,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             </div>
                             <div class="review-meta" style="margin-top: 6px; font-size:0.85em; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                                 <div>Actor: ${bugAttribution(e)}</div>
-                                <a href="${bugLogLink(e.bugid, e.id)}" target="_blank" rel="noopener noreferrer" style="color:var(--text-dim);">Full record ↗</a>
+                                ${bugLogLinkHtml(e.bugid, e.id)}
                             </div>
                         </div>
                         `;
@@ -4308,10 +4314,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <span>${escapeHtml(data.problem || data.title || 'Untitled bug')}</span>
                     <span class="status-badge ${status.cls}">${status.label}</span>
                 </h1>
-
-                <div class="controls" style="margin-bottom: 16px; justify-content: flex-end;">
-                    <a href="${bugLogLink(bugid)}" target="_blank" rel="noopener noreferrer" style="font-size: 0.9em; font-weight: 600;">Full logs &amp; raw data ↗</a>
-                </div>
 
                 ${data.duplicate_of ? `
                 <div class="section" style="margin-bottom: 16px;">
@@ -4379,7 +4381,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const payload = await res.json();
             const records = payload.records || [];
             const bugid = payload.bugid;
-            document.title = `${config.project_name || 'Sashiko'} - Full records for ${bugid}`;
+            document.title = `${config.project_name || 'Sashiko'} - Raw logs for ${bugid}`;
             const selected = new URLSearchParams(location.hash.split('?')[1] || '').get('event');
             const rawBlock = value => `<div style="position: relative; margin-top: 6px;"><button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button><div class="log-block" style="max-height: 350px;">${escapeHtml(typeof value === 'string' ? value : JSON.stringify(value, null, 2))}</div></div>`;
             const html = records.map(bug => `<div class="section"><h2>${escapeHtml(bug.title || bug.bugid)}</h2><div style="margin-bottom: 8px;"><a href="#/bug/${encodeURIComponent(bug.bugid)}"><code>${escapeHtml(bug.bugid)}</code></a></div>
@@ -4416,17 +4418,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     </div>`;
                 }).join('')}</div>`).join('');
             document.getElementById('app').innerHTML = `<div class="nav"><a href="#/bug/${encodeURIComponent(bugid)}">← Back to bug</a></div>
-                <h1><span>Full Logs &amp; Raw Data</span></h1>
+                <h1><span>Raw Logs</span></h1>
                 <p class="text-muted-sm" style="margin-bottom: 12px;">Original inputs, enrichment payloads, interaction logs, token usage, and attribution for every linked discovery.</p>
-                <div class="controls" style="margin-bottom: 16px;">
-                    <button id="download-bug-records">Download all records (JSON)</button>
-                </div>
                 ${html || '<p class="status-placeholder">No records available.</p>'}`;
-            document.getElementById('download-bug-records').onclick = () => {
-                const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
-                const a = document.createElement('a'); a.href = url; a.download = `${bugid}-records.json`; a.click();
-                setTimeout(() => URL.revokeObjectURL(url), 1000);
-            };
             if (selected && /^\d+$/.test(selected)) {
                 setTimeout(() => {
                     const el = document.getElementById(`bug-event-${selected}`);
