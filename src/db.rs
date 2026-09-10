@@ -617,6 +617,18 @@ impl Database {
         self.bug_actor != "system" || self.bug_tool != "sashiko"
     }
 
+    pub fn bug_actor(&self) -> &str {
+        &self.bug_actor
+    }
+
+    pub fn bug_tool(&self) -> &str {
+        &self.bug_tool
+    }
+
+    pub fn bug_model(&self) -> Option<&str> {
+        self.bug_model.as_deref()
+    }
+
     /// Attribution is scoped to this handle, never shared mutable connection state.
     pub fn with_bug_actor(&self, author: &str, tool: &str, model: Option<String>) -> Self {
         Self {
@@ -937,7 +949,15 @@ impl Database {
             tx.execute("PRAGMA user_version = 3", ()).await?;
             tx.commit().await?;
         }
-        info!("Database schema is up to date at version 3.");
+
+        if current_version < 4 {
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/004_backfill_bug_models.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 4", ()).await?;
+            tx.commit().await?;
+        }
+        info!("Database schema is up to date at version 4.");
         Ok(())
     }
 
@@ -1547,7 +1567,21 @@ impl Database {
              ), family(root, id) AS (
                 SELECT root, id FROM ancestors
                 UNION SELECT f.root, b.id FROM bugs b JOIN family f ON b.duplicate_of_id = f.id
-             ) SELECT f.root, e.model, e.tool FROM family f
+             ) SELECT f.root,
+                      COALESCE(
+                          NULLIF(trim(e.model), ''),
+                          (SELECT r.model FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = f.id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                          (SELECT r.model FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                          (SELECT r.model FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1)
+                      ) AS model,
+                      COALESCE(
+                          NULLIF(trim(e.tool), ''),
+                          (SELECT 'sashiko:' || r.provider FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = f.id LIMIT 1),
+                          (SELECT 'sashiko:' || r.provider FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                          (SELECT 'sashiko:' || r.provider FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
+                      ) AS tool
+               FROM family f
+               JOIN bugs b ON b.id = f.id
                LEFT JOIN bug_enrichments e ON e.bug_id = f.id AND e.kind IN ('candidate', 'discovery')",
             libsql::params![serde_json::to_string(ids)?]).await?;
         #[derive(Default, Serialize)]
@@ -1583,6 +1617,41 @@ impl Database {
             .collect()
     }
 
+    pub async fn resolve_bug_model_and_tool(
+        &self,
+        bug_id: i64,
+    ) -> Result<Option<(Option<String>, Option<String>)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT
+                    COALESCE(
+                        (SELECT r.model FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                        (SELECT r.model FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                        (SELECT r.model FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1)
+                    ) AS model,
+                    COALESCE(
+                        (SELECT 'sashiko:' || r.provider FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.id LIMIT 1),
+                        (SELECT 'sashiko:' || r.provider FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                        (SELECT 'sashiko:' || r.provider FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
+                    ) AS tool
+                 FROM bugs b WHERE b.id = ?",
+                libsql::params![bug_id],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let model: Option<String> = row.get(0).ok().flatten();
+            let tool: Option<String> = row.get(1).ok().flatten();
+            if model.is_none() && tool.is_none() {
+                Ok(None)
+            } else {
+                Ok(Some((model, tool)))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn bug_evidence(&self, id: i64) -> Result<serde_json::Value> {
         let family = self.bug_family(id, false).await?;
         let mut discoveries = Vec::new();
@@ -1603,19 +1672,34 @@ impl Database {
                 candidates.into_iter().map(Some).collect()
             };
             for record in records {
-                let model = record
+                let mut model = record
                     .and_then(|e| e.model.as_deref())
-                    .filter(|s| !s.trim().is_empty());
-                let tool = record
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string());
+                let mut tool = record
                     .map(|e| e.tool.as_str())
-                    .filter(|s| !s.trim().is_empty());
-                if let Some(m) = model {
-                    models.insert(m.to_owned());
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| s.to_string());
+
+                if (model.is_none() || tool.is_none())
+                    && let Ok(Some((fallback_model, fallback_tool))) =
+                        self.resolve_bug_model_and_tool(bug.id).await
+                {
+                    if model.is_none() {
+                        model = fallback_model;
+                    }
+                    if tool.is_none() {
+                        tool = fallback_tool;
+                    }
+                }
+
+                if let Some(ref m) = model {
+                    models.insert(m.clone());
                 } else {
                     unknown_models += 1;
                 }
-                if let Some(t) = tool {
-                    tools.insert(t.to_owned());
+                if let Some(ref t) = tool {
+                    tools.insert(t.clone());
                 }
                 discoveries.push(json!({
                     "bug_id": bug.id, "bugid": bug.bugid,
@@ -5998,6 +6082,73 @@ mod tests {
         assert_eq!(evidence["count"], 1);
         assert_eq!(evidence["unknown_models"], 1);
         assert_eq!(evidence["models"], json!([]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_model_resolution_from_review_and_migration_backfill() -> Result<()> {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("t1", "subj", 100).await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "m1", "subj", "auth", 100, 1, 0, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await?
+            .unwrap();
+        let rev_id = db
+            .create_review(ps_id, None, "gemini", "test-model", None, None)
+            .await?;
+
+        let bug = NewBug {
+            bugid: "linux-model-test".to_string(),
+            title: "Model test bug".to_string(),
+            status: "open".to_string(),
+            reporter: "sashiko".to_string(),
+            reported_at: 1000,
+            discovered_in_patchset_id: Some(ps_id),
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec!["net".to_string()],
+        };
+        let bug_id = db
+            .create_bug_with_enrichment(
+                &bug,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "sashiko:reviewer".to_string(),
+                    model: None,
+                    created_at: 1000,
+                    content: Some("test".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.link_review_to_bug(rev_id, bug_id, true).await?;
+
+        // 1. bug_discovery_summaries and bug_evidence resolve model from linked review
+        let summaries = db.bug_discovery_summaries(&[bug_id]).await?;
+        let summary = &summaries[&bug_id];
+        assert_eq!(summary["count"], 1);
+        assert_eq!(summary["models"], json!(["test-model"]));
+        assert_eq!(summary["tools"], json!(["sashiko:reviewer"]));
+        assert_eq!(summary["unknown_models"], 0);
+
+        let evidence = db.bug_evidence(bug_id).await?;
+        assert_eq!(evidence["count"], 1);
+        assert_eq!(evidence["models"], json!(["test-model"]));
+        assert_eq!(evidence["unknown_models"], 0);
+
+        // 2. Migration 004 backfills the database rows directly
+        db.conn.execute("PRAGMA user_version = 3", ()).await?;
+        db.migrate().await?;
+
+        let enrichments = db.get_bug_enrichments(bug_id).await?;
+        assert_eq!(enrichments[0].model.as_deref(), Some("test-model"));
+
         Ok(())
     }
 

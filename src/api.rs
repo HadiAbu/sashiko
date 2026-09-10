@@ -1209,7 +1209,10 @@ async fn analyze_bug(
         .tool
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "api".into());
-    let source_model = payload.model.filter(|s| !s.trim().is_empty());
+    let source_model = payload
+        .model
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| Some(provider.get_capabilities().model_name));
     let mut payload = payload.input;
     if payload.subsystems.is_empty() && !payload.source_files.is_empty() {
         if let Some(mindex) = crate::maintainers::get_global_maintainers() {

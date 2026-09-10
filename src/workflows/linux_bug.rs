@@ -1080,14 +1080,16 @@ pub async fn process_issue(
         input.problem, input.subsystems
     );
     let reviewer_db;
-    let db = if db.has_bug_actor() {
+    let db = if db.has_bug_actor() && db.bug_model().is_some() {
         db
     } else {
-        reviewer_db = db.with_bug_actor(
-            "sashiko",
-            "sashiko:reviewer",
-            Some(provider.get_capabilities().model_name),
-        );
+        let (actor, tool) = if db.has_bug_actor() {
+            (db.bug_actor().to_string(), db.bug_tool().to_string())
+        } else {
+            ("sashiko".to_string(), "sashiko:reviewer".to_string())
+        };
+        reviewer_db =
+            db.with_bug_actor(&actor, &tool, Some(provider.get_capabilities().model_name));
         &reviewer_db
     };
     let bugid = generate_bugid();
