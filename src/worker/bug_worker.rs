@@ -35,6 +35,11 @@ impl BugWorker {
                     let repo_path = self.repo_path.clone();
 
                     tokio::spawn(async move {
+                        let db = db.with_bug_actor(
+                            "sashiko",
+                            "sashiko:bug-worker",
+                            Some(provider.get_capabilities().model_name),
+                        );
                         info!("Processing raw bug ID {} ({})", bug.id, bug.bugid);
 
                         let input = if let Some(raw) = bug.raw_input() {

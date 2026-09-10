@@ -22,6 +22,9 @@ use tracing::info;
 
 pub struct Database {
     pub conn: libsql::Connection,
+    bug_actor: String,
+    bug_tool: String,
+    bug_model: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -610,6 +613,20 @@ pub struct PatchworkOutboxRow {
 }
 
 impl Database {
+    pub fn has_bug_actor(&self) -> bool {
+        self.bug_actor != "system" || self.bug_tool != "sashiko"
+    }
+
+    /// Attribution is scoped to this handle, never shared mutable connection state.
+    pub fn with_bug_actor(&self, author: &str, tool: &str, model: Option<String>) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            bug_actor: author.into(),
+            bug_tool: tool.into(),
+            bug_model: model,
+        }
+    }
+
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
         let mut rows = self
             .conn
@@ -881,7 +898,12 @@ impl Database {
             .next()
             .await;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            bug_actor: "system".into(),
+            bug_tool: "sashiko".into(),
+            bug_model: None,
+        })
     }
 
     pub async fn migrate(&self) -> Result<()> {
@@ -908,7 +930,14 @@ impl Database {
             self.conn.execute("PRAGMA user_version = 2", ()).await?;
         }
 
-        info!("Database schema is up to date at version 2.");
+        if current_version < 3 {
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/003_bug_provenance.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 3", ()).await?;
+            tx.commit().await?;
+        }
+        info!("Database schema is up to date at version 3.");
         Ok(())
     }
 
@@ -1189,6 +1218,32 @@ impl Database {
     }
 
     pub async fn create_bug(&self, bug: &NewBug) -> Result<i64> {
+        self.create_bug_with_enrichment(bug, None).await
+    }
+
+    /// Queue the candidate and its original evidence atomically so a worker cannot
+    /// pick up a raw bug before its discovery record has been saved.
+    pub async fn create_bug_with_enrichment(
+        &self,
+        bug: &NewBug,
+        enrichment: Option<&NewBugEnrichment>,
+    ) -> Result<i64> {
+        let tx = self.conn.transaction().await?;
+        let scoped = Self {
+            conn: (*tx).clone(),
+            bug_actor: self.bug_actor.clone(),
+            bug_tool: self.bug_tool.clone(),
+            bug_model: self.bug_model.clone(),
+        };
+        let id = scoped.insert_bug(bug).await?;
+        if let Some(enrichment) = enrichment {
+            scoped.add_bug_enrichment(id, enrichment).await?;
+        }
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn insert_bug(&self, bug: &NewBug) -> Result<i64> {
         let now = if bug.reported_at > 0 {
             bug.reported_at
         } else {
@@ -1201,8 +1256,8 @@ impl Database {
                     bugid, title, status, reporter, reported_at,
                     discovered_in_patchset_id, discovered_in_patch_id,
                     discovered_in_commit, source_ref, vector_json, duplicate_of_id,
-                    created_at, updated_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, audit_author, audit_tool, audit_model
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  RETURNING id",
                 libsql::params![
                     bug.bugid.as_str(),
@@ -1218,6 +1273,9 @@ impl Database {
                     bug.duplicate_of_id,
                     now,
                     now,
+                    self.bug_actor.as_str(),
+                    self.bug_tool.as_str(),
+                    self.bug_model.clone(),
                 ],
             )
             .await?;
@@ -1227,13 +1285,13 @@ impl Database {
             for sub in &bug.subsystems {
                 let trimmed = sub.trim();
                 if !trimmed.is_empty() {
-                    let _ = self
+                    self
                         .conn
                         .execute(
                             "INSERT OR IGNORE INTO bugs_subsystems (bug_id, subsystem) VALUES (?, ?)",
                             libsql::params![id, trimmed],
                         )
-                        .await;
+                        .await?;
                 }
             }
             Ok(id)
@@ -1278,9 +1336,16 @@ impl Database {
                 libsql::params![
                     bug_id,
                     enrichment.kind.as_str(),
-                    enrichment.tool.as_str(),
-                    enrichment.model.clone(),
-                    enrichment.author.clone(),
+                    if enrichment.tool.is_empty() {
+                        self.bug_tool.as_str()
+                    } else {
+                        enrichment.tool.as_str()
+                    },
+                    enrichment.model.clone().or_else(|| self.bug_model.clone()),
+                    enrichment
+                        .author
+                        .clone()
+                        .or_else(|| Some(self.bug_actor.clone())),
                     now,
                     compressed_content,
                     data_json_str,
@@ -1294,13 +1359,6 @@ impl Database {
 
         if let Some(row) = rows.next().await? {
             let eid: i64 = row.get(0)?;
-            let _ = self
-                .conn
-                .execute(
-                    "UPDATE bugs SET updated_at = ? WHERE id = ?",
-                    libsql::params![now, bug_id],
-                )
-                .await;
             Ok(eid)
         } else {
             bail!("Failed to insert bug enrichment: no id returned");
@@ -1392,7 +1450,7 @@ impl Database {
                 .get_subsystems_for_bug(bug.id)
                 .await
                 .unwrap_or_default();
-            bug.enrichments = self.get_bug_enrichments(bug.id).await.unwrap_or_default();
+            bug.enrichments = self.get_bug_enrichments(bug.id).await?;
             Ok(Some(bug))
         } else {
             Ok(None)
@@ -1418,7 +1476,7 @@ impl Database {
                 .get_subsystems_for_bug(bug.id)
                 .await
                 .unwrap_or_default();
-            bug.enrichments = self.get_bug_enrichments(bug.id).await.unwrap_or_default();
+            bug.enrichments = self.get_bug_enrichments(bug.id).await?;
             Ok(Some(bug))
         } else {
             Ok(None)
@@ -1442,6 +1500,216 @@ impl Database {
             subs.push(row.get(0)?);
         }
         Ok(subs)
+    }
+
+    /// Each candidate is a discovery; analysis stages never increase this count.
+    /// UNION makes historical malformed duplicate graphs terminate safely.
+    pub async fn bug_family(&self, id: i64, raw: bool) -> Result<Vec<Bug>> {
+        let mut rows = self
+            .conn
+            .query(
+                "WITH RECURSIVE ancestors(id, parent) AS (
+                SELECT id, duplicate_of_id FROM bugs WHERE id = ?
+                UNION SELECT b.id, b.duplicate_of_id FROM bugs b JOIN ancestors a ON b.id = a.parent
+             ), family(id) AS (
+                SELECT id FROM ancestors
+                UNION SELECT b.id FROM bugs b JOIN family f ON b.duplicate_of_id = f.id
+             ) SELECT id FROM family ORDER BY id",
+                libsql::params![id],
+            )
+            .await?;
+        let mut family = Vec::new();
+        while let Some(row) = rows.next().await? {
+            if let Some(mut bug) = self.get_bug(row.get(0)?).await? {
+                if raw {
+                    let mut records = self.conn.query("SELECT id, bug_id, kind, tool, model, author, created_at, content, data_json, tokens_in, tokens_out, tokens_cached, logs FROM bug_enrichments WHERE bug_id = ? ORDER BY created_at, id", libsql::params![bug.id]).await?;
+                    bug.enrichments.clear();
+                    while let Some(record) = records.next().await? {
+                        bug.enrichments
+                            .push(Self::parse_bug_enrichment_row(&record)?);
+                    }
+                }
+                family.push(bug);
+            }
+        }
+        Ok(family)
+    }
+
+    /// Fetch list-page evidence in one query without loading reports or payloads.
+    pub async fn bug_discovery_summaries(
+        &self,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, serde_json::Value>> {
+        let mut rows = self.conn.query(
+            "WITH RECURSIVE ancestors(root, id, parent) AS (
+                SELECT b.id, b.id, b.duplicate_of_id FROM bugs b JOIN json_each(?) requested ON b.id = requested.value
+                UNION SELECT a.root, b.id, b.duplicate_of_id FROM bugs b JOIN ancestors a ON b.id = a.parent
+             ), family(root, id) AS (
+                SELECT root, id FROM ancestors
+                UNION SELECT f.root, b.id FROM bugs b JOIN family f ON b.duplicate_of_id = f.id
+             ) SELECT f.root, e.model, e.tool FROM family f
+               LEFT JOIN bug_enrichments e ON e.bug_id = f.id AND e.kind IN ('candidate', 'discovery')",
+            libsql::params![serde_json::to_string(ids)?]).await?;
+        #[derive(Default, Serialize)]
+        struct Summary {
+            count: usize,
+            models: std::collections::BTreeSet<String>,
+            tools: std::collections::BTreeSet<String>,
+            unknown_models: usize,
+        }
+        let mut summaries: std::collections::HashMap<i64, Summary> =
+            std::collections::HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let summary = summaries.entry(row.get(0)?).or_default();
+            summary.count += 1;
+            if let Some(model) = row
+                .get::<Option<String>>(1)?
+                .filter(|s| !s.trim().is_empty())
+            {
+                summary.models.insert(model);
+            } else {
+                summary.unknown_models += 1;
+            }
+            if let Some(tool) = row
+                .get::<Option<String>>(2)?
+                .filter(|s| !s.trim().is_empty())
+            {
+                summary.tools.insert(tool);
+            }
+        }
+        summaries
+            .into_iter()
+            .map(|(id, summary)| Ok((id, serde_json::to_value(summary)?)))
+            .collect()
+    }
+
+    pub async fn bug_evidence(&self, id: i64) -> Result<serde_json::Value> {
+        let family = self.bug_family(id, false).await?;
+        let mut discoveries = Vec::new();
+        let mut activity = Vec::new();
+        let mut models = std::collections::BTreeSet::new();
+        let mut tools = std::collections::BTreeSet::new();
+        let mut unknown_models = 0;
+        for bug in &family {
+            let candidates: Vec<_> = bug
+                .enrichments
+                .iter()
+                .filter(|e| e.kind == "candidate" || e.kind == "discovery")
+                .collect();
+            // A legacy report without a candidate still represents one discovery.
+            let records: Vec<Option<&BugEnrichment>> = if candidates.is_empty() {
+                vec![None]
+            } else {
+                candidates.into_iter().map(Some).collect()
+            };
+            for record in records {
+                let model = record
+                    .and_then(|e| e.model.as_deref())
+                    .filter(|s| !s.trim().is_empty());
+                let tool = record
+                    .map(|e| e.tool.as_str())
+                    .filter(|s| !s.trim().is_empty());
+                if let Some(m) = model {
+                    models.insert(m.to_owned());
+                } else {
+                    unknown_models += 1;
+                }
+                if let Some(t) = tool {
+                    tools.insert(t.to_owned());
+                }
+                discoveries.push(json!({
+                    "bug_id": bug.id, "bugid": bug.bugid,
+                    "enrichment_id": record.map(|e| e.id),
+                    "author": record.and_then(|e| e.author.as_deref()).unwrap_or(&bug.reporter),
+                    "tool": tool, "model": model,
+                    "created_at": record.map(|e| e.created_at).unwrap_or(bug.reported_at),
+                    "patchset_id": bug.discovered_in_patchset_id,
+                    "commit": bug.discovered_in_commit,
+                    "legacy": record.is_none()
+                }));
+            }
+            for enrichment in &bug.enrichments {
+                let mut event = serde_json::to_value(enrichment)?;
+                event["bugid"] = json!(bug.bugid);
+                // Payloads and token accounting are only exposed by the raw endpoint.
+                // BugEnrichment serializes as a JSON object.
+                let obj = event
+                    .as_object_mut()
+                    .expect("serialized enrichment is an object");
+                for key in [
+                    "data_json",
+                    "logs",
+                    "tokens_in",
+                    "tokens_out",
+                    "tokens_cached",
+                ] {
+                    obj.remove(key);
+                }
+                if enrichment.kind == "audit"
+                    && let Some(data) = &enrichment.data_json
+                {
+                    match data["field"].as_str() {
+                        Some("duplicate_of_id") => {
+                            event["content"] = json!("Duplicate relationship updated")
+                        }
+                        Some("status") => {
+                            event["content"] = json!(format!(
+                                "Status changed from {} to {}",
+                                data["old"].as_str().unwrap_or("unknown"),
+                                data["new"].as_str().unwrap_or("unknown")
+                            ))
+                        }
+                        Some("title") => {
+                            event["content"] = json!(format!(
+                                "Title changed to {}",
+                                data["new"].as_str().unwrap_or("untitled")
+                            ))
+                        }
+                        _ => {}
+                    }
+                }
+                // Old deduplication content could itself be a JSON payload.
+                if enrichment.kind == "deduplication"
+                    && let Some(content) = &enrichment.content
+                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+                {
+                    event["content"] = value
+                        .get("reasoning")
+                        .cloned()
+                        .unwrap_or(json!("Matched an existing bug"));
+                }
+                activity.push(event);
+            }
+        }
+        activity.sort_by_key(|e| {
+            (
+                e["created_at"].as_i64().unwrap_or(0),
+                e["id"].as_i64().unwrap_or(0),
+            )
+        });
+        activity.reverse();
+        Ok(
+            json!({ "count": discoveries.len(), "models": models, "tools": tools,
+            "unknown_models": unknown_models, "discoveries": discoveries, "activity": activity }),
+        )
+    }
+
+    pub async fn change_bug_status_with_reason(
+        &self,
+        id: i64,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let tx = self.conn.transaction().await?;
+        let now = chrono::Utc::now().timestamp();
+        tx.execute("UPDATE bugs SET status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+            libsql::params![status, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id]).await?;
+        if let Some(reason) = reason.filter(|s| !s.trim().is_empty()) {
+            tx.execute("INSERT INTO bug_enrichments (bug_id, kind, tool, author, model, created_at, content) VALUES (?, 'comment', ?, ?, ?, ?, ?)",
+                libsql::params![id, self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(), now, reason]).await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn get_bug_logs(&self, id: i64) -> Result<Option<String>> {
@@ -1505,7 +1773,7 @@ impl Database {
             let now = chrono::Utc::now().timestamp();
             self.conn
                 .execute(
-                    "UPDATE bugs SET status = 'processing', updated_at = ? WHERE id = ?",
+                    "UPDATE bugs SET status = 'processing', updated_at = ?, audit_author = 'system', audit_tool = 'sashiko:bug-worker', audit_model = NULL WHERE id = ?",
                     libsql::params![now, id],
                 )
                 .await?;
@@ -1521,7 +1789,7 @@ impl Database {
         let count = self
             .conn
             .execute(
-                "UPDATE bugs SET status = 'raw' WHERE status = 'processing'",
+                "UPDATE bugs SET status = 'raw', audit_author = 'system', audit_tool = 'sashiko:bug-worker', audit_model = NULL WHERE status = 'processing'",
                 (),
             )
             .await?;
@@ -1538,8 +1806,8 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         self.conn
             .execute(
-                "UPDATE bugs SET status = ?, updated_at = ? WHERE id = ?",
-                libsql::params![status, now, id],
+                "UPDATE bugs SET status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+                libsql::params![status, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
             )
             .await?;
         Ok(())
@@ -1549,8 +1817,8 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         self.conn
             .execute(
-                "UPDATE bugs SET title = ?, updated_at = ? WHERE id = ?",
-                libsql::params![title, now, id],
+                "UPDATE bugs SET title = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+                libsql::params![title, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
             )
             .await?;
         Ok(())
@@ -1560,33 +1828,45 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         self.conn
             .execute(
-                "UPDATE bugs SET vector_json = ?, updated_at = ? WHERE id = ?",
-                libsql::params![vector_json, now, id],
+                "UPDATE bugs SET vector_json = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+                libsql::params![vector_json, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
             )
             .await?;
         Ok(())
     }
 
     pub async fn update_bug_subsystems(&self, id: i64, subsystems: &[String]) -> Result<()> {
-        let _ = self
-            .conn
-            .execute(
-                "DELETE FROM bugs_subsystems WHERE bug_id = ?",
+        let tx = self.conn.transaction().await?;
+        tx.execute("UPDATE bugs SET audit_author = ?, audit_tool = ?, audit_model = ?, updated_at = ? WHERE id = ?", libsql::params![self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), chrono::Utc::now().timestamp(), id]).await?;
+        let mut rows = tx
+            .query(
+                "SELECT subsystem FROM bugs_subsystems WHERE bug_id = ?",
                 libsql::params![id],
             )
-            .await;
-        for sub in subsystems {
-            let trimmed = sub.trim();
-            if !trimmed.is_empty() {
-                let _ = self
-                    .conn
-                    .execute(
-                        "INSERT OR IGNORE INTO bugs_subsystems (bug_id, subsystem) VALUES (?, ?)",
-                        libsql::params![id, trimmed],
-                    )
-                    .await;
+            .await?;
+        let wanted: std::collections::BTreeSet<_> = subsystems
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        while let Some(row) = rows.next().await? {
+            let sub: String = row.get(0)?;
+            if !wanted.contains(sub.as_str()) {
+                tx.execute(
+                    "DELETE FROM bugs_subsystems WHERE bug_id = ? AND subsystem = ?",
+                    libsql::params![id, sub],
+                )
+                .await?;
             }
         }
+        for sub in wanted {
+            tx.execute(
+                "INSERT OR IGNORE INTO bugs_subsystems (bug_id, subsystem) VALUES (?, ?)",
+                libsql::params![id, sub],
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1597,13 +1877,13 @@ impl Database {
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         if let Some(title) = params.problem {
-            let _ = self.update_bug_title(id, title).await;
+            self.update_bug_title(id, title).await?;
         }
         if let Some(subsystems) = params.subsystems {
-            let _ = self.update_bug_subsystems(id, subsystems).await;
+            self.update_bug_subsystems(id, subsystems).await?;
         }
         if let Some(vector) = params.vector_json {
-            let _ = self.update_bug_vector(id, vector).await;
+            self.update_bug_vector(id, vector).await?;
         }
         self.update_bug_status(id, params.status).await?;
 
@@ -1621,79 +1901,80 @@ impl Database {
                 "locations": params.locations,
                 "source_files": params.source_files,
             });
-            let _ = self
-                .add_bug_enrichment(
-                    id,
-                    &NewBugEnrichment {
-                        kind: "verification".to_string(),
-                        tool: "sashiko".to_string(),
-                        created_at: now,
-                        content: params.severity_explanation.map(|s| s.to_string()),
-                        data_json: Some(data),
-                        ..Default::default()
-                    },
-                )
-                .await;
+            self.add_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "verification".to_string(),
+                    tool: self.bug_tool.clone(),
+                    created_at: now,
+                    content: params.severity_explanation.map(|s| s.to_string()),
+                    data_json: Some(data),
+                    ..Default::default()
+                },
+            )
+            .await?;
         }
 
         if let Some(intro) = params.introduced_in_commit {
-            let _ = self
-                .add_bug_enrichment(
-                    id,
-                    &NewBugEnrichment {
-                        kind: "origin_discovery".to_string(),
-                        tool: "sashiko".to_string(),
-                        created_at: now,
-                        content: Some(intro.to_string()),
-                        data_json: Some(serde_json::json!({
-                            "introducing_commit_sha": intro,
-                        })),
-                        ..Default::default()
-                    },
-                )
-                .await;
+            self.add_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "origin_discovery".to_string(),
+                    tool: self.bug_tool.clone(),
+                    created_at: now,
+                    content: Some(intro.to_string()),
+                    data_json: Some(serde_json::json!({
+                        "introducing_commit_sha": intro,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await?;
         }
 
         if params.severity != Severity::Unknown {
-            let _ = self
-                .add_bug_enrichment(
-                    id,
-                    &NewBugEnrichment {
-                        kind: "severity_calibration".to_string(),
-                        tool: "sashiko".to_string(),
-                        created_at: now,
-                        content: params.severity_explanation.map(|s| s.to_string()),
-                        data_json: Some(serde_json::json!({
-                            "severity": params.severity.as_str(),
-                            "severity_int": params.severity as i32,
-                            "subsystems": params.subsystems,
-                        })),
-                        ..Default::default()
-                    },
-                )
-                .await;
+            self.add_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "severity_calibration".to_string(),
+                    tool: self.bug_tool.clone(),
+                    created_at: now,
+                    content: params.severity_explanation.map(|s| s.to_string()),
+                    data_json: Some(serde_json::json!({
+                        "severity": params.severity.as_str(),
+                        "severity_int": params.severity as i32,
+                        "subsystems": params.subsystems,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await?;
         }
 
-        if !params.inline_review.is_empty() {
-            let _ = self
-                .add_bug_enrichment(
-                    id,
-                    &NewBugEnrichment {
-                        kind: "report".to_string(),
-                        tool: "sashiko".to_string(),
-                        created_at: now,
-                        content: Some(params.inline_review.to_string()),
-                        data_json: Some(serde_json::json!({
-                            "format": "lkml_markdown",
-                        })),
-                        tokens_in: params.tokens_in,
-                        tokens_out: params.tokens_out,
-                        tokens_cached: params.tokens_cached,
-                        logs: params.logs.map(|s| s.to_string()),
-                        ..Default::default()
-                    },
-                )
-                .await;
+        if !params.inline_review.is_empty() || params.logs.is_some() {
+            self.add_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: if params.inline_review.is_empty() {
+                        "analysis"
+                    } else {
+                        "report"
+                    }
+                    .to_string(),
+                    tool: self.bug_tool.clone(),
+                    created_at: now,
+                    content: Some(params.inline_review.to_string()),
+                    data_json: Some(serde_json::json!({
+                        "format": "lkml_markdown",
+                    })),
+                    tokens_in: params.tokens_in,
+                    tokens_out: params.tokens_out,
+                    tokens_cached: params.tokens_cached,
+                    logs: params.logs.map(|s| s.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
         }
 
         Ok(())
@@ -1961,9 +2242,28 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         let tx = self.conn.transaction().await?;
 
+        let mut target = tx
+            .query(
+                "SELECT id FROM bugs WHERE id = ? AND duplicate_of_id IS NULL",
+                libsql::params![params.canonical_id],
+            )
+            .await?;
+        if params.ephemeral_id == params.canonical_id || target.next().await?.is_none() {
+            bail!("Choose an existing canonical bug, distinct from this bug");
+        }
+        let mut source = tx
+            .query(
+                "SELECT id FROM bugs WHERE id = ?",
+                libsql::params![params.ephemeral_id],
+            )
+            .await?;
+        if source.next().await?.is_none() {
+            bail!("Bug not found");
+        }
+
         tx.execute(
-            "UPDATE bugs SET status = 'duplicate', duplicate_of_id = ?, updated_at = ? WHERE id = ?",
-            libsql::params![params.canonical_id, now, params.ephemeral_id],
+            "UPDATE bugs SET status = 'duplicate', duplicate_of_id = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+            libsql::params![params.canonical_id, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), params.ephemeral_id],
         )
         .await?;
 
@@ -1974,10 +2274,11 @@ impl Database {
 
         tx.execute(
             "INSERT INTO bug_enrichments (
-                bug_id, kind, tool, created_at, content, tokens_in, tokens_out, tokens_cached, logs
-             ) VALUES (?, 'deduplication', 'sashiko', ?, ?, ?, ?, ?, ?)",
+                bug_id, kind, tool, author, model, created_at, content, tokens_in, tokens_out, tokens_cached, logs
+             ) VALUES (?, 'deduplication', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             libsql::params![
                 params.ephemeral_id,
+                self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(),
                 now,
                 params.reasoning,
                 params.tokens_in.map(|t| t as i64),
@@ -2179,7 +2480,7 @@ impl Database {
             .get_subsystems_for_bug(bug.id)
             .await
             .unwrap_or_default();
-        bug.enrichments = self.get_bug_enrichments(bug.id).await.unwrap_or_default();
+        bug.enrichments = self.get_bug_enrichments(bug.id).await?;
         Ok(bug)
     }
 
@@ -5488,6 +5789,219 @@ impl Database {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn test_bug_provenance_migration_preserves_legacy_records() -> Result<()> {
+        let db = Database::new(&DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.conn
+            .execute_batch(include_str!("migrations/001_initial.sql"))
+            .await?;
+        db.conn
+            .execute_batch(include_str!("migrations/002_add_bugs.sql"))
+            .await?;
+        db.conn.execute_batch(r#"PRAGMA user_version = 2;
+            INSERT INTO bugs (id, bugid, title, status, reporter, reported_at, created_at, updated_at) VALUES (1, 'legacy', 'Old report', 'open', 'legacy reporter', 1, 1, 1);
+            INSERT INTO bug_enrichments (bug_id, kind, tool, created_at, data_json, logs) VALUES (1, 'candidate', 'legacy-tool', 1, '{"original":true}', 'original log');"#).await?;
+        db.migrate().await?;
+        db.migrate().await?;
+        let raw = db.bug_family(1, true).await?;
+        assert_eq!(raw[0].enrichments.len(), 1);
+        assert_eq!(raw[0].enrichments[0].logs.as_deref(), Some("original log"));
+        assert!(raw[0].enrichments[0].author.is_none());
+        let summary = db.bug_evidence(1).await?;
+        assert_eq!(summary["count"], 1);
+        assert_eq!(summary["unknown_models"], 1);
+        assert_eq!(summary["tools"], json!(["legacy-tool"]));
+        let scoped = db.with_bug_actor("new author", "web", None);
+        scoped
+            .change_bug_status_with_reason(1, "closed", Some("Now fixed"))
+            .await?;
+        let bug = db.get_bug(1).await?.unwrap();
+        assert!(
+            bug.enrichments
+                .iter()
+                .any(|e| e.kind == "audit" && e.author.as_deref() == Some("new author"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_discovery_family_and_attributed_audit() -> Result<()> {
+        let db = setup_db().await;
+        let mut ids = Vec::new();
+        for (slug, tool, model) in [
+            ("canonical", "reviewer-a", "model-a"),
+            ("rediscovered", "reviewer-b", "model-b"),
+            ("again", "reviewer-a", "model-a"),
+        ] {
+            let scoped = db.with_bug_actor("automation", tool, Some(model.into()));
+            let id = scoped
+                .create_bug(&serde_json::from_value(
+                    json!({ "bugid": slug, "title": "net: missing check" }),
+                )?)
+                .await?;
+            scoped
+                .add_bug_enrichment(
+                    id,
+                    &NewBugEnrichment {
+                        kind: "candidate".into(),
+                        data_json: Some(json!({"raw": "original payload"})),
+                        logs: Some("unstructured original log".into()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            ids.push(id);
+        }
+        let worker = db.with_bug_actor("automation", "bug-worker", Some("analysis-model".into()));
+        worker
+            .update_bug_outcome(
+                ids[0],
+                UpdateBugOutcomeParams {
+                    status: "dismissed",
+                    verified_on_sha: Some("abcdef"),
+                    logs: Some("[{\"role\":\"model\",\"parts\":[{\"text\":\"refuted\"}]}]"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(db.get_bug_logs(ids[0]).await?.unwrap().contains("refuted"));
+        // Multiple enrichment stages must not inflate the number of discoveries.
+        assert_eq!(db.bug_evidence(ids[0]).await?["count"], 1);
+        let human = db.with_bug_actor("maintainer@example.org", "web", None);
+        human
+            .change_bug_status_with_reason(ids[0], "closed", Some("Confirmed fixed upstream"))
+            .await?;
+        // Merge a child into another discovery, then merge that parent.
+        human
+            .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                ephemeral_id: ids[2],
+                canonical_id: ids[1],
+                reasoning: "Same cause",
+                ..Default::default()
+            })
+            .await?;
+        human
+            .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                ephemeral_id: ids[1],
+                canonical_id: ids[0],
+                reasoning: "Same cause",
+                ..Default::default()
+            })
+            .await?;
+        let evidence = db.bug_evidence(ids[1]).await?;
+        assert_eq!(evidence["count"], 3);
+        assert_eq!(evidence["models"], json!(["model-a", "model-b"]));
+        assert_eq!(evidence["tools"], json!(["reviewer-a", "reviewer-b"]));
+        let summaries = db.bug_discovery_summaries(&ids).await?;
+        for id in &ids {
+            assert_eq!(summaries[id]["count"], evidence["count"]);
+            assert_eq!(summaries[id]["models"], evidence["models"]);
+            assert_eq!(summaries[id]["tools"], evidence["tools"]);
+        }
+        let events = evidence["activity"].as_array().unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|e| e.get("data_json").is_none() && e.get("logs").is_none())
+        );
+        let comment = events
+            .iter()
+            .find(|e| e["content"] == "Confirmed fixed upstream")
+            .unwrap();
+        assert_eq!(comment["author"], "maintainer@example.org");
+        assert_eq!(comment["tool"], "web");
+        assert!(comment["model"].is_null());
+        let bug = db.get_bug(ids[0]).await?.unwrap();
+        let closed = bug
+            .enrichments
+            .iter()
+            .find(|e| {
+                e.data_json
+                    .as_ref()
+                    .is_some_and(|d| d["field"] == "status" && d["new"] == "closed")
+            })
+            .unwrap();
+        assert_eq!(closed.author.as_deref(), Some("maintainer@example.org"));
+        assert_eq!(closed.tool, "web");
+        assert_eq!(closed.model, None);
+        let raw = db.bug_family(ids[0], true).await?;
+        assert_eq!(raw.len(), 3);
+        assert!(raw.iter().all(|b| {
+            b.enrichments
+                .iter()
+                .any(|e| e.logs.as_deref() == Some("unstructured original log"))
+        }));
+        assert!(
+            human
+                .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                    ephemeral_id: ids[0],
+                    canonical_id: ids[1],
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            human
+                .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                    ephemeral_id: ids[0],
+                    canonical_id: 99999,
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(db.get_bug(ids[0]).await?.unwrap().status, "closed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_attribution_scopes_and_subsystems() -> Result<()> {
+        let db = setup_db().await;
+        let alice = db.with_bug_actor("alice", "web", None);
+        let bot = db.with_bug_actor("bot", "external-tool", Some("external-model".into()));
+        let id = alice
+            .create_bug(&serde_json::from_value(
+                json!({"bugid": "scoped", "title": "test"}),
+            )?)
+            .await?;
+        bot.update_bug_subsystems(id, &["net".into()]).await?;
+        alice.update_bug_title(id, "Changed by Alice").await?;
+        bot.update_bug_vector(id, "{}").await?;
+        let bug = db.get_bug(id).await?.unwrap();
+        let title = bug
+            .enrichments
+            .iter()
+            .find(|e| e.data_json.as_ref().is_some_and(|d| d["field"] == "title"))
+            .unwrap();
+        assert_eq!(title.author.as_deref(), Some("alice"));
+        assert_eq!(title.model, None);
+        let subsystem = bug
+            .enrichments
+            .iter()
+            .find(|e| {
+                e.data_json
+                    .as_ref()
+                    .is_some_and(|d| d["action"] == "subsystem_added")
+            })
+            .unwrap();
+        assert_eq!(subsystem.author.as_deref(), Some("bot"));
+        assert_eq!(subsystem.model.as_deref(), Some("external-model"));
+        let count = bug.enrichments.len();
+        bot.update_bug_subsystems(id, &["net".into()]).await?;
+        assert_eq!(db.get_bug(id).await?.unwrap().enrichments.len(), count);
+        // A legacy report has no invented model attribution.
+        let evidence = db.bug_evidence(id).await?;
+        assert_eq!(evidence["count"], 1);
+        assert_eq!(evidence["unknown_models"], 1);
+        assert_eq!(evidence["models"], json!([]));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_bug_audit_log_triggers() -> Result<()> {
         let db = setup_db().await;
 
@@ -5515,7 +6029,7 @@ mod tests {
         assert_eq!(bug.status, "processing");
 
         let enrichments = bug.enrichments;
-        assert_eq!(enrichments.len(), 1); // status
+        assert_eq!(enrichments.len(), 2); // creation and status
 
         assert!(enrichments.iter().any(|e| {
             e.kind == "audit"
@@ -10562,7 +11076,14 @@ mod tests {
         assert_eq!(fetched.tokens_in(), 100);
         assert_eq!(fetched.tokens_out(), 50);
         assert_eq!(fetched.tokens_cached(), 25);
-        assert_eq!(fetched.enrichments.len(), 5);
+        assert_eq!(
+            fetched
+                .enrichments
+                .iter()
+                .filter(|e| e.kind != "audit")
+                .count(),
+            5
+        );
 
         // Fetch by bugid and slug
         let fetched_bugid = db
@@ -11007,8 +11528,13 @@ mod tests {
         assert_eq!(bug.tokens_cached(), 3000 + 1000 + 1500);
 
         // Verify enrichments timeline length and chronological order
-        assert_eq!(bug.enrichments.len(), 7);
-        let kinds: Vec<&str> = bug.enrichments.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(bug.enrichments.len(), 9);
+        let enrichments: Vec<_> = bug
+            .enrichments
+            .iter()
+            .filter(|e| e.kind != "audit")
+            .collect();
+        let kinds: Vec<&str> = enrichments.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(
             kinds,
             vec![
@@ -11022,7 +11548,7 @@ mod tests {
             ]
         );
 
-        let tools: Vec<&str> = bug.enrichments.iter().map(|e| e.tool.as_str()).collect();
+        let tools: Vec<&str> = enrichments.iter().map(|e| e.tool.as_str()).collect();
         assert_eq!(
             tools,
             vec![
@@ -11030,8 +11556,7 @@ mod tests {
             ]
         );
 
-        let models: Vec<Option<&str>> =
-            bug.enrichments.iter().map(|e| e.model.as_deref()).collect();
+        let models: Vec<Option<&str>> = enrichments.iter().map(|e| e.model.as_deref()).collect();
         assert_eq!(
             models,
             vec![
@@ -11047,6 +11572,6 @@ mod tests {
 
         // Check dedicated enrichment query method
         let enrichments = db.get_bug_enrichments(bug_id).await.unwrap();
-        assert_eq!(enrichments.len(), 7);
+        assert_eq!(enrichments.len(), 9);
     }
 }

@@ -55,7 +55,7 @@ impl FromRequestParts<std::sync::Arc<crate::api::AppState>> for AuthUser {
 
     async fn from_request_parts(
         parts: &mut Parts,
-        _state: &std::sync::Arc<crate::api::AppState>,
+        state: &std::sync::Arc<crate::api::AppState>,
     ) -> Result<Self, Self::Rejection> {
         let auth_header = parts
             .headers
@@ -73,10 +73,16 @@ impl FromRequestParts<std::sync::Arc<crate::api::AppState>> for AuthUser {
             }
         };
 
-        // In a real implementation this would come from the application state / config
-        let secret = match std::env::var("JWT_SECRET") {
-            Ok(s) => s,
-            Err(_) => {
+        // Use the same configured secret as the login and authorization endpoints.
+        let secret = match state
+            .settings
+            .server
+            .jwt_secret
+            .clone()
+            .or_else(|| std::env::var("JWT_SECRET").ok())
+        {
+            Some(s) => s,
+            None => {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "JWT_SECRET is not configured on the server.",

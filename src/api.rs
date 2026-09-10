@@ -342,6 +342,7 @@ pub fn build_router(
         .route("/api/bugs/subsystems", get(list_bug_subsystems))
         .route("/api/subsystems", get(list_bug_subsystems))
         .route("/api/bug/logs", get(get_bug_logs))
+        .route("/api/bug/raw", get(get_bug_raw))
         .route("/api/bug/enrichments", get(get_bug_enrichments))
         .route("/api/bug/analyze", post(analyze_bug))
         .route("/api/bug/action", post(bug_action))
@@ -514,7 +515,7 @@ async fn submit_patch(
                 .db
                 .create_fetching_patchset(
                     &format!("{}@sashiko.local", id),
-                    &format!("Fetching {} from {}...", &sha, repo_display),
+                    &format!("Fetching {} from {}...", sha, repo_display),
                     skip_subjects.as_ref(),
                     only_subjects.as_ref(),
                     None,
@@ -1038,6 +1039,23 @@ async fn get_bug(
                     .collect();
                 val["duplicates"] = serde_json::Value::Array(dup_summaries);
             }
+            val["evidence"] = state
+                .db
+                .bug_evidence(bug.id)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            if let Some(obj) = val.as_object_mut() {
+                for key in [
+                    "raw_input",
+                    "vector_json",
+                    "enrichments",
+                    "tokens_in",
+                    "tokens_out",
+                    "tokens_cached",
+                ] {
+                    obj.remove(key);
+                }
+            }
             Ok(Json(val))
         }
         Ok(None) => Err(StatusCode::NOT_FOUND),
@@ -1046,6 +1064,29 @@ async fn get_bug(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+async fn get_bug_raw(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BugQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let bug = if let Some(id) = query.id {
+        state.db.get_bug(id).await
+    } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
+        state.db.get_bug_by_bugid(bugid).await
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let records = state
+        .db
+        .bug_family(bug.id, true)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(
+        serde_json::json!({ "bugid": bug.bugid, "records": records }),
+    ))
 }
 
 async fn get_bug_enrichments(
@@ -1098,12 +1139,20 @@ async fn get_bug_logs(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct AnalyzeBugPayload {
+    #[serde(flatten)]
+    input: crate::workflows::linux_bug::BugInput,
+    tool: Option<String>,
+    model: Option<String>,
+}
+
 async fn analyze_bug(
     auth: crate::auth::OptionalAuthUser,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<crate::workflows::linux_bug::BugInput>,
+    Json(payload): Json<AnalyzeBugPayload>,
 ) -> Result<Json<crate::workflows::linux_bug::BugOutcome>, (StatusCode, String)> {
     if state.read_only {
         return Err((
@@ -1156,7 +1205,12 @@ async fn analyze_bug(
         None
     };
 
-    let mut payload = payload;
+    let source_tool = payload
+        .tool
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "api".into());
+    let source_model = payload.model.filter(|s| !s.trim().is_empty());
+    let mut payload = payload.input;
     if payload.subsystems.is_empty() && !payload.source_files.is_empty() {
         if let Some(mindex) = crate::maintainers::get_global_maintainers() {
             payload.subsystems = mindex.match_files(&payload.source_files);
@@ -1167,10 +1221,16 @@ async fn analyze_bug(
         }
     }
 
+    let actor = auth
+        .0
+        .as_ref()
+        .map(|u| u.email.clone())
+        .unwrap_or_else(|| format!("authorized client ({})", addr.ip()));
+    let attributed_db = state.db.with_bug_actor(&actor, &source_tool, source_model);
     match crate::workflows::linux_bug::process_issue(
         provider.as_ref(),
         tools,
-        &state.db,
+        &attributed_db,
         payload,
         Some("api_analyze"),
     )
@@ -1625,32 +1685,39 @@ async fn list_bugs(
         .await
     {
         Ok((items, total)) => {
-            let serialized_items: Vec<serde_json::Value> = items
-                .iter()
-                .map(|bug| {
-                    let mut val = serde_json::to_value(bug).unwrap_or(serde_json::json!({}));
-                    val["slug"] = serde_json::Value::String(bug.bugid.clone());
-                    val["problem"] = serde_json::Value::String(bug.problem().to_string());
-                    val["severity"] = serde_json::to_value(bug.severity()).unwrap();
-                    val["severity_explanation"] =
-                        serde_json::to_value(bug.severity_explanation()).unwrap();
-                    val["description"] = serde_json::to_value(bug.description()).unwrap();
-                    val["inline_review"] = serde_json::Value::String(bug.inline_review());
-                    val["locations"] = serde_json::to_value(bug.locations()).unwrap();
-                    val["source_files"] = serde_json::to_value(bug.source_files()).unwrap();
-                    val["introduced_in_commit"] =
-                        serde_json::to_value(bug.introduced_in_commit()).unwrap();
-                    val["verified_on_sha"] = serde_json::to_value(bug.verified_on_sha()).unwrap();
-                    val["is_fixed"] = serde_json::Value::Bool(bug.is_fixed());
-                    val["fixed_in_commit"] = serde_json::to_value(bug.fixed_in_commit()).unwrap();
-                    val["raw_input"] = serde_json::to_value(bug.raw_input()).unwrap();
-                    val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
-                    val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
-                    val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
-                    val.as_object_mut().map(|obj| obj.remove("enrichments"));
-                    val
-                })
-                .collect();
+            let ids: Vec<_> = items.iter().map(|b| b.id).collect();
+            let mut summaries = state
+                .db
+                .bug_discovery_summaries(&ids)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let mut serialized_items = Vec::new();
+            for bug in &items {
+                let mut val = serde_json::to_value(bug).unwrap_or(serde_json::json!({}));
+                val["slug"] = serde_json::Value::String(bug.bugid.clone());
+                val["problem"] = serde_json::Value::String(bug.problem().to_string());
+                val["severity"] = serde_json::to_value(bug.severity()).unwrap();
+                val["severity_explanation"] =
+                    serde_json::to_value(bug.severity_explanation()).unwrap();
+                val["description"] = serde_json::to_value(bug.description()).unwrap();
+                val["inline_review"] = serde_json::Value::String(bug.inline_review());
+                val["locations"] = serde_json::to_value(bug.locations()).unwrap();
+                val["source_files"] = serde_json::to_value(bug.source_files()).unwrap();
+                val["introduced_in_commit"] =
+                    serde_json::to_value(bug.introduced_in_commit()).unwrap();
+                val["verified_on_sha"] = serde_json::to_value(bug.verified_on_sha()).unwrap();
+                val["is_fixed"] = serde_json::Value::Bool(bug.is_fixed());
+                val["fixed_in_commit"] = serde_json::to_value(bug.fixed_in_commit()).unwrap();
+                val["raw_input"] = serde_json::to_value(bug.raw_input()).unwrap();
+                val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
+                val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
+                val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
+                val.as_object_mut().map(|obj| obj.remove("enrichments"));
+                val["evidence"] = summaries.remove(&bug.id).unwrap_or_else(|| serde_json::json!({"count": 0, "models": [], "tools": [], "unknown_models": 0}));
+                val.as_object_mut().unwrap().remove("raw_input");
+                val.as_object_mut().unwrap().remove("vector_json");
+                serialized_items.push(val);
+            }
             Ok(Json(serde_json::json!({
                 "items": serialized_items,
                 "total": total,
@@ -1703,6 +1770,9 @@ async fn list_bug_subsystems(
 
 #[derive(Debug, serde::Deserialize)]
 pub struct BugActionPayload {
+    /// Client-declared provenance. Author always comes from authentication.
+    pub tool: Option<String>,
+    pub model: Option<String>,
     #[serde(flatten)]
     pub action: BugAction,
 }
@@ -1720,7 +1790,8 @@ pub enum BugAction {
         reason: Option<String>,
     },
     MarkDuplicate {
-        duplicate_of_id: i64,
+        duplicate_of_id: Option<i64>,
+        duplicate_of_bugid: Option<String>,
         reasoning: Option<String>,
     },
 }
@@ -1765,113 +1836,80 @@ async fn bug_action(
         None => return Err((StatusCode::NOT_FOUND, "Bug not found".into())),
     };
 
-    let now = chrono::Utc::now().timestamp();
-
+    let actor = auth
+        .0
+        .as_ref()
+        .map(|u| u.email.clone())
+        .unwrap_or_else(|| format!("authorized client ({})", addr.ip()));
+    let tool = payload
+        .tool
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("api");
+    let model = payload.model.filter(|s| !s.trim().is_empty());
+    let db = state.db.with_bug_actor(&actor, tool, model);
     match payload.action {
         BugAction::Comment { content } => {
-            state
-                .db
-                .add_bug_enrichment(
-                    bug.id,
-                    &crate::db::NewBugEnrichment {
-                        kind: "comment".to_string(),
-                        tool: "human".to_string(),
-                        content: Some(content),
-                        created_at: now,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            if content.trim().is_empty() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Comment content is required".into(),
+                ));
+            }
+            db.add_bug_enrichment(
+                bug.id,
+                &crate::db::NewBugEnrichment {
+                    kind: "comment".into(),
+                    content: Some(content),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         BugAction::Close { reason } => {
-            let status = "closed";
-            state
-                .db
-                .update_bug_status(bug.id, status)
+            db.change_bug_status_with_reason(bug.id, "closed", reason.as_deref())
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            if let Some(r) = reason {
-                state
-                    .db
-                    .add_bug_enrichment(
-                        bug.id,
-                        &crate::db::NewBugEnrichment {
-                            kind: "comment".to_string(),
-                            tool: "human".to_string(),
-                            content: Some(r),
-                            created_at: now,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
         }
         BugAction::Dismiss { reason } => {
-            let status = "dismissed";
-            state
-                .db
-                .update_bug_status(bug.id, status)
+            db.change_bug_status_with_reason(bug.id, "dismissed", reason.as_deref())
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            if let Some(r) = reason {
-                state
-                    .db
-                    .add_bug_enrichment(
-                        bug.id,
-                        &crate::db::NewBugEnrichment {
-                            kind: "comment".to_string(),
-                            tool: "human".to_string(),
-                            content: Some(r),
-                            created_at: now,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
         }
         BugAction::MarkDuplicate {
             duplicate_of_id,
+            duplicate_of_bugid,
             reasoning,
         } => {
-            if duplicate_of_id == bug.id {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "A bug cannot be a duplicate of itself".into(),
-                ));
+            let target = match (duplicate_of_id, duplicate_of_bugid) {
+                (Some(id), None) => db.get_bug(id).await,
+                (None, Some(bugid)) => db.get_bug_by_bugid(bugid.trim()).await,
+                _ => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "Provide one existing bug ID".into(),
+                    ));
+                }
             }
-
-            state
-                .db
-                .mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
-                    ephemeral_id: bug.id,
-                    canonical_id: duplicate_of_id,
-                    reasoning: reasoning.as_deref().unwrap_or(""),
-                    logs: None,
-                    tokens_in: None,
-                    tokens_out: None,
-                    tokens_cached: None,
-                })
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            if let Some(r) = reasoning {
-                state
-                    .db
-                    .add_bug_enrichment(
-                        bug.id,
-                        &crate::db::NewBugEnrichment {
-                            kind: "deduplication".to_string(),
-                            tool: "human".to_string(),
-                            content: Some(r),
-                            created_at: now,
-                            ..Default::default()
-                        },
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            let target = target
+                .filter(|b| b.id != bug.id && b.duplicate_of_id.is_none())
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        "Choose an existing canonical bug, distinct from this bug".into(),
                     )
-                    .await
-                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            }
+                })?;
+            let duplicate_of_id = target.id;
+            db.mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
+                ephemeral_id: bug.id,
+                canonical_id: duplicate_of_id,
+                reasoning: reasoning.as_deref().unwrap_or("Marked as duplicate"),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
     }
 
@@ -1953,11 +1991,21 @@ mod tests {
         .await
         .unwrap();
 
-        let settings = Arc::new(crate::settings::Settings::new().unwrap());
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.jwt_secret = Some("bug-test-secret-12345678901234567890".into());
+        let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (fetch_tx, _fetch_rx) = mpsc::channel(10);
 
-        let app = build_router(settings, db.clone(), event_tx, fetch_tx, true, false, true);
+        let app = build_router(
+            settings.clone(),
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            true,
+            false,
+            true,
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1979,7 +2027,10 @@ mod tests {
         assert_eq!(json["bugid"], "linux-12345678");
         assert_eq!(json["problem"], "UAF in test_device");
         assert!(json["logs"].is_null());
-        assert_eq!(json["enrichments"].as_array().unwrap().len(), 2);
+        assert!(json.get("enrichments").is_none());
+        assert!(json.get("raw_input").is_none());
+        assert_eq!(json["evidence"]["count"], 1);
+        assert_eq!(json["evidence"]["activity"].as_array().unwrap().len(), 4);
 
         // Test 1c: get_bug_enrichments
         let res_enrich = reqwest::get(format!(
@@ -1990,9 +2041,14 @@ mod tests {
         .unwrap();
         assert_eq!(res_enrich.status(), 200);
         let enrich_json: serde_json::Value = res_enrich.json().await.unwrap();
-        assert_eq!(enrich_json.as_array().unwrap().len(), 2);
-        assert_eq!(enrich_json[0]["kind"], "severity_calibration");
-        assert_eq!(enrich_json[1]["kind"], "report");
+        assert_eq!(enrich_json.as_array().unwrap().len(), 4);
+        assert!(
+            enrich_json
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["kind"] == "report")
+        );
 
         // Test 1b: get_bug by legacy slug param
         let res_slug = reqwest::get(format!("http://{}/api/bug?slug=linux-12345678", addr))
@@ -2204,9 +2260,50 @@ mod tests {
             .unwrap();
         assert_eq!(action_res.status(), 200);
 
-        // Verify comment appears in logs
-        // Note: comments are mapped differently in get_bug_logs now? Wait, get_bug_logs returns BugEvent-like logs.
-        // Actually, just validating 200 response is good enough for now.
+        let token = crate::auth::create_token(
+            "maintainer@example.org",
+            settings.server.jwt_secret.as_deref().unwrap(),
+            None,
+            3600,
+        )
+        .unwrap();
+        let close = reqwest::Client::new()
+            .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"action":"close", "reason":"Fixed upstream", "tool":"web"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(close.status(), 200);
+        let stored = db.get_bug(bug_id).await.unwrap().unwrap();
+        let comment = stored
+            .enrichments
+            .iter()
+            .find(|e| e.content.as_deref() == Some("Fixed upstream"))
+            .unwrap();
+        assert_eq!(comment.author.as_deref(), Some("maintainer@example.org"));
+        assert_eq!(comment.tool, "web");
+        assert!(comment.model.is_none());
+        let raw: serde_json::Value =
+            reqwest::get(format!("http://{}/api/bug/raw?id={}", addr, bug_id))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(raw["records"].as_array().unwrap().len(), 2);
+        assert!(
+            raw["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|b| b["enrichments"].as_array().unwrap())
+                .any(|e| e["logs"].as_str().is_some_and(|s| s.contains("test")))
+        );
+        let missing = reqwest::get(format!("http://{}/api/bug/raw?id=999999", addr))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
     }
 
     #[tokio::test]

@@ -1069,7 +1069,7 @@ pub fn generate_slug() -> String {
 
 /// Executes the standalone Linux kernel bug pipeline for a single candidate concern.
 pub async fn process_issue(
-    _provider: &dyn AiProvider,
+    provider: &dyn AiProvider,
     _tools: Option<Arc<ToolBox>>,
     db: &Database,
     input: BugInput,
@@ -1079,6 +1079,17 @@ pub async fn process_issue(
         "Queueing candidate Linux kernel issue: '{}' in subsystems '{:?}'",
         input.problem, input.subsystems
     );
+    let reviewer_db;
+    let db = if db.has_bug_actor() {
+        db
+    } else {
+        reviewer_db = db.with_bug_actor(
+            "sashiko",
+            "sashiko:reviewer",
+            Some(provider.get_capabilities().model_name),
+        );
+        &reviewer_db
+    };
     let bugid = generate_bugid();
     let now = chrono::Utc::now().timestamp();
     let new_bug = NewBug {
@@ -1095,22 +1106,21 @@ pub async fn process_issue(
         duplicate_of_id: None,
         subsystems: input.subsystems.clone(),
     };
-    let id = db.create_bug(&new_bug).await?;
-    let _ = db
-        .add_bug_enrichment(
-            id,
-            &crate::db::NewBugEnrichment {
+    let id = db
+        .create_bug_with_enrichment(
+            &new_bug,
+            Some(&crate::db::NewBugEnrichment {
                 kind: "candidate".to_string(),
-                tool: "sashiko:reviewer".to_string(),
+                tool: String::new(),
                 model: None,
                 author: None,
                 created_at: now,
                 content: Some(input.reasoning.clone()),
                 data_json: serde_json::to_value(&input).ok(),
                 ..Default::default()
-            },
+            }),
         )
-        .await;
+        .await?;
     info!("Queued raw bug {} for asynchronous processing", id);
     let bug = db.get_bug(id).await?.unwrap();
     Ok(BugOutcome::NewlyDiscovered { bug })
@@ -1566,6 +1576,30 @@ pub async fn prefetch_bug_locations(
     .unwrap_or_default()
 }
 
+// Persist each completed stage immediately. If a later stage fails, its
+// predecessors' original interactions and usage remain available for inspection.
+async fn record_bug_stage<T>(
+    db: &Database,
+    bug_id: i64,
+    stage: &str,
+    result: &crate::ai::session::SessionResult<T>,
+) -> Result<()> {
+    db.add_bug_enrichment(
+        bug_id,
+        &crate::db::NewBugEnrichment {
+            kind: format!("{}_run", stage),
+            content: Some(format!("{} completed", stage.replace('_', " "))),
+            logs: Some(serde_json::to_string(&result.history)?),
+            tokens_in: Some(result.usage.prompt_tokens),
+            tokens_out: Some(result.usage.completion_tokens),
+            tokens_cached: result.usage.cached_tokens,
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 pub async fn process_issue_worker(
     provider: &dyn AiProvider,
     tools: Option<Arc<ToolBox>>,
@@ -1579,8 +1613,13 @@ pub async fn process_issue_worker(
         input.problem, input.subsystems
     );
 
+    let attributed_db = db.with_bug_actor(
+        "sashiko",
+        "sashiko:bug-worker",
+        Some(provider.get_capabilities().model_name),
+    );
+    let db = &attributed_db;
     let mut full_history = Vec::new();
-    let mut total_usage = crate::ai::AiUsage::default();
     let runner = SessionRunner::new(provider).with_max_turns(20);
     let master_sha = get_master_sha(tools.as_ref()).await;
 
@@ -1662,8 +1701,9 @@ pub async fn process_issue_worker(
     };
 
     let norm_result = runner.run(&mut norm_session).await?;
+    record_bug_stage(db, bug_row.id, "normalization", &norm_result).await?;
     full_history.extend(norm_result.history);
-    total_usage.accumulate(&norm_result.usage);
+
     let norm = norm_result.output;
 
     // Verify affected source files against mainline tree, falling back to input locations if empty
@@ -1741,8 +1781,9 @@ pub async fn process_issue_worker(
     };
 
     let verify_result = runner.run(&mut verify_session).await?;
+    record_bug_stage(db, bug_row.id, "verification", &verify_result).await?;
     full_history.extend(verify_result.history);
-    total_usage.accumulate(&verify_result.usage);
+
     let verification = verify_result.output;
     info!(
         "Stage 2 Complete: Verification returned is_false_positive={}",
@@ -1763,11 +1804,11 @@ pub async fn process_issue_worker(
                 subsystems: Some(&official_subsystems),
                 source_files: Some(&verified_files),
                 severity_explanation: Some(&reason),
-                logs: Some(&logs),
+                logs: None,
                 verified_on_sha: Some(&master_sha),
-                tokens_in: Some(total_usage.prompt_tokens),
-                tokens_out: Some(total_usage.completion_tokens),
-                tokens_cached: total_usage.cached_tokens,
+                tokens_in: None,
+                tokens_out: None,
+                tokens_cached: None,
                 ..Default::default()
             },
         )
@@ -1824,8 +1865,9 @@ pub async fn process_issue_worker(
             };
 
             let dedup_result = runner.run(&mut dedup_session).await?;
+            record_bug_stage(db, bug_row.id, "deduplication", &dedup_result).await?;
             full_history.extend(dedup_result.history);
-            total_usage.accumulate(&dedup_result.usage);
+
             let dedup = dedup_result.output;
 
             let duplicate_match = if dedup.is_duplicate {
@@ -1842,22 +1884,14 @@ pub async fn process_issue_worker(
                     existing.id, existing.bugid
                 );
                 let logs = serde_json::to_string(&full_history).unwrap_or_default();
-                let dup_meta = serde_json::json!({
-                    "duplicate_of_bugid": existing.bugid,
-                    "duplicate_of_slug": existing.bugid,
-                    "duplicate_of_id": existing.id,
-                    "reasoning": dedup.reasoning
-                });
-                let dup_meta_str = serde_json::to_string(&dup_meta).unwrap_or_default();
-
                 db.mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
                     ephemeral_id: bug_row.id,
                     canonical_id: existing.id,
-                    reasoning: &dup_meta_str,
-                    logs: Some(&logs),
-                    tokens_in: Some(total_usage.prompt_tokens),
-                    tokens_out: Some(total_usage.completion_tokens),
-                    tokens_cached: total_usage.cached_tokens,
+                    reasoning: &dedup.reasoning,
+                    logs: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    tokens_cached: None,
                 })
                 .await?;
                 (
@@ -1893,8 +1927,9 @@ pub async fn process_issue_worker(
         context_tag: context_tag.map(|s| s.to_string()),
     };
     let tracing_result = tracing_runner.run(&mut tracing_session).await?;
+    record_bug_stage(db, bug_row.id, "origin_tracing", &tracing_result).await?;
     full_history.extend(tracing_result.history);
-    total_usage.accumulate(&tracing_result.usage);
+
     let introducing_commit_sha = match tracing_result.output.introducing_commit_sha {
         Some(sha) => Some(sha),
         None => {
@@ -1912,8 +1947,9 @@ pub async fn process_issue_worker(
         context_tag: context_tag.map(|s| s.to_string()),
     };
     let severity_result = runner.run(&mut severity_session).await?;
+    record_bug_stage(db, bug_row.id, "severity_assessment", &severity_result).await?;
     full_history.extend(severity_result.history);
-    total_usage.accumulate(&severity_result.usage);
+
     let severity_output = severity_result.output;
     let severity = Severity::from_str(&severity_output.severity);
 
@@ -1939,13 +1975,13 @@ pub async fn process_issue_worker(
         prefetched_context: effective_prefetched,
     };
     let report_result = runner.run(&mut report_session).await?;
+    record_bug_stage(db, bug_row.id, "report_generation", &report_result).await?;
     full_history.extend(report_result.history);
-    total_usage.accumulate(&report_result.usage);
+
     let inline_review = report_result.output;
 
     // Stage 7: Final Database Write
     info!("--- Stage 7: Final Database Write ---");
-    let logs_json = serde_json::to_string(&full_history).ok();
 
     db.update_bug_outcome(
         bug_row.id,
@@ -1958,15 +1994,15 @@ pub async fn process_issue_worker(
             severity,
             severity_explanation: Some(&severity_output.severity_explanation),
             inline_review: &inline_review,
-            logs: logs_json.as_deref(),
+            logs: None,
             vector_json: Some(&query_vector.to_json()),
             introduced_in_commit: introduced_in_commit.as_deref(),
             verified_on_sha: Some(&master_sha),
             is_fixed: false,
             fixed_in_commit: None,
-            tokens_in: Some(total_usage.prompt_tokens),
-            tokens_out: Some(total_usage.completion_tokens),
-            tokens_cached: total_usage.cached_tokens,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
         },
     )
     .await?;
@@ -2440,6 +2476,65 @@ mod tests {
                 context_window_size: 8192,
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_bug_completed_stage_survives_later_failure() {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let provider = QueuedMockAiProvider::new(vec![
+            json!({
+                "canonical_title": "net: missing length check",
+                "canonical_description": "An unchecked length overruns the buffer.",
+                "affected_source_files": ["net/core/dev.c"]
+            })
+            .to_string(),
+        ]);
+        // The mock has no valid response for verification, after normalization succeeds.
+        let input = BugInput {
+            problem: "Unchecked length".into(),
+            reasoning: "Length is unbounded".into(),
+            locations: None,
+            subsystems: vec!["net".into()],
+            source_files: vec!["net/core/dev.c".into()],
+            commit_sha: None,
+            patchset_id: None,
+            patch_id: None,
+            baseline_sha: None,
+        };
+        let BugOutcome::NewlyDiscovered { bug } =
+            process_issue(&provider, None, &db, input.clone(), None)
+                .await
+                .unwrap()
+        else {
+            panic!("Expected candidate");
+        };
+        assert!(
+            process_issue_worker(&provider, None, &db, &bug, input, None)
+                .await
+                .is_err()
+        );
+        let raw = db.bug_family(bug.id, true).await.unwrap();
+        let stage = raw[0]
+            .enrichments
+            .iter()
+            .find(|e| e.kind == "normalization_run")
+            .expect("Completed normalization must be retained");
+        assert_eq!(stage.model.as_deref(), Some("mock"));
+        assert_eq!(stage.author.as_deref(), Some("sashiko"));
+        assert!(
+            stage
+                .logs
+                .as_deref()
+                .unwrap()
+                .contains("missing length check")
+        );
+        assert_eq!(db.bug_evidence(bug.id).await.unwrap()["count"], 1);
     }
 
     #[tokio::test]
