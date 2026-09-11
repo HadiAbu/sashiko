@@ -195,14 +195,21 @@ pub struct BugListQuery {
     pub subsystems: Option<String>,
     pub min_severity: Option<String>,
     pub severity: Option<String>,
-    pub status: Option<String>,
+    /// Triage state. Also accepts the historical `status` spelling.
+    #[serde(alias = "status")]
+    pub lifecycle_status: Option<String>,
+    /// Analysis execution state.
+    pub pipeline_state: Option<String>,
+    /// Filters by assignee. The literal `none` selects unassigned bugs.
+    pub assignee: Option<String>,
     pub sort_by: Option<String>,
     pub sort_order: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct BugSubsystemsQuery {
-    pub status: Option<String>,
+    #[serde(alias = "status")]
+    pub lifecycle_status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1013,7 +1020,7 @@ async fn get_bug(
             val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
             val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
 
-            if bug.status == "duplicate" {
+            if bug.lifecycle_status == crate::db::BugLifecycleStatus::Duplicate {
                 let canonical = if let Some(canon_id) = bug.duplicate_of_id {
                     state.db.get_bug(canon_id).await.ok().flatten()
                 } else {
@@ -1759,6 +1766,31 @@ async fn list_bugs(
         None
     };
 
+    // Unknown filter values are rejected outright: silently returning an empty
+    // list would look identical to "no bugs match" and hide the typo.
+    let lifecycle_status = match query.lifecycle_status.as_deref().map(str::parse) {
+        Some(Ok(status)) => Some(status),
+        Some(Err(_)) => return Err(StatusCode::BAD_REQUEST),
+        None => None,
+    };
+    let pipeline_state = match query.pipeline_state.as_deref().map(str::parse) {
+        Some(Ok(state)) => Some(state),
+        Some(Err(_)) => return Err(StatusCode::BAD_REQUEST),
+        None => None,
+    };
+    let assignee = query
+        .assignee
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|who| {
+            if who.eq_ignore_ascii_case("none") {
+                crate::db::AssigneeFilter::Unassigned
+            } else {
+                crate::db::AssigneeFilter::Is(who)
+            }
+        });
+
     match state
         .db
         .list_bugs(crate::db::ListBugsParams {
@@ -1771,7 +1803,9 @@ async fn list_bugs(
                 None
             },
             subsystems: parsed_subsystems.as_deref(),
-            status: query.status.as_deref(),
+            lifecycle_status,
+            pipeline_state,
+            assignee,
             search: query.q.as_deref(),
             sort_by: query.sort_by.as_deref(),
             sort_order: query.sort_order.as_deref(),
@@ -1830,15 +1864,21 @@ async fn list_bug_subsystems(
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugSubsystemsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let status_key = query.status.clone();
-    let status_filter = query.status.unwrap_or_else(|| "open".to_string());
+    let lifecycle_status = match query.lifecycle_status.as_deref().map(str::parse) {
+        Some(Ok(status)) => status,
+        Some(Err(_)) => return Err(StatusCode::BAD_REQUEST),
+        None => crate::db::BugLifecycleStatus::Open,
+    };
+    // Key the cache on the parsed value so the alias and the canonical spelling
+    // do not each get their own entry.
+    let status_key = Some(lifecycle_status.as_str().to_string());
 
     let res = state
         .bug_subsystems_cache
         .get_or_fetch(status_key, || async {
             let db = state.db.clone();
             let counts = db
-                .get_subsystems_bug_counts(Some(&status_filter))
+                .get_subsystems_bug_counts(Some(lifecycle_status))
                 .await
                 .map_err(|e| {
                     tracing::error!("Failed to fetch bug subsystem counts: {}", e);
@@ -1968,14 +2008,22 @@ async fn bug_action(
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         BugAction::Close { reason } => {
-            db.change_bug_status_with_reason(bug.id, "closed", reason.as_deref())
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            db.change_bug_status_with_reason(
+                bug.id,
+                crate::db::BugLifecycleStatus::Closed,
+                reason.as_deref(),
+            )
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         BugAction::Dismiss { reason } => {
-            db.change_bug_status_with_reason(bug.id, "dismissed", reason.as_deref())
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            db.change_bug_status_with_reason(
+                bug.id,
+                crate::db::BugLifecycleStatus::Dismissed,
+                reason.as_deref(),
+            )
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
         BugAction::MarkDuplicate {
             duplicate_of_id,
@@ -2038,7 +2086,9 @@ mod tests {
         let make_bug = |bugid: &str, title: &str| crate::db::NewBug {
             bugid: bugid.to_string(),
             title: title.to_string(),
-            status: "raw".to_string(),
+            lifecycle_status: crate::db::BugLifecycleStatus::New,
+            pipeline_state: crate::db::BugPipelineState::Pending,
+            assignee: None,
             reporter: "sashiko".to_string(),
             reported_at: 100,
             discovered_in_patchset_id: None,
@@ -2162,7 +2212,9 @@ mod tests {
             .create_bug(&crate::db::NewBug {
                 bugid: "linux-12345678".to_string(),
                 title: "UAF in test_device".to_string(),
-                status: "raw".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::New,
+                pipeline_state: crate::db::BugPipelineState::Pending,
+                assignee: None,
                 reporter: "sashiko".to_string(),
                 reported_at: 123456,
                 discovered_in_patchset_id: None,
@@ -2327,21 +2379,45 @@ mod tests {
         let empty_list: serde_json::Value = res_other_sub.json().await.unwrap();
         assert_eq!(empty_list["total"], 0);
 
-        // Test 3c: list_bugs with status filter
-        let res_status = reqwest::get(format!("http://{}/api/bugs?status=raw", addr))
+        // Test 3c: list_bugs with lifecycle filter
+        let res_status = reqwest::get(format!("http://{}/api/bugs?lifecycle_status=new", addr))
             .await
             .unwrap();
         assert_eq!(res_status.status(), 200);
         let status_json: serde_json::Value = res_status.json().await.unwrap();
         assert_eq!(status_json["total"], 1);
 
-        // Test 3d: list_bugs with status filter mismatch
-        let res_open = reqwest::get(format!("http://{}/api/bugs?status=open", addr))
+        // Test 3d: list_bugs with lifecycle filter mismatch
+        let res_open = reqwest::get(format!("http://{}/api/bugs?lifecycle_status=open", addr))
             .await
             .unwrap();
         assert_eq!(res_open.status(), 200);
         let open_json: serde_json::Value = res_open.json().await.unwrap();
         assert_eq!(open_json["total"], 0);
+
+        // Test 3d1: the historical status spelling still selects the lifecycle
+        // axis, so bookmarked URLs keep working.
+        let res_alias = reqwest::get(format!("http://{}/api/bugs?status=new", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_alias.status(), 200);
+        let alias_json: serde_json::Value = res_alias.json().await.unwrap();
+        assert_eq!(alias_json["total"], 1);
+
+        // Test 3d2: the pipeline axis is filterable independently.
+        let res_pipeline = reqwest::get(format!("http://{}/api/bugs?pipeline_state=pending", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_pipeline.status(), 200);
+        let pipeline_json: serde_json::Value = res_pipeline.json().await.unwrap();
+        assert_eq!(pipeline_json["total"], 1);
+
+        // Test 3d3: an unknown state is rejected rather than silently matching
+        // nothing, which would look identical to an empty result set.
+        let res_bogus = reqwest::get(format!("http://{}/api/bugs?lifecycle_status=raw", addr))
+            .await
+            .unwrap();
+        assert_eq!(res_bogus.status(), 400);
 
         // Test 3e: list_bugs with sorting
         let res_sort = reqwest::get(format!(
@@ -2380,10 +2456,13 @@ mod tests {
         let multi_none_json: serde_json::Value = res_multi_none.json().await.unwrap();
         assert_eq!(multi_none_json["total"], 0);
 
-        // Test 3i: GET /api/bugs/subsystems with status=raw
-        let res_subs_api = reqwest::get(format!("http://{}/api/bugs/subsystems?status=raw", addr))
-            .await
-            .unwrap();
+        // Test 3i: GET /api/bugs/subsystems with lifecycle_status=new
+        let res_subs_api = reqwest::get(format!(
+            "http://{}/api/bugs/subsystems?lifecycle_status=new",
+            addr
+        ))
+        .await
+        .unwrap();
         assert_eq!(res_subs_api.status(), 200);
         let subs_json: serde_json::Value = res_subs_api.json().await.unwrap();
         let subs_arr = subs_json.as_array().unwrap();
@@ -2393,16 +2472,22 @@ mod tests {
         assert_eq!(subs_arr[0]["open_bugs"], 1);
 
         // Test 3j: GET /api/subsystems alias
-        let res_subs_alias = reqwest::get(format!("http://{}/api/subsystems?status=raw", addr))
-            .await
-            .unwrap();
+        let res_subs_alias = reqwest::get(format!(
+            "http://{}/api/subsystems?lifecycle_status=new",
+            addr
+        ))
+        .await
+        .unwrap();
         assert_eq!(res_subs_alias.status(), 200);
 
-        // Test 3k: GET /api/bugs/subsystems with status=open (should skip 0-bug entries)
-        let res_subs_open =
-            reqwest::get(format!("http://{}/api/bugs/subsystems?status=open", addr))
-                .await
-                .unwrap();
+        // Test 3k: GET /api/bugs/subsystems with lifecycle_status=open (should
+        // skip 0-bug entries)
+        let res_subs_open = reqwest::get(format!(
+            "http://{}/api/bugs/subsystems?lifecycle_status=open",
+            addr
+        ))
+        .await
+        .unwrap();
         assert_eq!(res_subs_open.status(), 200);
         let open_subs_json: serde_json::Value = res_subs_open.json().await.unwrap();
         assert_eq!(open_subs_json.as_array().unwrap().len(), 0);
@@ -2412,7 +2497,9 @@ mod tests {
             .create_bug(&crate::db::NewBug {
                 bugid: "linux-dup-endpoint".to_string(),
                 title: "Duplicate issue".to_string(),
-                status: "raw".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::New,
+                pipeline_state: crate::db::BugPipelineState::Pending,
+                assignee: None,
                 reporter: "sashiko".to_string(),
                 reported_at: 123457,
                 discovered_in_patchset_id: None,

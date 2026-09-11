@@ -217,6 +217,137 @@ impl Severity {
     }
 }
 
+/// Triage lifecycle of a Linux kernel bug.
+///
+/// Owned by humans, the API, and the deduplication stage. Deliberately separate
+/// from [`BugPipelineState`]: re-running analysis must never be able to discard
+/// a triage decision that a person made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BugLifecycleStatus {
+    /// Recorded but not yet triaged.
+    #[default]
+    New,
+    /// Confirmed as a real, actionable defect.
+    Open,
+    /// Resolved by a fix that has landed.
+    Fixed,
+    /// Determined not to be a real defect.
+    Dismissed,
+    /// Folded into a canonical bug; implies duplicate_of_id is set.
+    Duplicate,
+    /// Closed without a fix, for example obsolete or will not fix.
+    Closed,
+}
+
+impl BugLifecycleStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BugLifecycleStatus::New => "new",
+            BugLifecycleStatus::Open => "open",
+            BugLifecycleStatus::Fixed => "fixed",
+            BugLifecycleStatus::Dismissed => "dismissed",
+            BugLifecycleStatus::Duplicate => "duplicate",
+            BugLifecycleStatus::Closed => "closed",
+        }
+    }
+
+    /// Reports whether the bug has reached a state that needs no further triage.
+    pub fn is_resolved(&self) -> bool {
+        matches!(
+            self,
+            BugLifecycleStatus::Fixed
+                | BugLifecycleStatus::Dismissed
+                | BugLifecycleStatus::Duplicate
+                | BugLifecycleStatus::Closed
+        )
+    }
+}
+
+impl std::fmt::Display for BugLifecycleStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for BugLifecycleStatus {
+    type Err = anyhow::Error;
+
+    /// Parses strictly. An unrecognised value means the row disagrees with the
+    /// CHECK constraint on the column, which is a corrupt database rather than
+    /// something to paper over with a default.
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim() {
+            "new" => Ok(BugLifecycleStatus::New),
+            "open" => Ok(BugLifecycleStatus::Open),
+            "fixed" => Ok(BugLifecycleStatus::Fixed),
+            "dismissed" => Ok(BugLifecycleStatus::Dismissed),
+            "duplicate" => Ok(BugLifecycleStatus::Duplicate),
+            "closed" => Ok(BugLifecycleStatus::Closed),
+            other => bail!("unknown bug lifecycle status: {other:?}"),
+        }
+    }
+}
+
+/// Execution state of the analysis pipeline for a Linux kernel bug.
+///
+/// Written exclusively by the bug worker. Crash recovery only ever touches this
+/// field, which is what keeps triage state safe across restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BugPipelineState {
+    /// Waiting to be claimed by a worker.
+    #[default]
+    Pending,
+    /// Claimed by a worker holding an unexpired lease.
+    Running,
+    /// Analysis completed.
+    Succeeded,
+    /// Analysis errored and remains eligible for retry.
+    Failed,
+    /// Analysis errored too many times; never claimed again without operator action.
+    Abandoned,
+}
+
+impl BugPipelineState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BugPipelineState::Pending => "pending",
+            BugPipelineState::Running => "running",
+            BugPipelineState::Succeeded => "succeeded",
+            BugPipelineState::Failed => "failed",
+            BugPipelineState::Abandoned => "abandoned",
+        }
+    }
+
+    /// Reports whether analysis is queued or in flight, and therefore whether
+    /// the user should be told that results are still on their way.
+    pub fn is_in_progress(&self) -> bool {
+        matches!(self, BugPipelineState::Pending | BugPipelineState::Running)
+    }
+}
+
+impl std::fmt::Display for BugPipelineState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl std::str::FromStr for BugPipelineState {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim() {
+            "pending" => Ok(BugPipelineState::Pending),
+            "running" => Ok(BugPipelineState::Running),
+            "succeeded" => Ok(BugPipelineState::Succeeded),
+            "failed" => Ok(BugPipelineState::Failed),
+            "abandoned" => Ok(BugPipelineState::Abandoned),
+            other => bail!("unknown bug pipeline state: {other:?}"),
+        }
+    }
+}
+
 pub struct Finding {
     pub review_id: i64,
     pub severity: Severity,
@@ -233,13 +364,23 @@ pub struct Bug {
     #[serde(alias = "slug")]
     pub bugid: String,
     pub title: String,
-    pub status: String,
+    /// Triage state. See [`BugLifecycleStatus`].
+    #[serde(default)]
+    pub lifecycle_status: BugLifecycleStatus,
+    /// Analysis execution state. See [`BugPipelineState`].
+    #[serde(default)]
+    pub pipeline_state: BugPipelineState,
     pub reporter: String,
     pub reported_at: i64,
+    /// Email address of whoever is working on this bug, if anyone.
+    pub assignee: Option<String>,
+    pub assigned_at: Option<i64>,
     pub discovered_in_patchset_id: Option<i64>,
     pub discovered_in_patch_id: Option<i64>,
     pub discovered_in_commit: Option<String>,
     pub source_ref: Option<String>,
+    /// Deduplication embedding, joined in from bug_vectors rather than
+    /// stored on the core row. Only populated by queries that need it.
     pub vector_json: Option<String>,
     pub duplicate_of_id: Option<i64>,
     pub created_at: i64,
@@ -257,9 +398,11 @@ impl std::fmt::Debug for Bug {
             .field("id", &self.id)
             .field("bugid", &self.bugid)
             .field("title", &self.title)
-            .field("status", &self.status)
+            .field("lifecycle_status", &self.lifecycle_status)
+            .field("pipeline_state", &self.pipeline_state)
             .field("reporter", &self.reporter)
             .field("reported_at", &self.reported_at)
+            .field("assignee", &self.assignee)
             .field("subsystems", &self.subsystems)
             .field("enrichments", &self.enrichments.len())
             .field("discovered_in_patchset_id", &self.discovered_in_patchset_id)
@@ -409,7 +552,7 @@ impl Bug {
     }
 
     pub fn is_fixed(&self) -> bool {
-        if self.status == "fixed" {
+        if self.lifecycle_status == BugLifecycleStatus::Fixed {
             return true;
         }
         for e in &self.enrichments {
@@ -504,12 +647,18 @@ pub struct NewBug {
     pub bugid: String,
     #[serde(default = "default_bug_title", alias = "problem")]
     pub title: String,
-    #[serde(default = "default_bug_status")]
-    pub status: String,
+    /// Defaults to New: a freshly reported bug has not been triaged yet.
+    #[serde(default)]
+    pub lifecycle_status: BugLifecycleStatus,
+    /// Defaults to Pending: a freshly reported bug is awaiting analysis.
+    #[serde(default)]
+    pub pipeline_state: BugPipelineState,
     #[serde(default = "default_bug_reporter")]
     pub reporter: String,
     #[serde(default = "default_now")]
     pub reported_at: i64,
+    #[serde(default)]
+    pub assignee: Option<String>,
     pub discovered_in_patchset_id: Option<i64>,
     pub discovered_in_patch_id: Option<i64>,
     pub discovered_in_commit: Option<String>,
@@ -524,10 +673,6 @@ fn default_bug_title() -> String {
     String::new()
 }
 
-fn default_bug_status() -> String {
-    "raw".to_string()
-}
-
 fn default_bug_reporter() -> String {
     "sashiko".to_string()
 }
@@ -536,9 +681,26 @@ fn default_now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// Canonical projection for reads of a core bug row.
+///
+/// Every query whose rows are handed to `Database::parse_bug_row_core` must
+/// select exactly these columns, in this order. Keeping the list in one place
+/// is what stops a new query from silently shifting the column indices.
+///
+/// The deduplication embedding is intentionally absent: it lives in
+/// bug_vectors and is only fetched by the dedup path, so ordinary reads
+/// never carry the blob.
+const BUG_ROW_COLUMNS: &str = "id, bugid, title, lifecycle_status, pipeline_state,
+     reporter, reported_at, assignee, assigned_at,
+     discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit,
+     source_ref, duplicate_of_id, created_at, updated_at";
+
 #[derive(Default, Debug, Clone)]
 pub struct UpdateBugOutcomeParams<'a> {
-    pub status: &'a str,
+    /// Triage verdict reached by the analysis. Execution failures are reported
+    /// through `Database::fail_bug_analysis` instead, so that a crashed run can
+    /// never be mistaken for a triage decision.
+    pub lifecycle_status: BugLifecycleStatus,
     pub problem: Option<&'a str>,
     pub subsystems: Option<&'a [String]>,
     pub source_files: Option<&'a [String]>,
@@ -575,10 +737,21 @@ pub struct ListBugsParams<'a> {
     pub min_severity: Option<Severity>,
     pub subsystem: Option<&'a str>,
     pub subsystems: Option<&'a [String]>,
-    pub status: Option<&'a str>,
+    pub lifecycle_status: Option<BugLifecycleStatus>,
+    pub pipeline_state: Option<BugPipelineState>,
+    pub assignee: Option<AssigneeFilter<'a>>,
     pub search: Option<&'a str>,
     pub sort_by: Option<&'a str>,
     pub sort_order: Option<&'a str>,
+}
+
+/// Selects bugs by who they are assigned to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssigneeFilter<'a> {
+    /// Only bugs nobody has picked up.
+    Unassigned,
+    /// Only bugs assigned to this exact address.
+    Is(&'a str),
 }
 
 pub struct EmailOutboxRow {
@@ -909,6 +1082,10 @@ impl Database {
             .await?
             .next()
             .await;
+        // Foreign keys are off by default in SQLite and must be re-enabled per
+        // connection. Without this every ON DELETE CASCADE in the schema is
+        // inert and orphaned child rows accumulate silently.
+        conn.execute("PRAGMA foreign_keys = ON;", ()).await?;
 
         Ok(Self {
             conn,
@@ -957,7 +1134,22 @@ impl Database {
             tx.execute("PRAGMA user_version = 4", ()).await?;
             tx.commit().await?;
         }
-        info!("Database schema is up to date at version 4.");
+        if current_version < 5 {
+            info!("Applying database migration version 5 (linux bug schema v2)...");
+            // Foreign key enforcement is suspended for the duration of this
+            // migration: it drops and recreates the bug tables, and SQLite
+            // refuses to change the pragma inside a transaction, so the whole
+            // batch runs unwrapped with enforcement restored afterwards.
+            self.conn.execute("PRAGMA foreign_keys = OFF;", ()).await?;
+            let result = self
+                .conn
+                .execute_batch(include_str!("migrations/005_linux_bug_schema_v2.sql"))
+                .await;
+            self.conn.execute("PRAGMA foreign_keys = ON;", ()).await?;
+            result?;
+            self.conn.execute("PRAGMA user_version = 5", ()).await?;
+        }
+        info!("Database schema is up to date at version 5.");
         Ok(())
     }
 
@@ -1269,27 +1461,37 @@ impl Database {
         } else {
             chrono::Utc::now().timestamp()
         };
+        let assignee = bug
+            .assignee
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let assigned_at = assignee.as_ref().map(|_| now);
         let mut rows = self
             .conn
             .query(
                 "INSERT INTO bugs (
-                    bugid, title, status, reporter, reported_at,
+                    bugid, title, lifecycle_status, pipeline_state, reporter, reported_at,
+                    assignee, assigned_at,
                     discovered_in_patchset_id, discovered_in_patch_id,
-                    discovered_in_commit, source_ref, vector_json, duplicate_of_id,
+                    discovered_in_commit, source_ref, duplicate_of_id,
                     created_at, updated_at, audit_author, audit_tool, audit_model
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  RETURNING id",
                 libsql::params![
                     bug.bugid.as_str(),
                     bug.title.as_str(),
-                    bug.status.as_str(),
+                    bug.lifecycle_status.as_str(),
+                    bug.pipeline_state.as_str(),
                     bug.reporter.as_str(),
                     now,
+                    assignee,
+                    assigned_at,
                     bug.discovered_in_patchset_id,
                     bug.discovered_in_patch_id,
                     bug.discovered_in_commit.clone(),
                     bug.source_ref.clone(),
-                    bug.vector_json.clone(),
                     bug.duplicate_of_id,
                     now,
                     now,
@@ -1308,16 +1510,42 @@ impl Database {
                     self
                         .conn
                         .execute(
-                            "INSERT OR IGNORE INTO bugs_subsystems (bug_id, subsystem) VALUES (?, ?)",
+                            "INSERT OR IGNORE INTO bug_subsystems (bug_id, subsystem) VALUES (?, ?)",
                             libsql::params![id, trimmed],
                         )
                         .await?;
                 }
             }
+            if let Some(vector_json) = bug.vector_json.as_deref() {
+                self.store_bug_vector(id, vector_json).await?;
+            }
             Ok(id)
         } else {
             bail!("Failed to insert bug: no id returned");
         }
+    }
+
+    /// Records a deduplication embedding for a bug.
+    ///
+    /// Keyed by the model that produced it, so switching embedding models adds a
+    /// row rather than destroying the previous vector.
+    async fn store_bug_vector(&self, bug_id: i64, vector_json: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO bug_vectors (bug_id, model, vector_json, created_at)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(bug_id, model) DO UPDATE SET
+                     vector_json = excluded.vector_json,
+                     created_at = excluded.created_at",
+                libsql::params![
+                    bug_id,
+                    self.bug_model.clone().unwrap_or_default(),
+                    vector_json,
+                    chrono::Utc::now().timestamp(),
+                ],
+            )
+            .await?;
+        Ok(())
     }
 
     pub async fn add_bug_enrichment(
@@ -1455,11 +1683,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, bugid, title, status, reporter, reported_at,
-                        discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, source_ref, vector_json, duplicate_of_id,
-                        created_at, updated_at
-                 FROM bugs WHERE id = ?",
+                &format!("SELECT {BUG_ROW_COLUMNS} FROM bugs WHERE id = ?"),
                 libsql::params![id],
             )
             .await?;
@@ -1481,11 +1705,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, bugid, title, status, reporter, reported_at,
-                        discovered_in_patchset_id, discovered_in_patch_id,
-                        discovered_in_commit, source_ref, vector_json, duplicate_of_id,
-                        created_at, updated_at
-                 FROM bugs WHERE bugid = ?",
+                &format!("SELECT {BUG_ROW_COLUMNS} FROM bugs WHERE bugid = ?"),
                 libsql::params![bugid],
             )
             .await?;
@@ -1511,7 +1731,7 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT subsystem FROM bugs_subsystems WHERE bug_id = ? ORDER BY subsystem ASC",
+                "SELECT subsystem FROM bug_subsystems WHERE bug_id = ? ORDER BY subsystem ASC",
                 libsql::params![bug_id],
             )
             .await?;
@@ -1570,14 +1790,14 @@ impl Database {
              ) SELECT f.root,
                       COALESCE(
                           NULLIF(trim(e.model), ''),
-                          (SELECT r.model FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = f.id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
-                          (SELECT r.model FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                          (SELECT r.model FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = f.id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                          (SELECT r.model FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
                           (SELECT r.model FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1)
                       ) AS model,
                       COALESCE(
                           NULLIF(trim(e.tool), ''),
-                          (SELECT 'sashiko:linux_patch_review' FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = f.id LIMIT 1),
-                          (SELECT 'sashiko:linux_patch_review' FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                          (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = f.id LIMIT 1),
+                          (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
                           (SELECT 'sashiko:linux_patch_review' FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
                       ) AS tool
                FROM family f
@@ -1626,13 +1846,13 @@ impl Database {
             .query(
                 "SELECT
                     COALESCE(
-                        (SELECT r.model FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
-                        (SELECT r.model FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                        (SELECT r.model FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
+                        (SELECT r.model FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1),
                         (SELECT r.model FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1)
                     ) AS model,
                     COALESCE(
-                        (SELECT 'sashiko:linux_patch_review' FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.id LIMIT 1),
-                        (SELECT 'sashiko:linux_patch_review' FROM review_bugs rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                        (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.id LIMIT 1),
+                        (SELECT 'sashiko:linux_patch_review' FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
                         (SELECT 'sashiko:linux_patch_review' FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
                     ) AS tool
                  FROM bugs b WHERE b.id = ?",
@@ -1841,7 +2061,7 @@ impl Database {
                 .conn
                 .query(
                     "SELECT rb.bug_id, r.patchset_id, r.patch_id
-                     FROM review_bugs rb
+                     FROM bug_reviews rb
                      JOIN reviews r ON r.id = rb.review_id
                      WHERE rb.bug_id IN (SELECT value FROM json_each(?))
                      ORDER BY r.id ASC",
@@ -1955,13 +2175,13 @@ impl Database {
     pub async fn change_bug_status_with_reason(
         &self,
         id: i64,
-        status: &str,
+        status: BugLifecycleStatus,
         reason: Option<&str>,
     ) -> Result<()> {
         let tx = self.conn.transaction().await?;
         let now = chrono::Utc::now().timestamp();
-        tx.execute("UPDATE bugs SET status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
-            libsql::params![status, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id]).await?;
+        tx.execute("UPDATE bugs SET lifecycle_status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+            libsql::params![status.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id]).await?;
         if let Some(reason) = reason.filter(|s| !s.trim().is_empty()) {
             tx.execute("INSERT INTO bug_enrichments (bug_id, kind, tool, author, model, created_at, content) VALUES (?, 'comment', ?, ?, ?, ?, ?)",
                 libsql::params![id, self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(), now, reason]).await?;
@@ -2018,11 +2238,12 @@ impl Database {
         self.get_bug_logs_by_bugid(slug).await
     }
 
-    pub async fn lock_raw_bug(&self) -> Result<Option<Bug>> {
+    /// Claims the oldest bug awaiting analysis and marks it as running.
+    pub async fn lock_pending_bug(&self) -> Result<Option<Bug>> {
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM bugs WHERE status = 'raw' ORDER BY created_at ASC LIMIT 1",
+                "SELECT id FROM bugs WHERE pipeline_state = 'pending' ORDER BY created_at ASC LIMIT 1",
                 (),
             )
             .await?;
@@ -2031,7 +2252,7 @@ impl Database {
             let now = chrono::Utc::now().timestamp();
             self.conn
                 .execute(
-                    "UPDATE bugs SET status = 'processing', updated_at = ?, audit_author = 'system', audit_tool = 'sashiko:linux_bug', audit_model = NULL WHERE id = ?",
+                    "UPDATE bugs SET pipeline_state = 'running', updated_at = ?, audit_author = 'system', audit_tool = 'sashiko:linux_bug', audit_model = NULL WHERE id = ?",
                     libsql::params![now, id],
                 )
                 .await?;
@@ -2041,31 +2262,77 @@ impl Database {
         }
     }
 
-    /// Recovers bugs that were left in the 'processing' state (e.g. from an unexpected process
-    /// crash or restart) by resetting their status back to 'raw' so they can be re-queued.
-    pub async fn recover_stale_processing_bugs(&self) -> Result<usize> {
+    /// Requeues bugs left mid-analysis by an unexpected process crash or restart.
+    ///
+    /// Only the pipeline state is touched. Triage state is owned by humans and
+    /// must survive a restart untouched.
+    pub async fn recover_stale_running_bugs(&self) -> Result<usize> {
         let count = self
             .conn
             .execute(
-                "UPDATE bugs SET status = 'raw', audit_author = 'system', audit_tool = 'sashiko:linux_bug', audit_model = NULL WHERE status = 'processing'",
+                "UPDATE bugs SET pipeline_state = 'pending', locked_by = NULL, lease_expires_at = NULL, audit_author = 'system', audit_tool = 'sashiko:linux_bug', audit_model = NULL WHERE pipeline_state = 'running'",
                 (),
             )
             .await?;
         if count > 0 {
             info!(
-                "Recovered {} stale processing bugs back to raw state",
+                "Requeued {} bugs left mid-analysis for another attempt",
                 count
             );
         }
         Ok(count as usize)
     }
 
-    pub async fn update_bug_status(&self, id: i64, status: &str) -> Result<()> {
+    /// Updates the triage state of a bug.
+    pub async fn set_bug_lifecycle_status(
+        &self,
+        id: i64,
+        status: BugLifecycleStatus,
+    ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         self.conn
             .execute(
-                "UPDATE bugs SET status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
-                libsql::params![status, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
+                "UPDATE bugs SET lifecycle_status = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+                libsql::params![status.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Updates the analysis execution state of a bug.
+    pub async fn set_bug_pipeline_state(&self, id: i64, state: BugPipelineState) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE bugs SET pipeline_state = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+                libsql::params![state.as_str(), now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Records that an analysis attempt failed.
+    ///
+    /// The triage state is left untouched: a crashed run says nothing about
+    /// whether the underlying defect is real.
+    pub async fn fail_bug_analysis(&self, id: i64, error: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "UPDATE bugs
+                 SET pipeline_state = ?, last_error = ?, locked_by = NULL,
+                     lease_expires_at = NULL, updated_at = ?,
+                     audit_author = ?, audit_tool = ?, audit_model = ?
+                 WHERE id = ?",
+                libsql::params![
+                    BugPipelineState::Failed.as_str(),
+                    error,
+                    now,
+                    self.bug_actor.as_str(),
+                    self.bug_tool.as_str(),
+                    self.bug_model.clone(),
+                    id,
+                ],
             )
             .await?;
         Ok(())
@@ -2083,14 +2350,7 @@ impl Database {
     }
 
     pub async fn update_bug_vector(&self, id: i64, vector_json: &str) -> Result<()> {
-        let now = chrono::Utc::now().timestamp();
-        self.conn
-            .execute(
-                "UPDATE bugs SET vector_json = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
-                libsql::params![vector_json, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), id],
-            )
-            .await?;
-        Ok(())
+        self.store_bug_vector(id, vector_json).await
     }
 
     pub async fn update_bug_subsystems(&self, id: i64, subsystems: &[String]) -> Result<()> {
@@ -2098,7 +2358,7 @@ impl Database {
         tx.execute("UPDATE bugs SET audit_author = ?, audit_tool = ?, audit_model = ?, updated_at = ? WHERE id = ?", libsql::params![self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), chrono::Utc::now().timestamp(), id]).await?;
         let mut rows = tx
             .query(
-                "SELECT subsystem FROM bugs_subsystems WHERE bug_id = ?",
+                "SELECT subsystem FROM bug_subsystems WHERE bug_id = ?",
                 libsql::params![id],
             )
             .await?;
@@ -2111,7 +2371,7 @@ impl Database {
             let sub: String = row.get(0)?;
             if !wanted.contains(sub.as_str()) {
                 tx.execute(
-                    "DELETE FROM bugs_subsystems WHERE bug_id = ? AND subsystem = ?",
+                    "DELETE FROM bug_subsystems WHERE bug_id = ? AND subsystem = ?",
                     libsql::params![id, sub],
                 )
                 .await?;
@@ -2119,7 +2379,7 @@ impl Database {
         }
         for sub in wanted {
             tx.execute(
-                "INSERT OR IGNORE INTO bugs_subsystems (bug_id, subsystem) VALUES (?, ?)",
+                "INSERT OR IGNORE INTO bug_subsystems (bug_id, subsystem) VALUES (?, ?)",
                 libsql::params![id, sub],
             )
             .await?;
@@ -2143,10 +2403,14 @@ impl Database {
         if let Some(vector) = params.vector_json {
             self.update_bug_vector(id, vector).await?;
         }
-        self.update_bug_status(id, params.status).await?;
+        self.set_bug_lifecycle_status(id, params.lifecycle_status)
+            .await?;
+        // Producing an outcome at all means the analysis ran to completion.
+        self.set_bug_pipeline_state(id, BugPipelineState::Succeeded)
+            .await?;
 
         if params.verified_on_sha.is_some() || params.locations.is_some() {
-            let is_valid = params.status != "dismissed";
+            let is_valid = params.lifecycle_status != BugLifecycleStatus::Dismissed;
             let refutation = if !is_valid {
                 params.severity_explanation.map(|s| s.to_string())
             } else {
@@ -2258,7 +2522,7 @@ impl Database {
             let placeholders = vec!["?"; valid_subs.len()].join(", ");
             conditions.push(
                 format!(
-                    "id IN (SELECT bug_id FROM bugs_subsystems WHERE subsystem IN ({}))",
+                    "id IN (SELECT bug_id FROM bug_subsystems WHERE subsystem IN ({}))",
                     placeholders
                 )
                 .into(),
@@ -2279,7 +2543,7 @@ impl Database {
                 let placeholders = vec!["?"; parts.len()].join(", ");
                 conditions.push(
                     format!(
-                        "id IN (SELECT bug_id FROM bugs_subsystems WHERE subsystem IN ({}))",
+                        "id IN (SELECT bug_id FROM bug_subsystems WHERE subsystem IN ({}))",
                         placeholders
                     )
                     .into(),
@@ -2289,7 +2553,7 @@ impl Database {
                 }
             } else {
                 conditions.push(
-                    "id IN (SELECT bug_id FROM bugs_subsystems WHERE subsystem = ? OR subsystem LIKE ?)".into(),
+                    "id IN (SELECT bug_id FROM bug_subsystems WHERE subsystem = ? OR subsystem LIKE ?)".into(),
                 );
                 query_params.push(libsql::Value::Text(sub.to_string()));
                 query_params.push(libsql::Value::Text(format!("{}/%", sub)));
@@ -2299,31 +2563,30 @@ impl Database {
         if let Some(min_sev) = params.min_severity
             && min_sev != Severity::Unknown
         {
-            conditions.push(
-                "(
-                    SELECT
-                        COALESCE(
-                            CAST(json_extract(data_json, '$.severity_int') AS INTEGER),
-                            CASE LOWER(json_extract(data_json, '$.severity'))
-                                WHEN 'critical' THEN 4
-                                WHEN 'high' THEN 3
-                                WHEN 'medium' THEN 2
-                                WHEN 'low' THEN 1
-                                ELSE 0
-                            END
-                        )
-                    FROM bug_enrichments
-                    WHERE bug_id = bugs.id AND kind = 'severity_calibration'
-                    ORDER BY created_at DESC LIMIT 1
-                ) >= ?"
-                    .into(),
-            );
+            // severity_int is projected from the severity_calibration enrichment
+            // by trigger, so this is an indexed comparison rather than a
+            // correlated subquery over the enrichment log.
+            conditions.push("severity_int >= ?".into());
             query_params.push(libsql::Value::Integer(min_sev as i64));
         }
 
-        if let Some(st) = params.status.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            conditions.push("status = ?".into());
-            query_params.push(libsql::Value::Text(st.to_string()));
+        if let Some(status) = params.lifecycle_status {
+            conditions.push("lifecycle_status = ?".into());
+            query_params.push(libsql::Value::Text(status.as_str().to_string()));
+        }
+
+        if let Some(state) = params.pipeline_state {
+            conditions.push("pipeline_state = ?".into());
+            query_params.push(libsql::Value::Text(state.as_str().to_string()));
+        }
+
+        match params.assignee {
+            Some(AssigneeFilter::Unassigned) => conditions.push("assignee IS NULL".into()),
+            Some(AssigneeFilter::Is(who)) => {
+                conditions.push("assignee = ?".into());
+                query_params.push(libsql::Value::Text(who.trim().to_string()));
+            }
+            None => {}
         }
 
         if let Some(q) = params.search.map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -2344,21 +2607,23 @@ impl Database {
             _ => "DESC",
         };
         let order_clause = match params.sort_by.map(|s| s.to_ascii_lowercase()).as_deref() {
-            Some("severity") => {
-                format!(
-                    "ORDER BY COALESCE((
-                        SELECT CAST(json_extract(data_json, '$.severity_int') AS INTEGER)
-                        FROM bug_enrichments
-                        WHERE bug_id = bugs.id AND kind = 'severity_calibration'
-                        ORDER BY created_at DESC LIMIT 1
-                    ), 0) {}, id {}",
-                    sort_dir, sort_dir
-                )
-            }
+            // Sorts straight off the projected column, which idx_bugs_severity covers.
+            Some("severity") => format!("ORDER BY severity_int {}, id {}", sort_dir, sort_dir),
             Some("title") | Some("problem") => {
                 format!("ORDER BY title {}, created_at DESC, id DESC", sort_dir)
             }
-            Some("status") => format!("ORDER BY status {}, created_at DESC, id DESC", sort_dir),
+            Some("status") | Some("lifecycle_status") => format!(
+                "ORDER BY lifecycle_status {}, created_at DESC, id DESC",
+                sort_dir
+            ),
+            Some("pipeline_state") => format!(
+                "ORDER BY pipeline_state {}, created_at DESC, id DESC",
+                sort_dir
+            ),
+            Some("assignee") => format!(
+                "ORDER BY assignee IS NULL, assignee {}, created_at DESC, id DESC",
+                sort_dir
+            ),
             Some("id") => format!("ORDER BY id {}", sort_dir),
             Some("bugid") => format!("ORDER BY bugid {}, id {}", sort_dir, sort_dir),
             Some("created_at") => format!("ORDER BY created_at {}, id {}", sort_dir, sort_dir),
@@ -2392,10 +2657,7 @@ impl Database {
         };
 
         let select_sql = format!(
-            "SELECT id, bugid, title, status, reporter, reported_at,
-                    discovered_in_patchset_id, discovered_in_patch_id,
-                    discovered_in_commit, source_ref, vector_json, duplicate_of_id,
-                    created_at, updated_at
+            "SELECT {BUG_ROW_COLUMNS}
              FROM bugs
              {}
              {}
@@ -2418,7 +2680,7 @@ impl Database {
 
             // Batch fetch subsystems
             let subs_sql = format!(
-                "SELECT bug_id, subsystem FROM bugs_subsystems WHERE bug_id IN ({}) ORDER BY subsystem ASC",
+                "SELECT bug_id, subsystem FROM bug_subsystems WHERE bug_id IN ({}) ORDER BY subsystem ASC",
                 placeholders
             );
             let subs_params: Vec<libsql::Value> = bug_ids
@@ -2473,17 +2735,17 @@ impl Database {
 
     pub async fn get_subsystems_bug_counts(
         &self,
-        status: Option<&str>,
+        lifecycle_status: Option<BugLifecycleStatus>,
     ) -> Result<Vec<(String, usize)>> {
-        let st = status.unwrap_or("open");
+        let st = lifecycle_status.unwrap_or(BugLifecycleStatus::Open);
         let sql = "SELECT bs.subsystem, COUNT(DISTINCT b.id) AS bug_count
-                   FROM bugs_subsystems bs
+                   FROM bug_subsystems bs
                    JOIN bugs b ON bs.bug_id = b.id
-                   WHERE b.status = ?
+                   WHERE b.lifecycle_status = ?
                    GROUP BY bs.subsystem
                    HAVING bug_count > 0
                    ORDER BY bug_count DESC, bs.subsystem ASC";
-        let mut rows = self.conn.query(sql, libsql::params![st]).await?;
+        let mut rows = self.conn.query(sql, libsql::params![st.as_str()]).await?;
         let mut results = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let name: String = row.get(0)?;
@@ -2503,7 +2765,7 @@ impl Database {
     ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO review_bugs (review_id, bug_id, is_newly_discovered)
+                "INSERT OR REPLACE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
                  VALUES (?, ?, ?)",
                 libsql::params![review_id, bug_id, if is_newly_discovered { 1 } else { 0 }],
             )
@@ -2538,7 +2800,7 @@ impl Database {
         }
 
         tx.execute(
-            "UPDATE bugs SET status = 'duplicate', duplicate_of_id = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
+            "UPDATE bugs SET lifecycle_status = 'duplicate', duplicate_of_id = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
             libsql::params![params.canonical_id, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), params.ephemeral_id],
         )
         .await?;
@@ -2566,12 +2828,12 @@ impl Database {
         .await?;
 
         tx.execute(
-            "INSERT OR IGNORE INTO review_bugs (review_id, bug_id) SELECT review_id, ?1 FROM review_bugs WHERE bug_id = ?2",
+            "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id) SELECT review_id, ?1 FROM bug_reviews WHERE bug_id = ?2",
             libsql::params![params.canonical_id, params.ephemeral_id],
         )
         .await?;
         tx.execute(
-            "DELETE FROM review_bugs WHERE bug_id = ?",
+            "DELETE FROM bug_reviews WHERE bug_id = ?",
             libsql::params![params.ephemeral_id],
         )
         .await?;
@@ -2583,14 +2845,14 @@ impl Database {
     pub async fn migrate_review_bugs(&self, from_bug_id: i64, to_bug_id: i64) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO review_bugs (review_id, bug_id, is_newly_discovered)
-             SELECT review_id, ?, 0 FROM review_bugs WHERE bug_id = ?",
+                "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
+             SELECT review_id, ?, 0 FROM bug_reviews WHERE bug_id = ?",
                 libsql::params![to_bug_id, from_bug_id],
             )
             .await?;
         self.conn
             .execute(
-                "DELETE FROM review_bugs WHERE bug_id = ?",
+                "DELETE FROM bug_reviews WHERE bug_id = ?",
                 libsql::params![from_bug_id],
             )
             .await?;
@@ -2637,7 +2899,7 @@ impl Database {
             .query(
                 "SELECT pb.id, rpb.is_newly_discovered
                  FROM bugs pb
-                 JOIN review_bugs rpb ON pb.id = rpb.bug_id
+                 JOIN bug_reviews rpb ON pb.id = rpb.bug_id
                  WHERE rpb.review_id = ?
                  ORDER BY pb.id ASC",
                 libsql::params![review_id],
@@ -2668,7 +2930,7 @@ impl Database {
             .query(
                 "SELECT DISTINCT pb.id, rpb.is_newly_discovered
                  FROM bugs pb
-                 JOIN review_bugs rpb ON pb.id = rpb.bug_id
+                 JOIN bug_reviews rpb ON pb.id = rpb.bug_id
                  JOIN reviews r ON rpb.review_id = r.id
                  WHERE r.patchset_id = ?
                  ORDER BY pb.id ASC",
@@ -2694,19 +2956,35 @@ impl Database {
         Ok(list)
     }
 
+    /// Loads the deduplication corpus: every bug that is still a candidate for
+    /// being matched against, together with its embedding.
+    ///
+    /// This is the only read path that pulls vectors, which is why they live in
+    /// a side table rather than on the core row.
     pub async fn list_all_bugs_for_vector_search(&self) -> Result<Vec<Bug>> {
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM bugs WHERE status IN ('open', 'fixed', 'verified') ORDER BY id ASC",
+                "SELECT b.id, v.vector_json
+                 FROM bugs b
+                 LEFT JOIN bug_vectors v ON v.bug_id = b.id
+                 WHERE b.lifecycle_status IN ('new', 'open', 'fixed')
+                 ORDER BY b.id ASC",
                 (),
             )
             .await?;
 
-        let mut list = Vec::new();
+        let mut ids = Vec::new();
         while let Some(row) = rows.next().await? {
             let id: i64 = row.get(0)?;
-            if let Some(bug) = self.get_bug(id).await? {
+            let vector_json: Option<String> = row.get(1).ok().flatten();
+            ids.push((id, vector_json));
+        }
+
+        let mut list = Vec::new();
+        for (id, vector_json) in ids {
+            if let Some(mut bug) = self.get_bug(id).await? {
+                bug.vector_json = vector_json;
                 list.push(bug);
             }
         }
@@ -2714,34 +2992,41 @@ impl Database {
         Ok(list)
     }
 
+    /// Parses a row selected with [`BUG_ROW_COLUMNS`]. The column order here and
+    /// the order in that constant must be kept in step.
     fn parse_bug_row_core(row: &libsql::Row) -> Result<Bug> {
         let id: i64 = row.get(0)?;
         let bugid: String = row.get(1)?;
         let title: String = row.get(2)?;
-        let status: String = row.get(3)?;
-        let reporter: String = row.get(4)?;
-        let reported_at: i64 = row.get(5)?;
-        let discovered_in_patchset_id: Option<i64> = row.get(6).ok().flatten();
-        let discovered_in_patch_id: Option<i64> = row.get(7).ok().flatten();
-        let discovered_in_commit: Option<String> = row.get(8).ok().flatten();
-        let source_ref: Option<String> = row.get(9).ok().flatten();
-        let vector_json: Option<String> = row.get(10).ok().flatten();
-        let duplicate_of_id: Option<i64> = row.get(11).ok().flatten();
-        let created_at: i64 = row.get(12)?;
-        let updated_at: i64 = row.get(13)?;
+        let lifecycle_status: String = row.get(3)?;
+        let pipeline_state: String = row.get(4)?;
+        let reporter: String = row.get(5)?;
+        let reported_at: i64 = row.get(6)?;
+        let assignee: Option<String> = row.get(7).ok().flatten();
+        let assigned_at: Option<i64> = row.get(8).ok().flatten();
+        let discovered_in_patchset_id: Option<i64> = row.get(9).ok().flatten();
+        let discovered_in_patch_id: Option<i64> = row.get(10).ok().flatten();
+        let discovered_in_commit: Option<String> = row.get(11).ok().flatten();
+        let source_ref: Option<String> = row.get(12).ok().flatten();
+        let duplicate_of_id: Option<i64> = row.get(13).ok().flatten();
+        let created_at: i64 = row.get(14)?;
+        let updated_at: i64 = row.get(15)?;
 
         Ok(Bug {
             id,
             bugid,
             title,
-            status,
+            lifecycle_status: lifecycle_status.parse()?,
+            pipeline_state: pipeline_state.parse()?,
             reporter,
             reported_at,
+            assignee,
+            assigned_at,
             discovered_in_patchset_id,
             discovered_in_patch_id,
             discovered_in_commit,
             source_ref,
-            vector_json,
+            vector_json: None,
             duplicate_of_id,
             created_at,
             updated_at,
@@ -6064,8 +6349,12 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    /// Schema v2 is a deliberate clean break: it drops the pre-v2 bug tables
+    /// instead of migrating them. This pins that behaviour so the data loss
+    /// stays intentional rather than becoming a surprise, and checks that the
+    /// recreated schema is immediately usable.
     #[tokio::test]
-    async fn test_bug_provenance_migration_preserves_legacy_records() -> Result<()> {
+    async fn test_bug_schema_v2_discards_legacy_records() -> Result<()> {
         let db = Database::new(&DatabaseSettings {
             url: ":memory:".into(),
             token: String::new(),
@@ -6079,31 +6368,63 @@ mod tests {
             .await?;
         db.conn.execute_batch(r#"PRAGMA user_version = 2;
             INSERT INTO bugs (id, bugid, title, status, reporter, reported_at, created_at, updated_at) VALUES (1, 'legacy', 'Old report', 'open', 'legacy reporter', 1, 1, 1);
-            INSERT INTO bug_enrichments (bug_id, kind, tool, created_at, data_json, logs) VALUES (1, 'candidate', 'legacy-tool', 1, '{"original":true}', 'original log');"#).await?;
+            INSERT INTO bug_enrichments (bug_id, kind, tool, created_at, data_json, logs) VALUES (1, 'candidate', 'legacy-tool', 1, '{"original":true}', 'original log');
+            INSERT INTO people (name, email) VALUES ('Shared Row', 'shared@example.org');"#).await?;
+
         db.migrate().await?;
+        // Re-running must be a no-op rather than dropping the tables again.
         db.migrate().await?;
-        let raw = db.bug_family(1, true).await?;
-        assert_eq!(raw[0].enrichments.len(), 1);
-        assert_eq!(raw[0].enrichments[0].logs.as_deref(), Some("original log"));
-        assert!(raw[0].enrichments[0].author.is_none());
-        let summary = db.bug_evidence(1).await?;
-        assert_eq!(summary["count"], 1);
-        assert_eq!(summary["unknown_models"], 1);
-        assert_eq!(summary["tools"], json!(["legacy-tool"]));
-        assert_eq!(summary["discoveries"][0]["has_input"], json!(true));
-        let candidate_event = summary["activity"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|e| e["kind"] == "candidate")
-            .unwrap();
-        assert_eq!(candidate_event["has_logs"], json!(true));
-        assert!(candidate_event.get("logs").is_none());
+
+        assert!(db.get_bug(1).await?.is_none(), "legacy bug survived v2");
+        assert_eq!(
+            db.conn
+                .query("SELECT COUNT(*) FROM bug_enrichments", ())
+                .await?
+                .next()
+                .await?
+                .unwrap()
+                .get::<i64>(0)?,
+            0,
+            "legacy enrichment survived v2"
+        );
+        assert_eq!(
+            db.conn
+                .query("SELECT COUNT(*) FROM people", ())
+                .await?
+                .next()
+                .await?
+                .unwrap()
+                .get::<i64>(0)?,
+            1,
+            "v2 must not touch shared infrastructure tables"
+        );
+
+        // The recreated schema starts bugs in the untriaged, unanalysed state
+        // and still records attributed audit history.
+        let id = db
+            .create_bug(&NewBug {
+                bugid: "linux-v2".to_string(),
+                title: "Fresh report".to_string(),
+                lifecycle_status: BugLifecycleStatus::New,
+                pipeline_state: BugPipelineState::Pending,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 1,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![],
+            })
+            .await?;
         let scoped = db.with_bug_actor("new author", "web", None);
         scoped
-            .change_bug_status_with_reason(1, "closed", Some("Now fixed"))
+            .change_bug_status_with_reason(id, BugLifecycleStatus::Closed, Some("Now fixed"))
             .await?;
-        let bug = db.get_bug(1).await?.unwrap();
+        let bug = db.get_bug(id).await?.unwrap();
+        assert_eq!(bug.lifecycle_status, BugLifecycleStatus::Closed);
         assert!(
             bug.enrichments
                 .iter()
@@ -6145,7 +6466,7 @@ mod tests {
             .update_bug_outcome(
                 ids[0],
                 UpdateBugOutcomeParams {
-                    status: "dismissed",
+                    lifecycle_status: BugLifecycleStatus::Dismissed,
                     verified_on_sha: Some("abcdef"),
                     logs: Some("[{\"role\":\"model\",\"parts\":[{\"text\":\"refuted\"}]}]"),
                     ..Default::default()
@@ -6157,7 +6478,11 @@ mod tests {
         assert_eq!(db.bug_evidence(ids[0]).await?["count"], 1);
         let human = db.with_bug_actor("maintainer@example.org", "web", None);
         human
-            .change_bug_status_with_reason(ids[0], "closed", Some("Confirmed fixed upstream"))
+            .change_bug_status_with_reason(
+                ids[0],
+                BugLifecycleStatus::Closed,
+                Some("Confirmed fixed upstream"),
+            )
             .await?;
         // Merge a child into another discovery, then merge that parent.
         human
@@ -6206,7 +6531,7 @@ mod tests {
             .find(|e| {
                 e.data_json
                     .as_ref()
-                    .is_some_and(|d| d["field"] == "status" && d["new"] == "closed")
+                    .is_some_and(|d| d["field"] == "lifecycle_status" && d["new"] == "closed")
             })
             .unwrap();
         assert_eq!(closed.author.as_deref(), Some("maintainer@example.org"));
@@ -6239,7 +6564,10 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(db.get_bug(ids[0]).await?.unwrap().status, "closed");
+        assert_eq!(
+            db.get_bug(ids[0]).await?.unwrap().lifecycle_status,
+            BugLifecycleStatus::Closed
+        );
         Ok(())
     }
 
@@ -6287,7 +6615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_bug_model_resolution_from_review_and_migration_backfill() -> Result<()> {
+    async fn test_bug_model_resolution_from_review() -> Result<()> {
         let db = setup_db().await;
         let thread_id = db.create_thread("t1", "subj", 100).await?;
         let ps_id = db
@@ -6304,7 +6632,9 @@ mod tests {
         let bug = NewBug {
             bugid: "linux-model-test".to_string(),
             title: "Model test bug".to_string(),
-            status: "open".to_string(),
+            lifecycle_status: BugLifecycleStatus::Open,
+            pipeline_state: BugPipelineState::Succeeded,
+            assignee: None,
             reporter: "sashiko".to_string(),
             reported_at: 1000,
             discovered_in_patchset_id: Some(ps_id),
@@ -6342,13 +6672,6 @@ mod tests {
         assert_eq!(evidence["count"], 1);
         assert_eq!(evidence["models"], json!(["test-model"]));
         assert_eq!(evidence["unknown_models"], 0);
-
-        // 2. Migration 004 backfills the database rows directly
-        db.conn.execute("PRAGMA user_version = 3", ()).await?;
-        db.migrate().await?;
-
-        let enrichments = db.get_bug_enrichments(bug_id).await?;
-        assert_eq!(enrichments[0].model.as_deref(), Some("test-model"));
 
         Ok(())
     }
@@ -6435,7 +6758,9 @@ mod tests {
         let bug1 = NewBug {
             bugid: "linux-bug-multi-1".to_string(),
             title: "Preexisting bug".to_string(),
-            status: "open".to_string(),
+            lifecycle_status: BugLifecycleStatus::Open,
+            pipeline_state: BugPipelineState::Succeeded,
+            assignee: None,
             reporter: "sashiko.dev".to_string(),
             reported_at: 1000,
             discovered_in_patchset_id: Some(ps1_id),
@@ -6469,7 +6794,9 @@ mod tests {
         let bug2 = NewBug {
             bugid: "linux-bug-multi-2".to_string(),
             title: "Preexisting bug copy 2".to_string(),
-            status: "raw".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
             reporter: "sashiko.dev".to_string(),
             reported_at: 2000,
             discovered_in_patchset_id: Some(ps1_id),
@@ -6510,7 +6837,9 @@ mod tests {
         let bug3 = NewBug {
             bugid: "linux-bug-multi-3".to_string(),
             title: "Preexisting bug copy 3".to_string(),
-            status: "raw".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
             reporter: "sashiko.dev".to_string(),
             reported_at: 3000,
             discovered_in_patchset_id: Some(ps2_id),
@@ -6551,7 +6880,9 @@ mod tests {
         let bug4 = NewBug {
             bugid: "linux-bug-multi-4".to_string(),
             title: "Preexisting bug copy 4".to_string(),
-            status: "raw".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
             reporter: "sashiko.dev".to_string(),
             reported_at: 4000,
             discovered_in_patchset_id: Some(ps1_id),
@@ -6618,7 +6949,9 @@ mod tests {
         let bug = crate::db::NewBug {
             bugid: "AUDIT-123".to_string(),
             title: "Initial problem".to_string(),
-            status: "raw".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
             reporter: "test@example.com".to_string(),
             reported_at: chrono::Utc::now().timestamp(),
             source_ref: None,
@@ -6631,12 +6964,13 @@ mod tests {
         };
         let bug_id = db.create_bug(&bug).await?;
 
-        // 1. Update status
-        db.update_bug_status(bug_id, "processing").await?;
+        // 1. Update the triage status.
+        db.set_bug_lifecycle_status(bug_id, BugLifecycleStatus::Open)
+            .await?;
 
         // Fetch enrichments
         let bug = db.get_bug(bug_id).await?.unwrap();
-        assert_eq!(bug.status, "processing");
+        assert_eq!(bug.lifecycle_status, BugLifecycleStatus::Open);
 
         let enrichments = bug.enrichments;
         assert_eq!(enrichments.len(), 2); // creation and status
@@ -6646,7 +6980,7 @@ mod tests {
                 && e.content
                     .as_deref()
                     .unwrap_or("")
-                    .contains("Field \"status\" changed")
+                    .contains(r#"Status changed from "new" to "open""#)
         }));
 
         Ok(())
@@ -11551,7 +11885,9 @@ mod tests {
         let bug = NewBug {
             bugid: "linux-test-1234".to_string(),
             title: "Memory leak in e1000_probe()".to_string(),
-            status: "open".to_string(),
+            lifecycle_status: BugLifecycleStatus::Open,
+            pipeline_state: BugPipelineState::Succeeded,
+            assignee: None,
             reporter: "sashiko".to_string(),
             reported_at: 123456789,
             discovered_in_patchset_id: None,
@@ -11725,7 +12061,7 @@ mod tests {
                 limit: Some(10),
                 min_severity: Some(Severity::High),
                 subsystem: Some("net"),
-                status: Some("open"),
+                lifecycle_status: Some(BugLifecycleStatus::Open),
                 search: Some("e1000"),
                 ..Default::default()
             })
@@ -11765,7 +12101,7 @@ mod tests {
             .list_bugs(ListBugsParams {
                 page: Some(1),
                 limit: Some(10),
-                status: Some("dismissed"),
+                lifecycle_status: Some(BugLifecycleStatus::Dismissed),
                 ..Default::default()
             })
             .await
@@ -11815,7 +12151,9 @@ mod tests {
         let dup_bug = NewBug {
             bugid: "linux-dup-1".to_string(),
             title: "Duplicate of e1000 leak".to_string(),
-            status: "raw".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
             reporter: "sashiko".to_string(),
             reported_at: 100005,
             discovered_in_patchset_id: None,
@@ -11893,7 +12231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recover_stale_processing_bugs() {
+    async fn test_recover_stale_running_bugs() {
         let db_settings = crate::settings::DatabaseSettings {
             url: ":memory:".to_string(),
             token: String::new(),
@@ -11904,7 +12242,9 @@ mod tests {
         let new_bug = NewBug {
             bugid: "linux-crash-recovery".to_string(),
             title: "Memory leak on crash".to_string(),
-            status: "raw".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
             reporter: "sashiko".to_string(),
             reported_at: 100000,
             discovered_in_patchset_id: None,
@@ -11917,26 +12257,34 @@ mod tests {
         };
         let bug_id = db.create_bug(&new_bug).await.unwrap();
 
-        // Lock bug -> status becomes 'processing'
-        let locked = db.lock_raw_bug().await.unwrap().expect("should lock bug");
+        // Claiming a bug moves it onto the running pipeline state.
+        let locked = db
+            .lock_pending_bug()
+            .await
+            .unwrap()
+            .expect("should lock bug");
         assert_eq!(locked.id, bug_id);
-        assert_eq!(locked.status, "processing");
+        assert_eq!(locked.pipeline_state, BugPipelineState::Running);
 
-        // No more raw bugs available to lock
-        assert!(db.lock_raw_bug().await.unwrap().is_none());
+        // No more pending bugs available to claim.
+        assert!(db.lock_pending_bug().await.unwrap().is_none());
 
-        // Simulate crash recovery
-        let recovered = db.recover_stale_processing_bugs().await.unwrap();
+        // Simulate crash recovery.
+        let recovered = db.recover_stale_running_bugs().await.unwrap();
         assert_eq!(recovered, 1);
 
-        // Bug should now be raw again and lockable
+        // Recovery only rewinds the pipeline axis, leaving triage untouched.
+        let rewound = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(rewound.pipeline_state, BugPipelineState::Pending);
+        assert_eq!(rewound.lifecycle_status, BugLifecycleStatus::New);
+
         let locked_again = db
-            .lock_raw_bug()
+            .lock_pending_bug()
             .await
             .unwrap()
             .expect("should re-lock recovered bug");
         assert_eq!(locked_again.id, bug_id);
-        assert_eq!(locked_again.status, "processing");
+        assert_eq!(locked_again.pipeline_state, BugPipelineState::Running);
     }
 
     #[tokio::test]
@@ -11952,7 +12300,9 @@ mod tests {
         let new_bug = NewBug {
             bugid: "linux-syzbot-12345".to_string(),
             title: "KASAN: use-after-free Read in sock_close".to_string(),
-            status: "raw".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
             reporter: "syzbot".to_string(),
             reported_at: 1700000000,
             discovered_in_patchset_id: None,

@@ -3642,7 +3642,9 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .create_bug(&crate::db::NewBug {
                 bugid: "linux-deadbeef".to_string(),
                 title: " High UAF in cleanup".to_string(),
-                status: "raw".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::New,
+                pipeline_state: crate::db::BugPipelineState::Pending,
+                assignee: None,
                 reporter: "sashiko".to_string(),
                 reported_at: 1000,
                 discovered_in_patchset_id: Some(ps_id),

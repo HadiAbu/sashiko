@@ -202,7 +202,8 @@ impl std::fmt::Debug for BugOutcome {
                 .debug_struct("NewlyDiscovered")
                 .field("id", &bug.id)
                 .field("bugid", &bug.bugid)
-                .field("status", &bug.status)
+                .field("lifecycle_status", &bug.lifecycle_status)
+                .field("pipeline_state", &bug.pipeline_state)
                 .field("problem", &bug.problem())
                 .field("severity", &bug.severity())
                 .finish(),
@@ -1201,7 +1202,9 @@ pub async fn process_issue(
     let new_bug = NewBug {
         bugid: bugid.clone(),
         title: input.problem.clone(),
-        status: "raw".to_string(),
+        lifecycle_status: crate::db::BugLifecycleStatus::New,
+        pipeline_state: crate::db::BugPipelineState::Pending,
+        assignee: None,
         reporter: db.bug_actor().to_string(),
         reported_at: now,
         discovered_in_patchset_id: input.patchset_id,
@@ -1919,7 +1922,7 @@ pub async fn process_issue_worker(
         db.update_bug_outcome(
             bug_row.id,
             crate::db::UpdateBugOutcomeParams {
-                status: "dismissed",
+                lifecycle_status: crate::db::BugLifecycleStatus::Dismissed,
                 problem: Some(&norm.canonical_title),
                 subsystems: Some(&official_subsystems),
                 source_files: Some(&verified_files),
@@ -2112,7 +2115,7 @@ pub async fn process_issue_worker(
     db.update_bug_outcome(
         bug_row.id,
         crate::db::UpdateBugOutcomeParams {
-            status: "open",
+            lifecycle_status: crate::db::BugLifecycleStatus::Open,
             problem: Some(&norm.canonical_title),
             subsystems: Some(&official_subsystems),
             source_files: Some(&verified_files),
@@ -2283,7 +2286,10 @@ mod tests {
         }
 
         let bug = db.get_bug(1).await.unwrap().unwrap();
-        assert_eq!(bug.status, "dismissed");
+        assert_eq!(
+            bug.lifecycle_status,
+            crate::db::BugLifecycleStatus::Dismissed
+        );
         assert_eq!(bug.problem(), "net: dev: null dereference in dev_read()");
         assert_eq!(bug.subsystems, vec!["net".to_string()]);
         assert_eq!(bug.source_files(), Some(vec!["net/core/dev.c".to_string()]));
@@ -2462,7 +2468,10 @@ mod tests {
             id: 42,
             bugid: "linux-42".to_string(),
             title: "Memory leak in dev.c".to_string(),
-            status: "verified".to_string(),
+            lifecycle_status: crate::db::BugLifecycleStatus::Open,
+            pipeline_state: crate::db::BugPipelineState::Succeeded,
+            assignee: None,
+            assigned_at: None,
             reporter: "sashiko".to_string(),
             reported_at: 100,
             discovered_in_patchset_id: None,
@@ -2511,7 +2520,10 @@ mod tests {
             id: 42,
             bugid: "linux-42".to_string(),
             title: "Memory leak in dev.c".to_string(),
-            status: "verified".to_string(),
+            lifecycle_status: crate::db::BugLifecycleStatus::Open,
+            pipeline_state: crate::db::BugPipelineState::Succeeded,
+            assignee: None,
+            assigned_at: None,
             reporter: "sashiko".to_string(),
             reported_at: 100,
             discovered_in_patchset_id: None,
@@ -3017,7 +3029,9 @@ mod tests {
             .create_bug(&NewBug {
                 bugid: "linux-existing1".to_string(),
                 title: "e1000: buffer overflow in e1000_clean_rx_irq()".to_string(),
-                status: "open".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::Open,
+                pipeline_state: crate::db::BugPipelineState::Succeeded,
+                assignee: None,
                 reporter: "sashiko".to_string(),
                 reported_at: 1000,
                 discovered_in_patchset_id: None,

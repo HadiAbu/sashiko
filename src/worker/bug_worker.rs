@@ -24,11 +24,14 @@ impl BugWorker {
 
     pub async fn run(&self) {
         info!("Starting Bug Worker...");
-        if let Err(e) = self.db.recover_stale_processing_bugs().await {
-            error!("Failed to recover stale processing bugs on startup: {}", e);
+        if let Err(e) = self.db.recover_stale_running_bugs().await {
+            error!(
+                "Failed to requeue interrupted bug analyses on startup: {}",
+                e
+            );
         }
         loop {
-            match self.db.lock_raw_bug().await {
+            match self.db.lock_pending_bug().await {
                 Ok(Some(bug)) => {
                     let provider = self.provider.clone();
                     let db = self.db.clone();
@@ -85,18 +88,9 @@ impl BugWorker {
                                 info!("Successfully processed raw bug {}: {}", bug.id, outcome);
                             }
                             Err(e) => {
-                                error!("Failed to process raw bug {}: {}", bug.id, e);
+                                error!("Failed to process bug {}: {}", bug.id, e);
                                 let error_msg = format!("Error during async processing: {}", e);
-                                let _ = db
-                                    .update_bug_outcome(
-                                        bug.id,
-                                        crate::db::UpdateBugOutcomeParams {
-                                            status: "failed",
-                                            severity_explanation: Some(&error_msg),
-                                            ..Default::default()
-                                        },
-                                    )
-                                    .await;
+                                let _ = db.fail_bug_analysis(bug.id, &error_msg).await;
                             }
                         }
                     });

@@ -602,12 +602,15 @@
             color: var(--thought-color);
         }
 
+        /* Bug triage states (lifecycle_status) */
         .status-Dismissed,
-        .status-Duplicate {
+        .status-Duplicate,
+        .status-Closed {
             color: var(--text-dim);
             border-color: var(--border);
         }
 
+        .status-New,
         .status-Open {
             color: var(--status-pending);
         }
@@ -616,11 +619,13 @@
             color: var(--status-reviewed);
         }
 
-        .status-Raw {
+        /* Bug analysis states (pipeline_state) */
+        .status-Queued,
+        .status-Analyzing {
             color: var(--status-inreview);
         }
 
-        .status-Error {
+        .status-Abandoned {
             color: var(--status-failed);
         }
 
@@ -1522,7 +1527,8 @@
             bugSubsystemsList: [],
             selectedSubsystems: null,
             bugMinSeverity: '',
-            bugStatus: 'open',
+            bugLifecycleStatus: 'open',
+            bugPipelineState: '',
             bugSortBy: 'severity',
             bugSortOrder: 'desc',
             patchsetId: null,
@@ -2177,24 +2183,42 @@
             }
         }
 
+        // Triage states, keyed by lifecycle_status.
+        const BUG_LIFECYCLE_BADGES = {
+            'new': { label: 'New', cls: 'status-New', color: 'var(--status-pending)' },
+            'open': { label: 'Open', cls: 'status-Open', color: 'var(--status-pending)' },
+            'fixed': { label: 'Fixed', cls: 'status-Fixed', color: 'var(--status-reviewed)' },
+            'dismissed': { label: 'Dismissed', cls: 'status-Dismissed', color: 'var(--text-dim)' },
+            'duplicate': { label: 'Duplicate', cls: 'status-Duplicate', color: 'var(--thought-color)' },
+            'closed': { label: 'Closed', cls: 'status-Closed', color: 'var(--text-dim)' },
+        };
+
+        // Analysis states, keyed by pipeline_state. Only the states that say
+        // something the triage badge cannot are listed; 'succeeded' is silent
+        // because a finished analysis is the normal case.
+        const BUG_PIPELINE_BADGES = {
+            'pending': { label: 'Queued', cls: 'status-Queued', color: 'var(--status-inreview)' },
+            'running': { label: 'Analyzing', cls: 'status-Analyzing', color: 'var(--status-inreview)' },
+            'failed': { label: 'Failed', cls: 'status-Failed', color: 'var(--status-failed)' },
+            'abandoned': { label: 'Abandoned', cls: 'status-Abandoned', color: 'var(--status-failed)' },
+        };
+
+        // Picks the single badge that best describes a bug.
+        //
+        // While analysis is queued, running or broken, the pipeline state is
+        // what the reader needs to know, so it takes precedence. Once analysis
+        // has succeeded the pipeline state is uninteresting and the triage
+        // status is shown instead.
         function getBugStatus(bug) {
-            if (bug.is_fixed || (bug.status && bug.status.toLowerCase() === 'fixed')) {
-                return { label: 'Fixed', cls: 'status-Fixed', color: 'var(--status-reviewed)' };
+            const pipeline = BUG_PIPELINE_BADGES[(bug.pipeline_state || '').toLowerCase()];
+            if (pipeline) {
+                return pipeline;
             }
-            const rawStatus = (bug.status || 'open').toLowerCase();
-            if (rawStatus === 'error') {
-                return { label: 'Error', cls: 'status-Error', color: 'var(--status-failed)' };
+            if (bug.is_fixed) {
+                return BUG_LIFECYCLE_BADGES['fixed'];
             }
-            if (rawStatus === 'dismissed') {
-                return { label: 'Dismissed', cls: 'status-Dismissed', color: 'var(--text-dim)' };
-            }
-            if (rawStatus === 'duplicate') {
-                return { label: 'Duplicate', cls: 'status-Duplicate', color: 'var(--thought-color)' };
-            }
-            if (rawStatus === 'raw') {
-                return { label: 'Raw', cls: 'status-Raw', color: 'var(--status-inreview)' };
-            }
-            return { label: 'Open', cls: 'status-Open', color: 'var(--status-pending)' };
+            return BUG_LIFECYCLE_BADGES[(bug.lifecycle_status || '').toLowerCase()]
+                || BUG_LIFECYCLE_BADGES['open'];
         }
 
         function formatCommitRef(ref, includeTag = false) {
@@ -2622,12 +2646,22 @@
                             <option value="Medium" ${state.bugMinSeverity === 'Medium' ? 'selected' : ''}>Medium+</option>
                             <option value="Low" ${state.bugMinSeverity === 'Low' ? 'selected' : ''}>Low+</option>
                         </select>
-                        <select id="bugStatusSelector" onchange="setBugFilter('status', this.value)">
-                            <option value="" ${!state.bugStatus ? 'selected' : ''}>All Statuses</option>
-                            <option value="open" ${state.bugStatus === 'open' ? 'selected' : ''}>Open</option>
-                            <option value="duplicate" ${state.bugStatus === 'duplicate' ? 'selected' : ''}>Duplicate</option>
-                            <option value="dismissed" ${state.bugStatus === 'dismissed' ? 'selected' : ''}>Dismissed</option>
-                            <option value="fixed" ${state.bugStatus === 'fixed' ? 'selected' : ''}>Fixed</option>
+                        <select id="bugStatusSelector" onchange="setBugFilter('lifecycle_status', this.value)">
+                            <option value="" ${!state.bugLifecycleStatus ? 'selected' : ''}>All Statuses</option>
+                            <option value="new" ${state.bugLifecycleStatus === 'new' ? 'selected' : ''}>New</option>
+                            <option value="open" ${state.bugLifecycleStatus === 'open' ? 'selected' : ''}>Open</option>
+                            <option value="duplicate" ${state.bugLifecycleStatus === 'duplicate' ? 'selected' : ''}>Duplicate</option>
+                            <option value="dismissed" ${state.bugLifecycleStatus === 'dismissed' ? 'selected' : ''}>Dismissed</option>
+                            <option value="fixed" ${state.bugLifecycleStatus === 'fixed' ? 'selected' : ''}>Fixed</option>
+                            <option value="closed" ${state.bugLifecycleStatus === 'closed' ? 'selected' : ''}>Closed</option>
+                        </select>
+                        <select id="bugPipelineSelector" onchange="setBugFilter('pipeline_state', this.value)">
+                            <option value="" ${!state.bugPipelineState ? 'selected' : ''}>Any Analysis</option>
+                            <option value="pending" ${state.bugPipelineState === 'pending' ? 'selected' : ''}>Queued</option>
+                            <option value="running" ${state.bugPipelineState === 'running' ? 'selected' : ''}>Analyzing</option>
+                            <option value="succeeded" ${state.bugPipelineState === 'succeeded' ? 'selected' : ''}>Analyzed</option>
+                            <option value="failed" ${state.bugPipelineState === 'failed' ? 'selected' : ''}>Failed</option>
+                            <option value="abandoned" ${state.bugPipelineState === 'abandoned' ? 'selected' : ''}>Abandoned</option>
                         </select>
                     </div>
 
@@ -2735,8 +2769,11 @@
                 if (state.bugMinSeverity) {
                     url += `&min_severity=${encodeURIComponent(state.bugMinSeverity)}`;
                 }
-                if (state.bugStatus) {
-                    url += `&status=${encodeURIComponent(state.bugStatus)}`;
+                if (state.bugLifecycleStatus) {
+                    url += `&lifecycle_status=${encodeURIComponent(state.bugLifecycleStatus)}`;
+                }
+                if (state.bugPipelineState) {
+                    url += `&pipeline_state=${encodeURIComponent(state.bugPipelineState)}`;
                 }
                 if (state.bugSortBy) {
                     url += `&sort_by=${encodeURIComponent(state.bugSortBy)}`;
@@ -2988,8 +3025,8 @@
                 return;
             }
             try {
-                const status = state.bugStatus || 'open';
-                const res = await fetch(`/api/bugs/subsystems?status=${encodeURIComponent(status)}`);
+                const status = state.bugLifecycleStatus || 'open';
+                const res = await fetch(`/api/bugs/subsystems?lifecycle_status=${encodeURIComponent(status)}`);
                 if (res.ok) {
                     const data = await res.json();
                     // Skip entries with (0)
@@ -3100,11 +3137,14 @@
         function setBugFilter(key, value) {
             if (key === 'subsystem') state.bugSubsystem = value.trim();
             if (key === 'min_severity') state.bugMinSeverity = value;
-            if (key === 'status') {
-                state.bugStatus = value;
+            if (key === 'lifecycle_status') {
+                state.bugLifecycleStatus = value;
                 loadBugSubsystems(true).then(() => {
                     renderSubsystemDropdown();
                 });
+            }
+            if (key === 'pipeline_state') {
+                state.bugPipelineState = value;
             }
             state.currentPage = 1;
             fetchListData();
@@ -3116,7 +3156,8 @@
             if (state.listMode === 'bugs') {
                 state.bugSubsystem = '';
                 state.bugMinSeverity = '';
-                state.bugStatus = 'open';
+                state.bugLifecycleStatus = 'open';
+                state.bugPipelineState = '';
                 state.bugSortBy = 'severity';
                 state.bugSortOrder = 'desc';
                 if (state.bugSubsystemsList.length > 0) {
@@ -3129,6 +3170,8 @@
                 if (sevSel) sevSel.value = '';
                 const statSel = document.getElementById('bugStatusSelector');
                 if (statSel) statSel.value = 'open';
+                const pipeSel = document.getElementById('bugPipelineSelector');
+                if (pipeSel) pipeSel.value = '';
             }
             state.currentPage = 1;
             fetchListData();
@@ -3140,8 +3183,8 @@
             state.currentPage = 1;
 
             if (mode === 'bugs') {
-                if (!state.bugStatus) {
-                    state.bugStatus = 'open';
+                if (!state.bugLifecycleStatus) {
+                    state.bugLifecycleStatus = 'open';
                     const statSel = document.getElementById('bugStatusSelector');
                     if (statSel) statSel.value = 'open';
                 }
@@ -4155,9 +4198,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 <details class="subsystem-dropdown" id="bugStatusDropdown" style="position:relative; display:inline-block;">
                     <summary class="subsystem-dropdown-btn">Change Status ▾</summary>
                     <div class="subsystem-dropdown-menu" style="display:block; min-width:180px;">
-                        ${!['closed', 'fixed'].includes(data.status) ? `<div class="subsystem-item" onclick="openBugActionModal('close', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Close bug</div>` : ''}
-                        ${data.status !== 'dismissed' ? `<div class="subsystem-item" onclick="openBugActionModal('dismiss', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Dismiss finding</div>` : ''}
-                        ${data.status !== 'duplicate' ? `<div class="subsystem-item" onclick="openBugActionModal('mark_duplicate', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Mark as duplicate</div>` : ''}
+                        ${!['closed', 'fixed'].includes(data.lifecycle_status) ? `<div class="subsystem-item" onclick="openBugActionModal('close', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Close bug</div>` : ''}
+                        ${data.lifecycle_status !== 'dismissed' ? `<div class="subsystem-item" onclick="openBugActionModal('dismiss', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Dismiss finding</div>` : ''}
+                        ${data.lifecycle_status !== 'duplicate' ? `<div class="subsystem-item" onclick="openBugActionModal('mark_duplicate', '${id}'); document.getElementById('bugStatusDropdown')?.removeAttribute('open');">Mark as duplicate</div>` : ''}
                     </div>
                 </details>
             ` : `
@@ -4381,7 +4424,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         </div>
                         ${reportEvent ? `<div style="margin-top: 8px; text-align: right; font-size:0.9em;">${bugLogLinkHtml(reportEvent.bugid, reportEvent.id)}</div>` : ''}
                     ` : `
-                        <p class="status-placeholder">${data.status === 'raw' || data.status === 'processing' ? 'Analysis is in progress. The report will appear here when it is ready.' : 'No report has been recorded. Check the audit history or discoveries for available findings.'}</p>
+                        <p class="status-placeholder">${data.pipeline_state === 'pending' || data.pipeline_state === 'running' ? 'Analysis is in progress. The report will appear here when it is ready.' : 'No report has been recorded. Check the audit history or discoveries for available findings.'}</p>
                     `}
                 </div>
 
