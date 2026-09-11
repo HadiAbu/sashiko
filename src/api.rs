@@ -343,6 +343,7 @@ pub fn build_router(
         .route("/api/subsystems", get(list_bug_subsystems))
         .route("/api/bug/logs", get(get_bug_logs))
         .route("/api/bug/raw", get(get_bug_raw))
+        .route("/api/bug/input", get(get_bug_input))
         .route("/api/bug/enrichments", get(get_bug_enrichments))
         .route("/api/bug/analyze", post(analyze_bug))
         .route("/api/bug/action", post(bug_action))
@@ -1087,6 +1088,47 @@ async fn get_bug_raw(
     Ok(Json(
         serde_json::json!({ "bugid": bug.bugid, "records": records }),
     ))
+}
+
+/// Serves the payload the bug workflow was started with for a single bug.
+/// Duplicates keep their own candidate records, so each one resolves to the
+/// input that produced it rather than the canonical bug's input.
+async fn get_bug_input(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BugQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let bug = if let Some(id) = query.id {
+        state.db.get_bug(id).await
+    } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
+        state.db.get_bug_by_bugid(bugid).await
+    } else {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let inputs: Vec<serde_json::Value> = bug
+        .enrichments
+        .iter()
+        .filter(|e| e.kind == "candidate" || e.kind == "raw_candidate")
+        .map(|e| {
+            serde_json::json!({
+                "enrichment_id": e.id,
+                "created_at": e.created_at,
+                "author": e.author,
+                "tool": e.tool,
+                "model": e.model,
+                "input": e.data_json,
+                "content": e.content,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "bugid": bug.bugid,
+        "title": bug.title,
+        "inputs": inputs,
+    })))
 }
 
 async fn get_bug_enrichments(
@@ -1982,6 +2024,129 @@ mod tests {
         let id = generate_synthetic_id("test");
         assert!(id.starts_with("sashiko-test-"));
         assert!(id.ends_with("@sashiko.local"));
+    }
+
+    #[tokio::test]
+    async fn test_bug_input_endpoint_serves_per_bug_payload() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let make_bug = |bugid: &str, title: &str| crate::db::NewBug {
+            bugid: bugid.to_string(),
+            title: title.to_string(),
+            status: "raw".to_string(),
+            reporter: "sashiko".to_string(),
+            reported_at: 100,
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![],
+        };
+
+        let canonical = db
+            .create_bug_with_enrichment(
+                &make_bug("linux-canonical", "UAF in canonical path"),
+                Some(&crate::db::NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "sashiko:linux_patch_review".to_string(),
+                    model: Some("test-model".to_string()),
+                    created_at: 100,
+                    content: Some("canonical reasoning".to_string()),
+                    data_json: Some(serde_json::json!({"problem": "canonical problem"})),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let duplicate = db
+            .create_bug_with_enrichment(
+                &make_bug("linux-duplicate", "UAF spotted again"),
+                Some(&crate::db::NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: "sashiko:linux_patch_review".to_string(),
+                    model: Some("test-model".to_string()),
+                    created_at: 200,
+                    content: Some("duplicate reasoning".to_string()),
+                    data_json: Some(serde_json::json!({"problem": "duplicate problem"})),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        db.mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
+            ephemeral_id: duplicate,
+            canonical_id: canonical,
+            reasoning: "same defect",
+            logs: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_cached: None,
+        })
+        .await
+        .unwrap();
+
+        let settings = Arc::new(crate::settings::Settings::new().unwrap());
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings,
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            false,
+            false,
+            false,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let canonical_input: serde_json::Value = reqwest::get(format!(
+            "http://{}/api/bug/input?bugid=linux-canonical",
+            addr
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(canonical_input["bugid"], "linux-canonical");
+        let inputs = canonical_input["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0]["input"]["problem"], "canonical problem");
+
+        // A duplicate resolves to the payload that produced it, not to the
+        // canonical bug's payload.
+        let duplicate_input: serde_json::Value =
+            reqwest::get(format!("http://{}/api/bug/input?id={}", addr, duplicate))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let inputs = duplicate_input["inputs"].as_array().unwrap();
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0]["input"]["problem"], "duplicate problem");
+        assert_eq!(inputs[0]["model"], "test-model");
+
+        let missing = reqwest::get(format!("http://{}/api/bug/input?id=999999", addr))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
     }
 
     #[tokio::test]
