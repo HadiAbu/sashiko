@@ -4446,8 +4446,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             }
             stages.sort((a, b) => (a.record.created_at || 0) - (b.record.created_at || 0));
 
+            // tokens_in counts the cached prefix, so subtract it here to keep
+            // the input and cached figures from reporting the same tokens
+            // twice, the same way the review cards report them.
+            const uncachedTokensIn = (record) => Math.max(0, (record.tokens_in || 0) - (record.tokens_cached || 0));
+
             const totals = stages.reduce((acc, s) => ({
-                in: acc.in + (s.record.tokens_in || 0),
+                in: acc.in + uncachedTokensIn(s.record),
                 out: acc.out + (s.record.tokens_out || 0),
                 cached: acc.cached + (s.record.tokens_cached || 0),
             }), { in: 0, out: 0, cached: 0 });
@@ -4455,7 +4460,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const stagesHtml = stages.map(({ record: e, bugid: stageBugid, entries }) => {
                 const tokensHtml = (e.tokens_in || e.tokens_out || e.tokens_cached) ? `
                             <div class="review-meta-label">Tokens:</div>
-                            <div>In ${formatTokenCount(e.tokens_in)} &middot; Out ${formatTokenCount(e.tokens_out)} &middot; Cached ${formatTokenCount(e.tokens_cached)}</div>
+                            <div>In ${formatTokenCount(uncachedTokensIn(e))} &middot; Out ${formatTokenCount(e.tokens_out)} &middot; Cached ${formatTokenCount(e.tokens_cached)}</div>
                 ` : '';
                 return `
                 <div class="review-card" id="bug-event-${Number(e.id)}" style="margin-bottom: 16px;">
