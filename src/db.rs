@@ -690,6 +690,32 @@ fn default_now() -> i64 {
 /// The deduplication embedding is intentionally absent: it lives in
 /// bug_vectors and is only fetched by the dedup path, so ordinary reads
 /// never carry the blob.
+/// Renders the summary of a bug as it appears embedded in a patchset or review
+/// payload.
+///
+/// Shared by both callers so that the two views cannot drift apart. Both
+/// previously omitted the bug's state entirely, which left the badge on the
+/// patchset detail card permanently reading Open regardless of the bug's
+/// actual triage or analysis state.
+fn bug_reference_json(bug: &Bug, is_newly_discovered: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": bug.id,
+        "bugid": bug.bugid,
+        "slug": bug.bugid,
+        "problem": bug.problem(),
+        "severity": bug.severity().as_str(),
+        "subsystems": bug.subsystems,
+        "subsystem": bug.subsystems.first().cloned(),
+        "inline_review": bug.inline_review(),
+        "is_newly_discovered": is_newly_discovered,
+        "created_at": bug.created_at,
+        "lifecycle_status": bug.lifecycle_status.as_str(),
+        "pipeline_state": bug.pipeline_state.as_str(),
+        "is_fixed": bug.is_fixed(),
+        "assignee": bug.assignee,
+    })
+}
+
 const BUG_ROW_COLUMNS: &str = "id, bugid, title, lifecycle_status, pipeline_state,
      reporter, reported_at, assignee, assigned_at,
      discovered_in_patchset_id, discovered_in_patch_id, discovered_in_commit,
@@ -5069,20 +5095,7 @@ impl Database {
             let bugs = self.list_bugs_for_patchset(pid).await.unwrap_or_default();
             let bugs_json = bugs
                 .into_iter()
-                .map(|(bug, is_new)| {
-                    serde_json::json!({
-                        "id": bug.id,
-                        "bugid": bug.bugid,
-                        "slug": bug.bugid,
-                        "problem": bug.problem(),
-                        "severity": bug.severity().as_str(),
-                        "subsystems": bug.subsystems,
-                        "subsystem": bug.subsystems.first().cloned(),
-                        "inline_review": bug.inline_review(),
-                        "is_newly_discovered": is_new,
-                        "created_at": bug.created_at,
-                    })
-                })
+                .map(|(bug, is_new)| bug_reference_json(&bug, is_new))
                 .collect::<Vec<_>>();
 
             Ok(Some(serde_json::json!({
@@ -5462,20 +5475,7 @@ impl Database {
             let bugs = self.list_bugs_for_review(id).await.unwrap_or_default();
             let bugs_json = bugs
                 .into_iter()
-                .map(|(bug, is_new)| {
-                    serde_json::json!({
-                        "id": bug.id,
-                        "bugid": bug.bugid,
-                        "slug": bug.bugid,
-                        "problem": bug.problem(),
-                        "severity": bug.severity().as_str(),
-                        "subsystems": bug.subsystems,
-                        "subsystem": bug.subsystems.first().cloned(),
-                        "inline_review": bug.inline_review(),
-                        "is_newly_discovered": is_new,
-                        "created_at": bug.created_at,
-                    })
-                })
+                .map(|(bug, is_new)| bug_reference_json(&bug, is_new))
                 .collect::<Vec<_>>();
 
             Ok(Some(serde_json::json!({
