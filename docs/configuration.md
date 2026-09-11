@@ -201,6 +201,16 @@ pass.
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
 
+### `[linux_bug]`
+
+Tuning for the worker that analyses Linux kernel bugs. Both keys are
+optional; omitting the whole section uses the defaults below.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `lease_ttl_seconds` | integer | `1800` | How long a worker's claim on a bug stays valid. If the worker dies, the bug becomes claimable again once this elapses. Must exceed the longest expected analysis, or a slow run will be reclaimed and analysed twice in parallel. |
+| `max_attempts` | integer | `3` | How many analysis attempts a bug gets before it is abandoned. Abandoned bugs are never retried automatically. |
+
 ### `[subsystems]`
 
 Controls how patches and emails are categorized into subsystems for targeted reviews and specific email policies. By default, this section is empty, meaning the system relies on fallback heuristics (like identifying `@vger.kernel.org` addresses) to determine subsystems.
