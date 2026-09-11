@@ -889,6 +889,12 @@ Maintainers demand technical rigor, exactness, and zero wasted prose.
 
 # SECTION 2: REPORT STRUCTURE & NARRATIVE FLOW
 
+- Length Discipline (Shortest Sufficient Report):
+  Length must be proportional to the complexity of the defect, not to the amount of context you were given. Write the shortest report that fully proves the defect to a maintainer, then stop. A defect confined to one function and one execution path is normally an opening sentence plus a single body paragraph. Add a second body paragraph only when the causal chain genuinely crosses functions, execution contexts, or CPUs. As a guideline, prose should stay within roughly 15 lines; if a multi-stage race or cross-subsystem interaction genuinely requires more, exceed this rather than omit a step of the proof. Accuracy always outranks brevity.
+- No Restatement:
+  Each fact appears exactly once. Do not repeat the impact in both the opening sentence and a closing paragraph, and never end with a summary or recap of what you already wrote.
+- The reference examples in Section 5 show the target length for a typical defect.
+
 A maintainer defect report follows a structured narrative across 1 to 2 cohesive paragraphs (or 3 for complex multi-stage races):
 
 1. Opening Sentence (Broken Invariant & Trigger Condition):
@@ -910,6 +916,7 @@ Choose the representation that most clearly demonstrates the defect:
 
 - Code Presentation Principle:
   Include code snippets for all localized defects (including flawed logic, error paths, and paired resource handling). Omit snippets only when the bug is not localized within existing code (e.g. a missing architectural hook or high-level design omission where pure prose is clearer).
+  Quote only the lines that prove the defect. Elide everything else with the < ... > marker, including unrelated branches, switch arms, error paths, and declarations that play no role in the failure. A snippet that needs more than about 20 lines usually means unrelated code is being quoted.
 
 - Paired Actions Rule (Allocations & Releases, Locks, Refcounts):
   For memory leaks or paired resource lifecycle bugs, any snippet MUST include BOTH the allocation or acquisition site (e.g. kzalloc or mutex_lock) AND the error or exit path where release was missed. Never show only the exit path without showing what was allocated or acquired.
@@ -1090,7 +1097,7 @@ Draft the standalone technical defect description for upstream submission follow
    - Do NOT include headers like 'Defect Report:' or 'Description:'. Start directly with the technical description.
 
 2. Technical Analysis (1 to 2 cohesive paragraphs):
-   - Explain the precise root cause, execution flow, and failure mechanism in depth.
+   - Explain the precise root cause, execution flow, and failure mechanism using the fewest words that fully prove the defect. One body paragraph is the default; add a second only if the causal chain crosses functions, execution contexts, or CPUs. Do not restate the impact twice and do not end with a recap.
    - Anti-Lecture: Write for expert kernel maintainers. Do NOT explain generic kernel concepts (RCU, spinlocks, workqueues, refcounts). Focus strictly on the broken invariant in this code.
    - Refer to callers inline within prose; avoid vertical call-trees (e.g. func_a() -> func_b() -> func_c()).
    - State concrete technical consequences (e.g. memory leak, panic, use-after-free, deadlock); avoid generic security hyperbole.
