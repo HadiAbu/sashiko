@@ -36,6 +36,79 @@ use crate::ai::{AiProvider, AiResponse, AiResponseFormat, AiTool};
 use crate::db::{Bug, Database, NewBug, Severity};
 use crate::toolbox::ToolBox;
 
+/// Named stages of the Linux kernel bug pipeline, in execution order.
+///
+/// Every stage announces itself at the top of its first user prompt, so the
+/// stored interaction log shows exactly where each stage begins and ends, the
+/// same way the patch review pipeline labels its stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BugStage {
+    Normalization,
+    Verification,
+    Deduplication,
+    OriginTracing,
+    SeverityAssessment,
+    ReportGeneration,
+}
+
+impl BugStage {
+    /// Every stage in execution order.
+    pub const ALL: [BugStage; 6] = [
+        BugStage::Normalization,
+        BugStage::Verification,
+        BugStage::Deduplication,
+        BugStage::OriginTracing,
+        BugStage::SeverityAssessment,
+        BugStage::ReportGeneration,
+    ];
+
+    /// Position of the stage in the pipeline, starting at 1.
+    pub const fn number(self) -> u8 {
+        match self {
+            BugStage::Normalization => 1,
+            BugStage::Verification => 2,
+            BugStage::Deduplication => 3,
+            BugStage::OriginTracing => 4,
+            BugStage::SeverityAssessment => 5,
+            BugStage::ReportGeneration => 6,
+        }
+    }
+
+    /// Stable machine-readable identifier used to build enrichment kinds.
+    pub const fn id(self) -> &'static str {
+        match self {
+            BugStage::Normalization => "normalization",
+            BugStage::Verification => "verification",
+            BugStage::Deduplication => "deduplication",
+            BugStage::OriginTracing => "origin_tracing",
+            BugStage::SeverityAssessment => "severity_assessment",
+            BugStage::ReportGeneration => "report_generation",
+        }
+    }
+
+    /// Human-readable stage name shown in the interface.
+    pub const fn title(self) -> &'static str {
+        match self {
+            BugStage::Normalization => "Normalization",
+            BugStage::Verification => "Verification",
+            BugStage::Deduplication => "Deduplication",
+            BugStage::OriginTracing => "Origin tracing",
+            BugStage::SeverityAssessment => "Severity assessment",
+            BugStage::ReportGeneration => "Report generation",
+        }
+    }
+
+    /// Heading that opens the stage in the interaction log.
+    pub fn heading(self) -> String {
+        format!("# Stage {}. {}", self.number(), self.title())
+    }
+
+    /// Enrichment kind under which the stage interactions are persisted.
+    pub fn enrichment_kind(self) -> String {
+        format!("{}_run", self.id())
+    }
+}
+
 /// Input payload representing a candidate Linux kernel defect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BugInput {
@@ -227,7 +300,9 @@ impl LlmSession for VerifySession<'_> {
         };
 
         format!(
-            "Candidate Defect to Verify:
+            "{stage_heading}
+
+Candidate Defect to Verify:
 Title: {title}
 Subsystem: {subsystem}
 {files_str}Description:
@@ -252,6 +327,7 @@ Return ONLY a valid JSON object matching this schema:
   \"impact_severity\": \"High\",
   \"relevant_code_locations\": [ {{\"file\": \"path/to/file.c\", \"function_or_symbol\": \"function_name\", \"line\": 123}} ]
 }}",
+            stage_heading = BugStage::Verification.heading(),
             master_sha = self.master_sha,
             title = self.title,
             subsystem = self.subsystem,
@@ -327,7 +403,9 @@ impl LlmSession for NormalizeSession<'_> {
             .unwrap_or_default();
 
         format!(
-            "Candidate Bug Details:
+            "{stage_heading}
+
+Candidate Bug Details:
 Original Problem: {problem}
 Reasoning: {reasoning}
 Reported Locations:
@@ -353,6 +431,7 @@ Return ONLY a valid JSON object matching this schema:
   \"affected_source_files\": [\"fs/btrfs/ordered-data.c\"],
   \"affected_symbols\": [\"btrfs_cleanup_ordered_extents\"]
 }}",
+            stage_heading = BugStage::Normalization.heading(),
             problem = self.problem,
             reasoning = self.reasoning,
             locations = self.locations,
@@ -542,12 +621,13 @@ impl LlmSession for DedupSession<'_> {
         };
 
         format!(
-            "Newly Verified Linux Kernel Bug:\n\
-            Problem: {}\n\
-            Subsystems: {}\n\
-            Locations:\n{}\n\n\
+            "{stage_heading}\n\n\
+            Newly Verified Linux Kernel Bug:\n\
+            Problem: {problem}\n\
+            Subsystems: {subsystems}\n\
+            Locations:\n{locations}\n\n\
             Candidate Known Bugs in Database:\n\
-            {}\n\
+            {known_bugs}\n\
             Task:\n\
             Determine if the newly verified bug is an identical duplicate of ANY of the candidate bugs listed above.\n\
             - Root cause matching: Bugs that have the same root cause but different consequences (e.g. wrong synchronization leads to a data race which might look like a memory leak or use-after-free crash) should be considered a duplicate and be merged.\n\
@@ -560,7 +640,11 @@ impl LlmSession for DedupSession<'_> {
               \"duplicate_of_id\": 12,\n\
               \"reasoning\": \"Both describe the same missing unlock in foo_cleanup()\"\n\
             }}",
-            self.candidate_problem, cand_subs, loc_str, known_list
+            stage_heading = BugStage::Deduplication.heading(),
+            problem = self.candidate_problem,
+            subsystems = cand_subs,
+            locations = loc_str,
+            known_bugs = known_list,
         )
     }
 
@@ -625,7 +709,9 @@ impl LlmSession for TracingSession<'_> {
 
     fn initial_user_prompt(&self) -> String {
         format!(
-            "Verified Vulnerability:
+            "{stage_heading}
+
+Verified Vulnerability:
 Problem: {problem}
 Reasoning: {reasoning}
 Verification Evidence: {ver_reasoning}
@@ -639,6 +725,7 @@ Return ONLY a valid JSON object matching this schema:
 {{
   \"introducing_commit_sha\": \"abc123456789012345678901234567890123456789\"
 }}",
+            stage_heading = BugStage::OriginTracing.heading(),
             master_sha = self.master_sha,
             problem = self.input.problem,
             reasoning = self.input.reasoning,
@@ -723,7 +810,9 @@ impl LlmSession for SeveritySession<'_> {
 
     fn initial_user_prompt(&self) -> String {
         format!(
-            "Verified Linux Kernel Defect:
+            "{stage_heading}
+
+Verified Linux Kernel Defect:
 Title: {title}
 Description:
 {description}
@@ -739,6 +828,7 @@ Return ONLY a valid JSON object matching:
   \"severity\": \"Low\" | \"Medium\" | \"High\" | \"Critical\" | \"Unknown\",
   \"severity_explanation\": \"Explain consequence, triggering path, reachability, attack prerequisites, required privileges, and blast radius...\"
 }}",
+            stage_heading = BugStage::SeverityAssessment.heading(),
             title = self.canonical_title,
             description = self.canonical_description,
             locations = self.locations,
@@ -977,7 +1067,9 @@ unresolvable AB-BA deadlock.
         };
 
         format!(
-            "Linux Kernel Defect Details:
+            "{stage_heading}
+
+Linux Kernel Defect Details:
 Title: {problem}
 Severity: {severity}
 Description:
@@ -1018,6 +1110,7 @@ Draft the standalone technical defect description for upstream submission follow
    - Raw plain text only: no markdown fences (```), no quote marks ('>'), no backticks (`).
    - For function names, ALWAYS use func() format.
    - Hard-wrap all prose and comment lines at 75 characters per line (LKML standard: 72-75 columns).",
+            stage_heading = BugStage::ReportGeneration.heading(),
             problem = self.problem,
             severity = self.severity,
             description = self.canonical_description,
@@ -1587,14 +1680,19 @@ pub async fn prefetch_bug_locations(
 async fn record_bug_stage<T>(
     db: &Database,
     bug_id: i64,
-    stage: &str,
+    stage: BugStage,
     result: &crate::ai::session::SessionResult<T>,
 ) -> Result<()> {
     db.add_bug_enrichment(
         bug_id,
         &crate::db::NewBugEnrichment {
-            kind: format!("{}_run", stage),
-            content: Some(format!("{} completed", stage.replace('_', " "))),
+            kind: stage.enrichment_kind(),
+            content: Some(format!("{} completed", stage.title())),
+            data_json: Some(serde_json::json!({
+                "stage_number": stage.number(),
+                "stage_id": stage.id(),
+                "stage_title": stage.title(),
+            })),
             logs: Some(serde_json::to_string(&result.history)?),
             tokens_in: Some(result.usage.prompt_tokens),
             tokens_out: Some(result.usage.completion_tokens),
@@ -1716,7 +1814,7 @@ pub async fn process_issue_worker(
     };
 
     let norm_result = runner.run(&mut norm_session).await?;
-    record_bug_stage(db, bug_row.id, "normalization", &norm_result).await?;
+    record_bug_stage(db, bug_row.id, BugStage::Normalization, &norm_result).await?;
     full_history.extend(norm_result.history);
 
     let norm = norm_result.output;
@@ -1796,7 +1894,7 @@ pub async fn process_issue_worker(
     };
 
     let verify_result = runner.run(&mut verify_session).await?;
-    record_bug_stage(db, bug_row.id, "verification", &verify_result).await?;
+    record_bug_stage(db, bug_row.id, BugStage::Verification, &verify_result).await?;
     full_history.extend(verify_result.history);
 
     let verification = verify_result.output;
@@ -1880,7 +1978,7 @@ pub async fn process_issue_worker(
             };
 
             let dedup_result = runner.run(&mut dedup_session).await?;
-            record_bug_stage(db, bug_row.id, "deduplication", &dedup_result).await?;
+            record_bug_stage(db, bug_row.id, BugStage::Deduplication, &dedup_result).await?;
             full_history.extend(dedup_result.history);
 
             let dedup = dedup_result.output;
@@ -1942,7 +2040,7 @@ pub async fn process_issue_worker(
         context_tag: context_tag.map(|s| s.to_string()),
     };
     let tracing_result = tracing_runner.run(&mut tracing_session).await?;
-    record_bug_stage(db, bug_row.id, "origin_tracing", &tracing_result).await?;
+    record_bug_stage(db, bug_row.id, BugStage::OriginTracing, &tracing_result).await?;
     full_history.extend(tracing_result.history);
 
     let introducing_commit_sha = match tracing_result.output.introducing_commit_sha {
@@ -1962,7 +2060,13 @@ pub async fn process_issue_worker(
         context_tag: context_tag.map(|s| s.to_string()),
     };
     let severity_result = runner.run(&mut severity_session).await?;
-    record_bug_stage(db, bug_row.id, "severity_assessment", &severity_result).await?;
+    record_bug_stage(
+        db,
+        bug_row.id,
+        BugStage::SeverityAssessment,
+        &severity_result,
+    )
+    .await?;
     full_history.extend(severity_result.history);
 
     let severity_output = severity_result.output;
@@ -1990,7 +2094,7 @@ pub async fn process_issue_worker(
         prefetched_context: effective_prefetched,
     };
     let report_result = runner.run(&mut report_session).await?;
-    record_bug_stage(db, bug_row.id, "report_generation", &report_result).await?;
+    record_bug_stage(db, bug_row.id, BugStage::ReportGeneration, &report_result).await?;
     full_history.extend(report_result.history);
 
     let inline_review = report_result.output;
@@ -2573,6 +2677,129 @@ mod tests {
         let runner = SessionRunner::new(&mock_provider);
         let res = runner.run(&mut session).await.unwrap();
         assert!(res.output.contains("int *ptr = alloc();"));
+    }
+
+    #[test]
+    fn test_bug_stages_are_numbered_and_named() {
+        for (index, stage) in BugStage::ALL.iter().enumerate() {
+            assert_eq!(stage.number() as usize, index + 1, "{stage:?}");
+            assert_eq!(
+                stage.heading(),
+                format!("# Stage {}. {}", stage.number(), stage.title())
+            );
+            assert_eq!(stage.enrichment_kind(), format!("{}_run", stage.id()));
+        }
+        let ids: std::collections::BTreeSet<&str> = BugStage::ALL.iter().map(|s| s.id()).collect();
+        assert_eq!(ids.len(), BugStage::ALL.len());
+        assert_eq!(
+            BugStage::ReportGeneration.heading(),
+            "# Stage 6. Report generation"
+        );
+    }
+
+    #[test]
+    fn test_stage_prompts_open_with_their_stage_heading() {
+        let input = BugInput {
+            problem: "UAF in foo()".to_string(),
+            reasoning: "Freed then used".to_string(),
+            locations: None,
+            subsystems: vec!["net".to_string()],
+            source_files: vec!["net/foo.c".to_string()],
+            commit_sha: None,
+            patchset_id: None,
+            patch_id: None,
+            baseline_sha: None,
+        };
+        let no_files: Vec<String> = Vec::new();
+
+        let prompts: Vec<(BugStage, String)> = vec![
+            (
+                BugStage::Normalization,
+                NormalizeSession {
+                    problem: &input.problem,
+                    reasoning: &input.reasoning,
+                    locations: "[]",
+                    master_sha: "abc123",
+                    maintainers_hint: None,
+                    tools: None,
+                    context_tag: None,
+                }
+                .initial_user_prompt(),
+            ),
+            (
+                BugStage::Verification,
+                VerifySession {
+                    title: &input.problem,
+                    description: &input.reasoning,
+                    subsystem: "net",
+                    affected_files: &no_files,
+                    locations: None,
+                    master_sha: "abc123".to_string(),
+                    tools: None,
+                    context_tag: None,
+                    prefetched_context: String::new(),
+                }
+                .initial_user_prompt(),
+            ),
+            (
+                BugStage::Deduplication,
+                DedupSession {
+                    candidate_problem: &input.problem,
+                    candidate_locations: None,
+                    candidate_subsystems: &input.subsystems,
+                    known_candidates: &[],
+                    context_tag: None,
+                }
+                .initial_user_prompt(),
+            ),
+            (
+                BugStage::OriginTracing,
+                TracingSession {
+                    input: &input,
+                    master_sha: "abc123".to_string(),
+                    verification_reasoning: "verified".to_string(),
+                    relevant_locations: "[]".to_string(),
+                    tools: None,
+                    context_tag: None,
+                }
+                .initial_user_prompt(),
+            ),
+            (
+                BugStage::SeverityAssessment,
+                SeveritySession {
+                    canonical_title: &input.problem,
+                    canonical_description: &input.reasoning,
+                    locations: "[]",
+                    context_tag: None,
+                }
+                .initial_user_prompt(),
+            ),
+            (
+                BugStage::ReportGeneration,
+                ReportSession {
+                    problem: &input.problem,
+                    severity: "High",
+                    canonical_description: &input.reasoning,
+                    severity_explanation: "reachable",
+                    locations: None,
+                    introduced_in_commit: None,
+                    tools: None,
+                    context_tag: None,
+                    prefetched_context: String::new(),
+                }
+                .initial_user_prompt(),
+            ),
+        ];
+
+        assert_eq!(prompts.len(), BugStage::ALL.len());
+        for (stage, prompt) in prompts {
+            assert!(
+                prompt.starts_with(&stage.heading()),
+                "{:?} prompt must open with its heading, got: {}",
+                stage,
+                prompt.chars().take(80).collect::<String>()
+            );
+        }
     }
 
     #[tokio::test]
