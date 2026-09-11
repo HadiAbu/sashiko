@@ -1674,6 +1674,26 @@ impl Database {
         let mut models = std::collections::BTreeSet::new();
         let mut tools = std::collections::BTreeSet::new();
         let mut unknown_models = 0;
+
+        // Interaction logs are deliberately not loaded with the family, so ask
+        // the table which records carry one before assembling the events.
+        let family_ids: Vec<i64> = family.iter().map(|b| b.id).collect();
+        let mut logged_records = std::collections::HashSet::<i64>::new();
+        if !family_ids.is_empty() {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM bug_enrichments
+                     WHERE bug_id IN (SELECT value FROM json_each(?))
+                       AND logs IS NOT NULL AND length(logs) > 0",
+                    libsql::params![serde_json::to_string(&family_ids)?],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                logged_records.insert(row.get(0)?);
+            }
+        }
+
         for bug in &family {
             let candidates: Vec<_> = bug
                 .enrichments
@@ -1759,6 +1779,9 @@ impl Database {
             for enrichment in &bug.enrichments {
                 let mut event = serde_json::to_value(enrichment)?;
                 event["bugid"] = json!(bug.bugid);
+                // The interaction log itself stays behind the raw endpoint, but
+                // callers need to know whether one exists to offer a link to it.
+                event["has_logs"] = json!(logged_records.contains(&enrichment.id));
                 // Payloads and token accounting are only exposed by the raw endpoint.
                 // BugEnrichment serializes as a JSON object.
                 let obj = event
@@ -1893,6 +1916,12 @@ impl Database {
                 author
             };
 
+            // Only discoveries that stored the payload handed to the workflow
+            // can offer a raw input view.
+            let has_input = raw
+                .record
+                .is_some_and(|e| e.data_json.is_some() || e.content.is_some());
+
             discoveries.push(json!({
                 "bug_id": raw.bug_id,
                 "bugid": raw.bugid,
@@ -1905,6 +1934,7 @@ impl Database {
                 "patch_id": raw.patch_id,
                 "patch_part": patch_part,
                 "commit": raw.commit,
+                "has_input": has_input,
                 "legacy": raw.record.is_none()
             }));
         }
@@ -6060,6 +6090,15 @@ mod tests {
         assert_eq!(summary["count"], 1);
         assert_eq!(summary["unknown_models"], 1);
         assert_eq!(summary["tools"], json!(["legacy-tool"]));
+        assert_eq!(summary["discoveries"][0]["has_input"], json!(true));
+        let candidate_event = summary["activity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "candidate")
+            .unwrap();
+        assert_eq!(candidate_event["has_logs"], json!(true));
+        assert!(candidate_event.get("logs").is_none());
         let scoped = db.with_bug_actor("new author", "web", None);
         scoped
             .change_bug_status_with_reason(1, "closed", Some("Now fixed"))
