@@ -1940,6 +1940,10 @@
             if (bugLogMatch) {
                 return { view: 'bug_log', id: decodeURIComponent(bugLogMatch[1]), query };
             }
+            const bugInputMatch = hash.match(/^#\/(?:bug|preexisting-bug)\/(.+)\/input$/);
+            if (bugInputMatch) {
+                return { view: 'bug_input', id: decodeURIComponent(bugInputMatch[1]), query };
+            }
             const bugMatch = hash.match(/^#\/(?:bug|preexisting-bug)\/(.+)$/);
             if (bugMatch) {
                 return { view: 'bug', id: decodeURIComponent(bugMatch[1]), query };
@@ -2036,6 +2040,9 @@
                         break;
                     case 'bug_log':
                         await renderBugLogView(route.id);
+                        break;
+                    case 'bug_input':
+                        await renderBugInputView(route.id);
                         break;
                     case 'message':
                         await renderMessageView(route.id);
@@ -3961,10 +3968,22 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             return `#/bug/${encodeURIComponent(bugid)}/log${eventId ? `?event=${encodeURIComponent(eventId)}` : ''}`;
         }
 
+        function bugInputLink(bugid) {
+            return `#/bug/${encodeURIComponent(bugid)}/input`;
+        }
+
         // Matches the "View Raw Log" affordance used by patch reviews so raw
         // records are reached the same way everywhere in the UI.
-        function bugLogLinkHtml(bugid, eventId, label = 'View Raw Log') {
-            return `<a href="${bugLogLink(bugid, eventId)}" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${escapeHtml(label)}</a>`;
+        function rawRecordLinkHtml(href, label) {
+            return `<a href="${href}" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${escapeHtml(label)}</a>`;
+        }
+
+        function bugLogLinkHtml(bugid, eventId, label = 'View Workflow Log') {
+            return rawRecordLinkHtml(bugLogLink(bugid, eventId), label);
+        }
+
+        function bugInputLinkHtml(bugid, label = 'View Raw Input') {
+            return rawRecordLinkHtml(bugInputLink(bugid), label);
         }
 
         function bugAttribution(record) {
@@ -4052,7 +4071,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         <div class="review-meta-label">Source:</div>
                         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                             <span>${sourceHtml}${d.legacy ? ' <span class="text-muted-sm">· Historical report; discovery metadata incomplete</span>' : ''}</span>
-                            <span style="font-size:0.9em;">${bugLogLinkHtml(d.bugid, d.enrichment_id)}</span>
+                            <span style="font-size:0.9em;">${d.has_input ? bugInputLinkHtml(d.bugid) : ''}</span>
                         </div>
                     </div>
                 </div>
@@ -4077,10 +4096,18 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 } else if (e.kind === 'report' || e.kind === 'candidate' || e.kind === 'discovery' || e.kind === 'raw_candidate') {
                     // Exclude primary report and raw discovery candidates from enrichment tabs
                     continue;
+                } else if (e.kind && e.kind.endsWith('_run')) {
+                    // Workflow stage records only carry interaction logs, which
+                    // the workflow log page presents.
+                    continue;
                 } else {
                     analysis.push(e);
                 }
             }
+
+            // The report record carries the interaction log of the run that
+            // produced the description shown in the first tab.
+            const reportEvent = activity.find(e => e.kind === 'report' && e.has_logs);
 
             const sortedComments = [...comments].sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
 
@@ -4153,9 +4180,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                 <div>${bugAttribution(c)}</div>
                             </div>
                             ${c.content ? `<div class="log-inline-block" style="margin-top: 8px;">${escapeHtml(c.content, true, false)}</div>` : ''}
-                            <div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                            ${c.has_logs ? `<div style="margin-top: 8px; text-align: right; font-size:0.9em;">
                                 ${bugLogLinkHtml(c.bugid, c.id)}
-                            </div>
+                            </div>` : ''}
                         </div>
                     `).join('')}
                     ${canAct ? `
@@ -4191,9 +4218,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                     <div class="log-inline-block">${escapeHtml(f.content, true, false)}</div>
                                 </div>
                             ` : ''}
-                            <div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                            ${f.has_logs ? `<div style="margin-top: 8px; text-align: right; font-size:0.9em;">
                                 ${bugLogLinkHtml(f.bugid, f.id)}
-                            </div>
+                            </div>` : ''}
                         </div>
                         `;
                     }).join('')}
@@ -4225,9 +4252,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                     <div class="log-inline-block" style="font-family: monospace;">${escapeHtml(r.content, true, false)}</div>
                                 </div>
                             ` : ''}
-                            <div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                            ${r.has_logs ? `<div style="margin-top: 8px; text-align: right; font-size:0.9em;">
                                 ${bugLogLinkHtml(r.bugid, r.id)}
-                            </div>
+                            </div>` : ''}
                         </div>
                         `;
                     }).join('')}
@@ -4259,9 +4286,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                     <div class="log-inline-block">${escapeHtml(a.content, true, false)}</div>
                                 </div>
                             ` : ''}
-                            <div style="margin-top: 8px; text-align: right; font-size:0.9em;">
+                            ${a.has_logs ? `<div style="margin-top: 8px; text-align: right; font-size:0.9em;">
                                 ${bugLogLinkHtml(a.bugid, a.id)}
-                            </div>
+                            </div>` : ''}
                         </div>
                         `;
                     }).join('')}
@@ -4300,7 +4327,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             </div>
                             <div class="review-meta" style="margin-top: 6px; font-size:0.85em; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
                                 <div>Actor: ${bugAttribution(e)}</div>
-                                ${bugLogLinkHtml(e.bugid, e.id)}
+                                ${e.has_logs ? bugLogLinkHtml(e.bugid, e.id) : ''}
                             </div>
                         </div>
                         `;
@@ -4346,6 +4373,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
                             <div class="log-inline-block" style="padding-right: 55px;">${escapeHtml(report, true, false)}</div>
                         </div>
+                        ${reportEvent ? `<div style="margin-top: 8px; text-align: right; font-size:0.9em;">${bugLogLinkHtml(reportEvent.bugid, reportEvent.id)}</div>` : ''}
                     ` : `
                         <p class="status-placeholder">${data.status === 'raw' || data.status === 'processing' ? 'Analysis is in progress. The report will appear here when it is ready.' : 'No report has been recorded. Check the audit history or discoveries for available findings.'}</p>
                     `}
@@ -4374,66 +4402,129 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             `;
         }
 
+        // The workflow records the stage number and name it ran under. Older
+        // records predate that, so the raw kind is humanized instead.
+        function bugStageLabel(record) {
+            const data = record.data_json || {};
+            if (data.stage_title) {
+                return data.stage_number ? `Stage ${data.stage_number}. ${data.stage_title}` : data.stage_title;
+            }
+            return String(record.kind || 'stage').replace(/_run$/, '').replace(/_/g, ' ');
+        }
+
+        function formatTokenCount(value) {
+            return Number(value || 0).toLocaleString();
+        }
+
+        // Shows the agent stages that ran for a bug and its duplicates, in the
+        // order they executed, with the tokens each one consumed.
         async function renderBugLogView(slugOrId) {
             const queryParam = /^\d+$/.test(slugOrId) ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
             const res = await fetch(`/api/bug/raw?${queryParam}`);
-            if (!res.ok) throw new Error(`Full bug records could not be loaded (${res.status}). Please try again.`);
+            if (!res.ok) throw new Error(`Workflow log could not be loaded (${res.status}). Please try again.`);
             const payload = await res.json();
             const records = payload.records || [];
             const bugid = payload.bugid;
-            document.title = `${config.project_name || 'Sashiko'} - Raw logs for ${bugid}`;
+            document.title = `${config.project_name || 'Sashiko'} - Workflow log for ${bugid}`;
             const selected = new URLSearchParams(location.hash.split('?')[1] || '').get('event');
-            const rawBlock = value => `<div style="position: relative; margin-top: 6px;"><button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button><div class="log-block" style="max-height: 350px;">${escapeHtml(typeof value === 'string' ? value : JSON.stringify(value, null, 2))}</div></div>`;
-            const html = records.map(bug => `<div class="section"><h2>${escapeHtml(bug.title || bug.bugid)}</h2><div style="margin-bottom: 8px;"><a href="#/bug/${encodeURIComponent(bug.bugid)}"><code>${escapeHtml(bug.bugid)}</code></a></div>
-                <div style="margin-top: 8px;">
-                    <button class="toggle-btn" onclick="toggleCollapsible('raw-meta-${Number(bug.id)}', this)">▶ Raw Bug Metadata</button>
-                    <div id="raw-meta-${Number(bug.id)}" class="collapsible">
-                        ${rawBlock(Object.fromEntries(Object.entries(bug).filter(([key]) => key !== 'enrichments')))}
-                    </div>
-                </div>
-                ${bug.enrichments.map(e => {
+
+            const stages = [];
+            for (const bug of records) {
+                for (const e of (bug.enrichments || [])) {
                     let entries = [];
-                    if (e.logs) { try { const parsed = JSON.parse(e.logs); entries = Array.isArray(parsed) ? parsed : [parsed]; } catch (_) {} }
+                    if (e.logs) { try { const parsed = JSON.parse(e.logs); entries = Array.isArray(parsed) ? parsed : [parsed]; } catch (_) { } }
                     entries = entries.filter(entry => entry && typeof entry === 'object');
-                    return `<div class="review-card" id="bug-event-${Number(e.id)}" style="margin-top: 12px;">
-                        <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
-                            <div style="display:flex; align-items:center; gap: 8px;">
-                                <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(e.kind.replace(/_/g, ' '))}</span>
-                                ${e.logs ? '<span class="tag" style="background:var(--diff-add-bg); color:var(--status-reviewed);">Interaction log</span>' : ''}
-                            </div>
-                            <span class="text-muted-sm">${formatDate(e.created_at, true)}</span>
+                    if (!entries.length) continue;
+                    stages.push({ record: e, bugid: bug.bugid, entries });
+                }
+            }
+            stages.sort((a, b) => (a.record.created_at || 0) - (b.record.created_at || 0));
+
+            const totals = stages.reduce((acc, s) => ({
+                in: acc.in + (s.record.tokens_in || 0),
+                out: acc.out + (s.record.tokens_out || 0),
+                cached: acc.cached + (s.record.tokens_cached || 0),
+            }), { in: 0, out: 0, cached: 0 });
+
+            const stagesHtml = stages.map(({ record: e, bugid: stageBugid, entries }) => {
+                const tokensHtml = (e.tokens_in || e.tokens_out || e.tokens_cached) ? `
+                            <div class="review-meta-label">Tokens:</div>
+                            <div>In ${formatTokenCount(e.tokens_in)} &middot; Out ${formatTokenCount(e.tokens_out)} &middot; Cached ${formatTokenCount(e.tokens_cached)}</div>
+                ` : '';
+                return `
+                <div class="review-card" id="bug-event-${Number(e.id)}" style="margin-bottom: 16px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                        <div style="display:flex; align-items:center; gap: 8px;">
+                            <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border); text-transform:capitalize;">${escapeHtml(bugStageLabel(e))}</span>
+                            ${stageBugid !== bugid ? `<span class="text-muted-sm">From <a href="#/bug/${encodeURIComponent(stageBugid)}">${escapeHtml(stageBugid)}</a></span>` : ''}
+                            <span class="text-muted-sm">${entries.length} ${entries.length === 1 ? 'interaction' : 'interactions'}</span>
                         </div>
-                        <div class="review-meta" style="margin-top: 4px;">
-                            <div class="review-meta-label">Actor:</div>
-                            <div>${bugAttribution(e)}</div>
-                        </div>
-                        ${e.content ? `<div class="log-inline-block" style="margin-top: 8px;">${escapeHtml(e.content, true, false)}</div>` : ''}
-                        ${entries.length ? `<div style="margin-top: 12px;"><h3>Interaction Log</h3>${renderInteractionLogEntries(entries, `bug-${Number(e.id)}-`)}</div>` : ''}
-                        <div style="margin-top: 12px;">
-                            <button class="toggle-btn" onclick="toggleCollapsible('raw-enrich-${Number(e.id)}', this)">▶ Complete Raw Record</button>
-                            <div id="raw-enrich-${Number(e.id)}" class="collapsible">
-                                ${rawBlock(e)}
-                            </div>
-                        </div>
-                    </div>`;
-                }).join('')}</div>`).join('');
+                        <span class="text-muted-sm">${formatDate(e.created_at, true)}</span>
+                    </div>
+                    <div class="review-meta" style="margin-top: 4px;">
+                        <div class="review-meta-label">Actor:</div>
+                        <div>${bugAttribution(e)}</div>
+                        ${tokensHtml}
+                    </div>
+                    <div style="margin-top: 12px;">${renderInteractionLogEntries(entries, `bug-${Number(e.id)}-`)}</div>
+                </div>`;
+            }).join('');
+
             document.getElementById('app').innerHTML = `<div class="nav"><a href="#/bug/${encodeURIComponent(bugid)}">← Back to bug</a></div>
-                <h1><span>Raw Logs</span></h1>
-                <p class="text-muted-sm" style="margin-bottom: 12px;">Original inputs, enrichment payloads, interaction logs, token usage, and attribution for every linked discovery.</p>
-                ${html || '<p class="status-placeholder">No records available.</p>'}`;
+                <h1><span>Workflow Log</span></h1>
+                <p class="text-muted-sm" style="margin-bottom: 12px;">Every agent stage that ran for <a href="#/bug/${encodeURIComponent(bugid)}"><code>${escapeHtml(bugid)}</code></a> and its duplicates, in execution order.</p>
+                ${stages.length ? `
+                <div class="section" style="margin-bottom: 16px;">
+                    <div class="kv"><div class="label">Stages:</div><div>${stages.length}</div></div>
+                    <div class="kv"><div class="label">Tokens in:</div><div>${formatTokenCount(totals.in)}</div></div>
+                    <div class="kv"><div class="label">Tokens out:</div><div>${formatTokenCount(totals.out)}</div></div>
+                    <div class="kv"><div class="label">Tokens cached:</div><div>${formatTokenCount(totals.cached)}</div></div>
+                </div>` : ''}
+                ${stagesHtml || '<p class="status-placeholder">No workflow interactions were recorded for this bug.</p>'}`;
+
             if (selected && /^\d+$/.test(selected)) {
                 setTimeout(() => {
-                    const el = document.getElementById(`bug-event-${selected}`);
-                    if (el) {
-                        el.scrollIntoView({ block: 'start', behavior: 'smooth' });
-                        const coll = document.getElementById(`raw-enrich-${selected}`);
-                        if (coll && !coll.classList.contains('open')) {
-                            const btn = coll.previousElementSibling;
-                            toggleCollapsible(`raw-enrich-${selected}`, btn);
-                        }
-                    }
+                    document.getElementById(`bug-event-${selected}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' });
                 }, 100);
             }
+        }
+
+        // Shows the payload the workflow was started with. Duplicates keep
+        // their own candidate records, so each one shows its original input.
+        async function renderBugInputView(slugOrId) {
+            const queryParam = /^\d+$/.test(slugOrId) ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
+            const res = await fetch(`/api/bug/input?${queryParam}`);
+            if (!res.ok) throw new Error(`Raw input could not be loaded (${res.status}). Please try again.`);
+            const payload = await res.json();
+            const bugid = payload.bugid;
+            const inputs = payload.inputs || [];
+            document.title = `${config.project_name || 'Sashiko'} - Raw input for ${bugid}`;
+
+            const inputsHtml = inputs.map(record => {
+                const body = record.input !== null && record.input !== undefined
+                    ? JSON.stringify(record.input, null, 2)
+                    : (record.content || '');
+                return `
+                <div class="review-card" style="margin-bottom: 16px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center; gap: 8px; margin-bottom: 6px;">
+                        <span class="tag" style="font-weight:bold; background:var(--code-bg); border:1px solid var(--border);">Candidate</span>
+                        <span class="text-muted-sm">${formatDate(record.created_at, true)}</span>
+                    </div>
+                    <div class="review-meta" style="margin-top: 4px;">
+                        <div class="review-meta-label">Reported by:</div>
+                        <div>${bugAttribution(record)}</div>
+                    </div>
+                    <div style="position: relative; margin-top: 10px;">
+                        <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                        <div class="log-block">${escapeHtml(body)}</div>
+                    </div>
+                </div>`;
+            }).join('');
+
+            document.getElementById('app').innerHTML = `<div class="nav"><a href="#/bug/${encodeURIComponent(bugid)}">← Back to bug</a></div>
+                <h1><span>Raw Input</span></h1>
+                <p class="text-muted-sm" style="margin-bottom: 12px;">The payload the bug workflow was started with for <a href="#/bug/${encodeURIComponent(bugid)}"><code>${escapeHtml(bugid)}</code></a>.</p>
+                ${inputsHtml || '<p class="status-placeholder">No workflow input was recorded for this discovery.</p>'}`;
         }
 
         function renderInteractionLogEntries(logs, prefix = '') {
