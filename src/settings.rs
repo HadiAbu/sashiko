@@ -562,6 +562,39 @@ fn default_email_policy_path() -> String {
     "email_policy.toml".to_string()
 }
 
+/// Tuning for the Linux bug analysis worker.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+#[allow(unused)]
+pub struct LinuxBugSettings {
+    /// How long a claimed bug stays claimed before another worker may take it
+    /// over. This must comfortably exceed the longest expected analysis, or a
+    /// slow run will be reclaimed and analysed twice.
+    #[serde(default = "default_bug_lease_ttl_seconds")]
+    pub lease_ttl_seconds: i64,
+    /// How many times a bug may be analysed before it is abandoned. Without a
+    /// cap, a bug that reliably crashes the worker is retried forever.
+    #[serde(default = "default_bug_max_attempts")]
+    pub max_attempts: i64,
+}
+
+impl Default for LinuxBugSettings {
+    fn default() -> Self {
+        Self {
+            lease_ttl_seconds: default_bug_lease_ttl_seconds(),
+            max_attempts: default_bug_max_attempts(),
+        }
+    }
+}
+
+fn default_bug_lease_ttl_seconds() -> i64 {
+    1800
+}
+
+fn default_bug_max_attempts() -> i64 {
+    3
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -586,6 +619,8 @@ pub struct Settings {
     pub server: ServerSettings,
     pub git: GitSettings,
     pub review: ReviewSettings,
+    #[serde(default)]
+    pub linux_bug: LinuxBugSettings,
 }
 
 fn default_subsystems() -> SubsystemsSettings {

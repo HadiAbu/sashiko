@@ -11,19 +11,39 @@ pub struct BugWorker {
     db: Arc<Database>,
     provider: Arc<dyn AiProvider>,
     repo_path: String,
+    /// Identifies this worker in the lease it takes, so that a lease which
+    /// never gets released can be traced back to a process.
+    worker_id: String,
+    lease_ttl_seconds: i64,
+    max_attempts: i64,
 }
 
 impl BugWorker {
-    pub fn new(db: Arc<Database>, provider: Arc<dyn AiProvider>, repo_path: String) -> Self {
+    pub fn new(
+        db: Arc<Database>,
+        provider: Arc<dyn AiProvider>,
+        repo_path: String,
+        settings: &crate::settings::LinuxBugSettings,
+    ) -> Self {
         Self {
             db,
             provider,
             repo_path,
+            worker_id: format!(
+                "{}:{}",
+                std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string()),
+                std::process::id()
+            ),
+            lease_ttl_seconds: settings.lease_ttl_seconds,
+            max_attempts: settings.max_attempts,
         }
     }
 
     pub async fn run(&self) {
-        info!("Starting Bug Worker...");
+        info!(
+            "Starting Bug Worker as {} (lease {}s, {} attempts max)...",
+            self.worker_id, self.lease_ttl_seconds, self.max_attempts
+        );
         if let Err(e) = self.db.recover_stale_running_bugs().await {
             error!(
                 "Failed to requeue interrupted bug analyses on startup: {}",
@@ -31,7 +51,11 @@ impl BugWorker {
             );
         }
         loop {
-            match self.db.lock_pending_bug().await {
+            match self
+                .db
+                .claim_pending_bug(&self.worker_id, self.lease_ttl_seconds, self.max_attempts)
+                .await
+            {
                 Ok(Some(bug)) => {
                     let provider = self.provider.clone();
                     let db = self.db.clone();
@@ -86,6 +110,12 @@ impl BugWorker {
                         {
                             Ok(outcome) => {
                                 info!("Successfully processed raw bug {}: {}", bug.id, outcome);
+                                // The workflow records the outcome; this only
+                                // drops the claim so the row stops looking
+                                // like it is still being worked on.
+                                if let Err(e) = db.release_bug_lease(bug.id).await {
+                                    error!("Failed to release lease on bug {}: {}", bug.id, e);
+                                }
                             }
                             Err(e) => {
                                 error!("Failed to process bug {}: {}", bug.id, e);
@@ -96,10 +126,15 @@ impl BugWorker {
                     });
                 }
                 Ok(None) => {
+                    // Nothing left to claim, so this is the cheapest moment to
+                    // retire the bugs that have run out of attempts.
+                    if let Err(e) = self.db.abandon_exhausted_bugs(self.max_attempts).await {
+                        error!("Failed to abandon exhausted bugs: {}", e);
+                    }
                     sleep(Duration::from_secs(5)).await;
                 }
                 Err(e) => {
-                    error!("Database error while fetching raw bugs: {}", e);
+                    error!("Database error while claiming a bug for analysis: {}", e);
                     sleep(Duration::from_secs(10)).await;
                 }
             }

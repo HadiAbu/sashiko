@@ -2238,47 +2238,131 @@ impl Database {
         self.get_bug_logs_by_bugid(slug).await
     }
 
-    /// Claims the oldest bug awaiting analysis and marks it as running.
-    pub async fn lock_pending_bug(&self) -> Result<Option<Bug>> {
+    /// Claims the oldest bug awaiting analysis, taking a lease on it.
+    ///
+    /// The claim is a single statement so that two workers racing for the same
+    /// bug cannot both win: SQLite serialises writers, so the loser's subquery
+    /// no longer selects the row. The previous read-then-write version could
+    /// hand the same bug to both.
+    ///
+    /// Claimable bugs are those awaiting a first attempt, those whose last
+    /// attempt failed, and those whose lease has expired because the worker
+    /// holding it died. Bugs that have exhausted `max_attempts` are skipped;
+    /// [`Self::abandon_exhausted_bugs`] moves them to the dead letter state.
+    ///
+    /// `worker_id` identifies the holder so that a stuck lease can be traced
+    /// back to a process.
+    pub async fn claim_pending_bug(
+        &self,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+        max_attempts: i64,
+    ) -> Result<Option<Bug>> {
+        let now = chrono::Utc::now().timestamp();
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM bugs WHERE pipeline_state = 'pending' ORDER BY created_at ASC LIMIT 1",
-                (),
+                "UPDATE bugs
+                    SET pipeline_state = 'running',
+                        locked_by = ?1,
+                        lease_expires_at = ?2,
+                        attempt_count = attempt_count + 1,
+                        updated_at = ?3,
+                        audit_author = 'system',
+                        audit_tool = 'sashiko:linux_bug',
+                        audit_model = NULL
+                  WHERE id = (
+                      SELECT id FROM bugs
+                       WHERE attempt_count < ?4
+                         AND (pipeline_state IN ('pending', 'failed')
+                              OR (pipeline_state = 'running' AND lease_expires_at < ?3))
+                       ORDER BY created_at ASC
+                       LIMIT 1
+                  )
+                  RETURNING id",
+                libsql::params![worker_id, now + lease_ttl_seconds, now, max_attempts],
             )
             .await?;
-        if let Some(row) = rows.next().await? {
-            let id: i64 = row.get(0)?;
-            let now = chrono::Utc::now().timestamp();
-            self.conn
-                .execute(
-                    "UPDATE bugs SET pipeline_state = 'running', updated_at = ?, audit_author = 'system', audit_tool = 'sashiko:linux_bug', audit_model = NULL WHERE id = ?",
-                    libsql::params![now, id],
-                )
-                .await?;
-            self.get_bug(id).await
-        } else {
-            Ok(None)
+        match rows.next().await? {
+            Some(row) => self.get_bug(row.get::<i64>(0)?).await,
+            None => Ok(None),
         }
     }
 
-    /// Requeues bugs left mid-analysis by an unexpected process crash or restart.
+    /// Releases the lease on a bug that finished analysis.
     ///
-    /// Only the pipeline state is touched. Triage state is owned by humans and
-    /// must survive a restart untouched.
-    pub async fn recover_stale_running_bugs(&self) -> Result<usize> {
+    /// The pipeline state is left alone: whoever completed the run has already
+    /// recorded the outcome, and overwriting it here would race with them.
+    pub async fn release_bug_lease(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE bugs SET locked_by = NULL, lease_expires_at = NULL WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Moves bugs that have used up their attempts into the dead letter state.
+    ///
+    /// Abandoned bugs are never claimed again. Requeueing one is a deliberate
+    /// operator action, so that a bug which reliably crashes the worker cannot
+    /// quietly consume the analysis budget forever.
+    pub async fn abandon_exhausted_bugs(&self, max_attempts: i64) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp();
         let count = self
             .conn
             .execute(
-                "UPDATE bugs SET pipeline_state = 'pending', locked_by = NULL, lease_expires_at = NULL, audit_author = 'system', audit_tool = 'sashiko:linux_bug', audit_model = NULL WHERE pipeline_state = 'running'",
-                (),
+                "UPDATE bugs
+                    SET pipeline_state = 'abandoned',
+                        locked_by = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?1,
+                        audit_author = 'system',
+                        audit_tool = 'sashiko:linux_bug',
+                        audit_model = NULL
+                  WHERE attempt_count >= ?2
+                    AND (pipeline_state IN ('pending', 'failed')
+                         OR (pipeline_state = 'running' AND lease_expires_at < ?1))",
+                libsql::params![now, max_attempts],
             )
             .await?;
         if count > 0 {
             info!(
-                "Requeued {} bugs left mid-analysis for another attempt",
+                "Abandoned {} bugs that exhausted their analysis attempts",
                 count
             );
+        }
+        Ok(count as usize)
+    }
+
+    /// Requeues bugs whose lease expired because the worker holding it died.
+    ///
+    /// Only the pipeline state is touched. Triage state is owned by humans and
+    /// must survive a crash untouched.
+    ///
+    /// Claiming already reclaims expired leases on its own, so this exists to
+    /// make the requeue visible in the bug list rather than leaving a dead
+    /// worker's bugs displayed as running until someone happens to claim them.
+    pub async fn recover_stale_running_bugs(&self) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp();
+        let count = self
+            .conn
+            .execute(
+                "UPDATE bugs
+                    SET pipeline_state = 'pending',
+                        locked_by = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?1,
+                        audit_author = 'system',
+                        audit_tool = 'sashiko:linux_bug',
+                        audit_model = NULL
+                  WHERE pipeline_state = 'running' AND lease_expires_at < ?1",
+                libsql::params![now],
+            )
+            .await?;
+        if count > 0 {
+            info!("Requeued {} bugs whose analysis lease expired", count);
         }
         Ok(count as usize)
     }
@@ -12230,17 +12314,10 @@ mod tests {
         assert_eq!(all_bugs[0].id, bug_id);
     }
 
-    #[tokio::test]
-    async fn test_recover_stale_running_bugs() {
-        let db_settings = crate::settings::DatabaseSettings {
-            url: ":memory:".to_string(),
-            token: String::new(),
-        };
-        let db = Database::new(&db_settings).await.unwrap();
-        db.migrate().await.unwrap();
-
-        let new_bug = NewBug {
-            bugid: "linux-crash-recovery".to_string(),
+    /// Builds a bug that is ready to be claimed for analysis.
+    async fn create_pending_bug(db: &Database, bugid: &str) -> i64 {
+        db.create_bug(&NewBug {
+            bugid: bugid.to_string(),
             title: "Memory leak on crash".to_string(),
             lifecycle_status: BugLifecycleStatus::New,
             pipeline_state: BugPipelineState::Pending,
@@ -12254,37 +12331,119 @@ mod tests {
             vector_json: None,
             duplicate_of_id: None,
             subsystems: vec!["kernel".to_string()],
-        };
-        let bug_id = db.create_bug(&new_bug).await.unwrap();
+        })
+        .await
+        .unwrap()
+    }
 
-        // Claiming a bug moves it onto the running pipeline state.
+    #[tokio::test]
+    async fn test_recover_stale_running_bugs() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-crash-recovery").await;
+
+        // Claiming a bug moves it onto the running pipeline state and records
+        // who holds the lease.
         let locked = db
-            .lock_pending_bug()
+            .claim_pending_bug("worker-a", 3600, 10)
             .await
             .unwrap()
-            .expect("should lock bug");
+            .expect("should claim bug");
         assert_eq!(locked.id, bug_id);
         assert_eq!(locked.pipeline_state, BugPipelineState::Running);
 
-        // No more pending bugs available to claim.
-        assert!(db.lock_pending_bug().await.unwrap().is_none());
+        // A second worker must not get the same bug while the lease is live.
+        assert!(
+            db.claim_pending_bug("worker-b", 3600, 10)
+                .await
+                .unwrap()
+                .is_none()
+        );
 
-        // Simulate crash recovery.
-        let recovered = db.recover_stale_running_bugs().await.unwrap();
-        assert_eq!(recovered, 1);
+        // An unexpired lease is not disturbed by recovery.
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 0);
+
+        // Expire the lease, as if the worker holding it had died.
+        db.conn
+            .execute(
+                "UPDATE bugs SET lease_expires_at = 1 WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 1);
 
         // Recovery only rewinds the pipeline axis, leaving triage untouched.
         let rewound = db.get_bug(bug_id).await.unwrap().unwrap();
         assert_eq!(rewound.pipeline_state, BugPipelineState::Pending);
         assert_eq!(rewound.lifecycle_status, BugLifecycleStatus::New);
 
-        let locked_again = db
-            .lock_pending_bug()
+        let claimed_again = db
+            .claim_pending_bug("worker-b", 3600, 10)
             .await
             .unwrap()
-            .expect("should re-lock recovered bug");
-        assert_eq!(locked_again.id, bug_id);
-        assert_eq!(locked_again.pipeline_state, BugPipelineState::Running);
+            .expect("should re-claim recovered bug");
+        assert_eq!(claimed_again.id, bug_id);
+        assert_eq!(claimed_again.pipeline_state, BugPipelineState::Running);
+    }
+
+    /// A bug that keeps failing must not be retried forever, and once it stops
+    /// being retried it must say so rather than sitting in the queue looking
+    /// like work that is about to happen.
+    #[tokio::test]
+    async fn test_bug_analysis_retry_cap_and_dead_letter() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-always-fails").await;
+        let max_attempts = 2;
+
+        for attempt in 1..=max_attempts {
+            let claimed = db
+                .claim_pending_bug("worker-a", 3600, max_attempts)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("attempt {} should be claimable", attempt));
+            assert_eq!(claimed.id, bug_id);
+            db.fail_bug_analysis(bug_id, "boom").await.unwrap();
+            // A failed attempt leaves triage alone: a crashed run says nothing
+            // about whether the defect is real.
+            let failed = db.get_bug(bug_id).await.unwrap().unwrap();
+            assert_eq!(failed.pipeline_state, BugPipelineState::Failed);
+            assert_eq!(failed.lifecycle_status, BugLifecycleStatus::New);
+        }
+
+        // The cap is now reached, so the bug is no longer claimable.
+        assert!(
+            db.claim_pending_bug("worker-a", 3600, max_attempts)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(db.abandon_exhausted_bugs(max_attempts).await.unwrap(), 1);
+        let abandoned = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(abandoned.pipeline_state, BugPipelineState::Abandoned);
+        assert_eq!(abandoned.lifecycle_status, BugLifecycleStatus::New);
+
+        // Abandoning is idempotent and never resurrects the bug.
+        assert_eq!(db.abandon_exhausted_bugs(max_attempts).await.unwrap(), 0);
+        assert!(
+            db.claim_pending_bug("worker-a", 3600, max_attempts)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

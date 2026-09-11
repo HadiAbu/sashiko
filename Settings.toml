@@ -176,3 +176,13 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
+
+[linux_bug]
+# How long a worker's claim on a bug stays valid. If the worker dies, the
+# bug becomes claimable again once this elapses. Set this comfortably
+# above the longest expected analysis, or a slow run will be reclaimed
+# and analysed a second time in parallel.
+lease_ttl_seconds = 1800
+# How many analysis attempts a bug gets before it is abandoned. Abandoned
+# bugs are never retried automatically.
+max_attempts = 3

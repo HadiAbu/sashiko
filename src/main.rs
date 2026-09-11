@@ -857,6 +857,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             db.clone(),
             provider,
             settings.git.repository_path.clone(),
+            &settings.linux_bug,
         );
         tokio::spawn(async move {
             bug_worker.run().await;
