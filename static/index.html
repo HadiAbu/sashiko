@@ -3978,7 +3978,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             return `<a href="${href}" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${escapeHtml(label)}</a>`;
         }
 
-        function bugLogLinkHtml(bugid, eventId, label = 'View Workflow Log') {
+        function bugLogLinkHtml(bugid, eventId, label = 'View Raw Log') {
             return rawRecordLinkHtml(bugLogLink(bugid, eventId), label);
         }
 
@@ -4044,6 +4044,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const sevColor = getSeverityColor(severity);
             const report = data.description || data.inline_review;
             const activity = evidence.activity || [];
+            // Any record with an interaction log makes the raw log page useful,
+            // so the link is offered whenever at least one exists.
+            const hasInteractionLogs = activity.some(e => e.has_logs);
             document.title = `${config.project_name || 'Sashiko'} - ${data.problem || bugid}`;
             const commit = (value, includeTag = false) => value ? `<code>${escapeHtml(formatCommitRef(value, includeTag))}</code>` : '';
 
@@ -4105,9 +4108,11 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 }
             }
 
-            // The report record carries the interaction log of the run that
-            // produced the description shown in the first tab.
-            const reportEvent = activity.find(e => e.kind === 'report' && e.has_logs);
+            // The description comes from the report generation run. Older bugs
+            // stored that interaction on the report record itself, while newer
+            // ones keep it on the stage record, so both are accepted.
+            const reportEvent = activity.find(e => e.kind === 'report' && e.has_logs)
+                || activity.find(e => e.kind === 'report_generation_run' && e.has_logs);
 
             const sortedComments = [...comments].sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
 
@@ -4361,6 +4366,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     ${data.fixed_in_commit ? `<div class="kv"><div class="label">Fixed in:</div><div>${commit(data.fixed_in_commit)}</div></div>` : ''}
                     ${data.verified_on_sha ? `<div class="kv"><div class="label">Verified on:</div><div>${commit(data.verified_on_sha)}</div></div>` : ''}
                     ${(data.duplicates && data.duplicates.length > 0) ? `<div class="kv"><div class="label">Duplicates (${data.duplicates.length}):</div><div>${data.duplicates.map(d => `<a href="#/bug/${encodeURIComponent(d.bugid || d.id)}" class="tag" style="text-decoration:none;" title="${escapeHtml(d.problem || '')}">${escapeHtml(d.bugid || d.id)}</a>`).join('')}</div></div>` : ''}
+                    ${hasInteractionLogs ? `<div class="kv"><div class="label">Interaction log:</div><div>${bugLogLinkHtml(bugid)}</div></div>` : ''}
                 </div>
 
                 <div class="controls" style="margin-top: 20px; margin-bottom: 16px; border-bottom: 1px solid var(--border-light); padding-bottom: 8px;" role="tablist" aria-label="Bug details" onkeydown="bugTabKeydown(event)">
@@ -4421,11 +4427,11 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         async function renderBugLogView(slugOrId) {
             const queryParam = /^\d+$/.test(slugOrId) ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
             const res = await fetch(`/api/bug/raw?${queryParam}`);
-            if (!res.ok) throw new Error(`Workflow log could not be loaded (${res.status}). Please try again.`);
+            if (!res.ok) throw new Error(`Interaction log could not be loaded (${res.status}). Please try again.`);
             const payload = await res.json();
             const records = payload.records || [];
             const bugid = payload.bugid;
-            document.title = `${config.project_name || 'Sashiko'} - Workflow log for ${bugid}`;
+            document.title = `${config.project_name || 'Sashiko'} - Interaction log for ${bugid}`;
             const selected = new URLSearchParams(location.hash.split('?')[1] || '').get('event');
 
             const stages = [];
@@ -4470,8 +4476,22 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 </div>`;
             }).join('');
 
+            // The canonical bug carries the status shown in the header, the same
+            // way the patch review log page badges its review status.
+            const canonical = records.find(b => b.bugid === bugid) || records[0] || {};
+            const bugStatus = getBugStatus(canonical);
+
             document.getElementById('app').innerHTML = `<div class="nav"><a href="#/bug/${encodeURIComponent(bugid)}">← Back to bug</a></div>
-                <h1><span>Workflow Log</span></h1>
+                <h1>
+                    <span>Interaction Log</span>
+                    <span class="header-subtitle">
+                        ${(() => {
+                            const ver = config.git_hash || config.version;
+                            return ver ? 'Sashiko ver.: ' + ver.substring(0, 8) + ' · ' : '';
+                        })()}
+                        <span class="status-badge ${bugStatus.cls}">${bugStatus.label}</span>
+                    </span>
+                </h1>
                 <p class="text-muted-sm" style="margin-bottom: 12px;">Every agent stage that ran for <a href="#/bug/${encodeURIComponent(bugid)}"><code>${escapeHtml(bugid)}</code></a> and its duplicates, in execution order.</p>
                 ${stages.length ? `
                 <div class="section" style="margin-bottom: 16px;">
@@ -4480,7 +4500,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <div class="kv"><div class="label">Tokens out:</div><div>${formatTokenCount(totals.out)}</div></div>
                     <div class="kv"><div class="label">Tokens cached:</div><div>${formatTokenCount(totals.cached)}</div></div>
                 </div>` : ''}
-                ${stagesHtml || '<p class="status-placeholder">No workflow interactions were recorded for this bug.</p>'}`;
+                ${stagesHtml || '<p class="status-placeholder">No interactions were recorded for this bug.</p>'}`;
 
             if (selected && /^\d+$/.test(selected)) {
                 setTimeout(() => {
