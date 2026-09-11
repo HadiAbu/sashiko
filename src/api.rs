@@ -1928,6 +1928,30 @@ pub enum BugAction {
         duplicate_of_bugid: Option<String>,
         reasoning: Option<String>,
     },
+    /// Hands a bug to someone, or drops the assignment when the assignee is
+    /// absent, empty, or null.
+    Assign {
+        assignee: Option<String>,
+        reason: Option<String>,
+    },
+}
+
+/// Checks that a string looks like an email address.
+///
+/// This deliberately stops well short of RFC validation. Its only job is to
+/// catch a value that clearly is not an address, since assignees are matched
+/// by exact string and a malformed one can never be filtered for.
+fn is_plausible_email(value: &str) -> bool {
+    match value.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+                && !value.chars().any(char::is_whitespace)
+        }
+        None => false,
+    }
 }
 
 async fn bug_action(
@@ -2058,6 +2082,23 @@ async fn bug_action(
             })
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
+        BugAction::Assign { assignee, reason } => {
+            let assignee = assignee.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            // A bare sanity check, not full validation: assignees are matched
+            // by exact string, so a value that is obviously not an address
+            // would create an assignment nobody can ever filter for.
+            if let Some(who) = assignee
+                && !is_plausible_email(who)
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Assignee must be an email address".into(),
+                ));
+            }
+            db.assign_bug(bug.id, assignee, reason.as_deref())
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         }
     }
 

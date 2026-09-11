@@ -1496,6 +1496,12 @@
                     <div style="font-size: 0.85em; color: var(--text-muted); margin-top: 4px;">Paste the bug ID shown at the top of the existing bug.</div>
                 </div>
 
+                <div id="bugActionAssignSection" style="display: none; margin-bottom: 16px;">
+                    <div style="margin-bottom: 8px;"><strong>Assignee email:</strong></div>
+                    <input type="email" id="bugActionAssignee" class="search-input" placeholder="developer@example.org" style="width: 100%; border: 1px solid var(--border); box-sizing: border-box;">
+                    <div style="font-size: 0.85em; color: var(--text-muted); margin-top: 4px;">Leave empty to unassign.</div>
+                </div>
+
                 <div style="margin-bottom: 8px;"><strong id="bugActionReasonLabel">Reason / Comment:</strong></div>
                 <textarea id="bugActionReason" class="search-input" style="width: 100%; height: 120px; border: 1px solid var(--border); box-sizing: border-box; resize: vertical;" placeholder="Add reasoning or context..."></textarea>
                 
@@ -1529,6 +1535,7 @@
             bugMinSeverity: '',
             bugLifecycleStatus: 'open',
             bugPipelineState: '',
+            bugAssignee: '',
             bugSortBy: 'severity',
             bugSortOrder: 'desc',
             patchsetId: null,
@@ -2663,6 +2670,7 @@
                             <option value="failed" ${state.bugPipelineState === 'failed' ? 'selected' : ''}>Failed</option>
                             <option value="abandoned" ${state.bugPipelineState === 'abandoned' ? 'selected' : ''}>Abandoned</option>
                         </select>
+                        <input type="text" id="bugAssigneeFilter" placeholder="Assignee (or none)" value="${escapeHtml(state.bugAssignee)}" style="width: 160px;" onchange="setBugFilter('assignee', this.value)">
                     </div>
 
                     <input type="text" id="searchInput" placeholder="${state.listMode === 'bugs' ? 'Search bugs (problem, file, commit)' : 'Search (subject, author:, date:)'}" value="${escapeHtml(state.searchQuery)}">
@@ -2710,6 +2718,7 @@
                     <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('severity')" title="Sort by Severity">Severity${sortIndicator('severity')}</th>
                     <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('discoveries')" title="Sort by Discoveries">Discoveries${sortIndicator('discoveries')}</th>
                     <th style="width:100px; cursor:pointer; user-select:none;" onclick="toggleBugSort('created_at')" title="Sort by Date">Date${sortIndicator('created_at')}</th>
+                    <th style="width:150px; cursor:pointer; user-select:none;" onclick="toggleBugSort('assignee')" title="Sort by Assignee">Assignee${sortIndicator('assignee')}</th>
                     <th style="width:80px; cursor:pointer; user-select:none;" onclick="toggleBugSort('status')" title="Sort by Status">Status${sortIndicator('status')}</th>
                 </tr>`;
             } else {
@@ -2774,6 +2783,9 @@
                 }
                 if (state.bugPipelineState) {
                     url += `&pipeline_state=${encodeURIComponent(state.bugPipelineState)}`;
+                }
+                if (state.bugAssignee) {
+                    url += `&assignee=${encodeURIComponent(state.bugAssignee)}`;
                 }
                 if (state.bugSortBy) {
                     url += `&sort_by=${encodeURIComponent(state.bugSortBy)}`;
@@ -2910,6 +2922,7 @@
                             <td style="line-height:1.2;">${sevHtml}</td>
                             <td title="${escapeHtml(discoveriesTitle)}">${discoveriesCount}</td>
                             <td style="line-height:1.2;"><div>${dateStr}</div>${timeStr ? `<div class="text-muted-sm">${timeStr}</div>` : ''}</td>
+                            <td title="${escapeHtml(p.assignee || 'Unassigned')}">${p.assignee ? escapeHtml(p.assignee.split('@')[0]) : '<span class="text-muted-sm">Unassigned</span>'}</td>
                             <td><span class="status-badge ${statusInfo.cls}">${statusInfo.label}</span></td>
                         `;
                     } else {
@@ -3146,6 +3159,9 @@
             if (key === 'pipeline_state') {
                 state.bugPipelineState = value;
             }
+            if (key === 'assignee') {
+                state.bugAssignee = value.trim();
+            }
             state.currentPage = 1;
             fetchListData();
         }
@@ -3158,6 +3174,7 @@
                 state.bugMinSeverity = '';
                 state.bugLifecycleStatus = 'open';
                 state.bugPipelineState = '';
+                state.bugAssignee = '';
                 state.bugSortBy = 'severity';
                 state.bugSortOrder = 'desc';
                 if (state.bugSubsystemsList.length > 0) {
@@ -3172,6 +3189,8 @@
                 if (statSel) statSel.value = 'open';
                 const pipeSel = document.getElementById('bugPipelineSelector');
                 if (pipeSel) pipeSel.value = '';
+                const assigneeInput = document.getElementById('bugAssigneeFilter');
+                if (assigneeInput) assigneeInput.value = '';
             }
             state.currentPage = 1;
             fetchListData();
@@ -4193,8 +4212,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             const canAct = canPerformBugActions();
             const actionDisabledTitle = getActionDisabledTitle();
 
+            // Remembered so the assign modal opens prefilled for reassignment
+            // rather than making the user retype the current owner.
+            state.currentBugAssignee = data.assignee || '';
+
             const actionButtonsHtml = canAct ? `
                 <button class="primary" onclick="openBugActionModal('comment', '${id}')">Add Comment</button>
+                <button class="btn" onclick="openBugActionModal('assign', '${id}')">${data.assignee ? 'Reassign' : 'Assign'}</button>
                 <details class="subsystem-dropdown" id="bugStatusDropdown" style="position:relative; display:inline-block;">
                     <summary class="subsystem-dropdown-btn">Change Status ▾</summary>
                     <div class="subsystem-dropdown-menu" style="display:block; min-width:180px;">
@@ -4205,6 +4229,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 </details>
             ` : `
                 <button class="primary" disabled title="${escapeHtml(actionDisabledTitle)}">Add Comment</button>
+                <button class="btn" disabled title="${escapeHtml(actionDisabledTitle)}">Assign</button>
                 <button class="btn" disabled title="${escapeHtml(actionDisabledTitle)}">Change Status ▾</button>
             `;
 
@@ -4401,6 +4426,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     <div class="kv"><div class="label">Bug ID:</div><div><code>${escapeHtml(bugid)}</code> <button class="copy-btn" onclick="copyToClipboard('${escapeHtml(bugid)}')">Copy</button></div></div>
                     <div class="kv"><div class="label">Severity:</div><div><span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(severity)}</span></div></div>
                     <div class="kv"><div class="label">Status:</div><div><span class="status-badge ${status.cls}">${status.label}</span></div></div>
+                    <div class="kv"><div class="label">Assignee:</div><div>${data.assignee ? `${escapeHtml(data.assignee)}${data.assigned_at ? ` <span class="text-muted-sm">since ${formatDate(data.assigned_at, true)}</span>` : ''}` : '<span class="text-muted-sm">Unassigned</span>'}</div></div>
                     <div class="kv"><div class="label">Discoveries:</div><div>${evidence.count} (${evidence.tools.length} ${evidence.tools.length === 1 ? 'tool' : 'tools'}, ${evidence.models.length} ${evidence.models.length === 1 ? 'model' : 'models'})</div></div>
                     <div class="kv"><div class="label">Reported:</div><div>${formatDate(data.reported_at || data.created_at, true)}</div></div>
                     <div class="kv"><div class="label">Updated:</div><div>${formatDate(data.updated_at, true)}</div></div>
@@ -5220,15 +5246,18 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             document.getElementById('bugActionTargetId').value = id;
             document.getElementById('bugActionReason').value = '';
             document.getElementById('bugActionDuplicateId').value = '';
+            document.getElementById('bugActionAssignee').value = '';
             document.getElementById('bugActionError').style.display = 'none';
             document.getElementById('bugActionSubmitBtn').disabled = false;
             
             const titleEl = document.getElementById('bugActionTitle');
             const reasonLabelEl = document.getElementById('bugActionReasonLabel');
             const dupSection = document.getElementById('bugActionDuplicateSection');
+            const assignSection = document.getElementById('bugActionAssignSection');
             const reasonArea = document.getElementById('bugActionReason');
-            
+
             dupSection.style.display = 'none';
+            assignSection.style.display = 'none';
             
             if (action === 'comment') {
                 titleEl.textContent = 'Add Comment';
@@ -5247,6 +5276,14 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 reasonLabelEl.textContent = 'Reason (optional):';
                 reasonArea.placeholder = 'Explain why it is a duplicate...';
                 dupSection.style.display = 'block';
+            } else if (action === 'assign') {
+                titleEl.textContent = 'Assign Bug';
+                reasonLabelEl.textContent = 'Reason (optional):';
+                reasonArea.placeholder = 'Why is this being assigned?';
+                assignSection.style.display = 'block';
+                // Prefill with the current assignee so the field doubles as a
+                // reassignment form rather than always starting blank.
+                document.getElementById('bugActionAssignee').value = state.currentBugAssignee || '';
             }
             
             document.getElementById('bugActionModal').classList.add('open');
@@ -5301,8 +5338,14 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 if (reason) {
                     payload.reasoning = reason;
                 }
+            } else if (action === 'assign') {
+                // An empty field is meaningful here: it unassigns the bug.
+                payload.assignee = document.getElementById('bugActionAssignee').value.trim() || null;
+                if (reason) {
+                    payload.reason = reason;
+                }
             }
-            
+
             try {
                 const res = await fetch(`/api/bug/action?id=${encodeURIComponent(id)}`, {
                     method: 'POST',

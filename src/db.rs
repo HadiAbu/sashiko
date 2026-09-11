@@ -2190,6 +2190,63 @@ impl Database {
         Ok(())
     }
 
+    /// Records who is working on a bug, or clears the assignment when given
+    /// `None`.
+    ///
+    /// The address is stored as plain text on purpose: Sashiko keeps no
+    /// persistent user records, so there is nothing to reference.
+    ///
+    /// Both columns are written in one statement because the schema requires
+    /// `assigned_at` to be set if and only if there is an assignee. An
+    /// optional reason is recorded as a comment so the audit feed explains the
+    /// handover rather than just noting that it happened.
+    ///
+    /// Returns false when no such bug exists, so the caller can tell a bad id
+    /// apart from a successful assignment.
+    pub async fn assign_bug(
+        &self,
+        id: i64,
+        assignee: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<bool> {
+        let assignee = assignee.map(str::trim).filter(|s| !s.is_empty());
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.conn.transaction().await?;
+        let updated = tx
+            .execute(
+                "UPDATE bugs
+                    SET assignee = ?1,
+                        assigned_at = CASE WHEN ?1 IS NULL THEN NULL ELSE ?2 END,
+                        updated_at = ?2,
+                        audit_author = ?3,
+                        audit_tool = ?4,
+                        audit_model = ?5
+                  WHERE id = ?6",
+                libsql::params![
+                    assignee,
+                    now,
+                    self.bug_actor.as_str(),
+                    self.bug_tool.as_str(),
+                    self.bug_model.clone(),
+                    id,
+                ],
+            )
+            .await?;
+        if updated == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        if let Some(reason) = reason.map(str::trim).filter(|s| !s.is_empty()) {
+            tx.execute(
+                "INSERT INTO bug_enrichments (bug_id, kind, tool, author, model, created_at, content) VALUES (?, 'comment', ?, ?, ?, ?, ?)",
+                libsql::params![id, self.bug_tool.as_str(), self.bug_actor.as_str(), self.bug_model.clone(), now, reason],
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn get_bug_logs(&self, id: i64) -> Result<Option<String>> {
         let mut rows = self
             .conn
@@ -12391,6 +12448,107 @@ mod tests {
             .expect("should re-claim recovered bug");
         assert_eq!(claimed_again.id, bug_id);
         assert_eq!(claimed_again.pipeline_state, BugPipelineState::Running);
+    }
+
+    /// Assignment writes both columns together, because the schema requires
+    /// assigned_at to be present exactly when there is an assignee.
+    #[tokio::test]
+    async fn test_assign_and_unassign_bug() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-assignable").await;
+        let fresh = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert!(fresh.assignee.is_none());
+        assert!(fresh.assigned_at.is_none());
+
+        let scoped = db.with_bug_actor("triager@example.org", "web", None);
+        assert!(
+            scoped
+                .assign_bug(bug_id, Some("  dev@example.org  "), Some("Owns this area"))
+                .await
+                .unwrap()
+        );
+        let assigned = db.get_bug(bug_id).await.unwrap().unwrap();
+        // The address is stored trimmed so that filtering by exact match works.
+        assert_eq!(assigned.assignee.as_deref(), Some("dev@example.org"));
+        assert!(assigned.assigned_at.is_some());
+        assert!(
+            assigned.enrichments.iter().any(|e| e.kind == "audit"
+                && e.content.as_deref() == Some("Assigned to dev@example.org"))
+        );
+        assert!(
+            assigned
+                .enrichments
+                .iter()
+                .any(|e| e.kind == "comment" && e.content.as_deref() == Some("Owns this area"))
+        );
+
+        // Reassignment is recorded as a handover rather than as two events.
+        scoped
+            .assign_bug(bug_id, Some("other@example.org"), None)
+            .await
+            .unwrap();
+        let reassigned = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(reassigned.assignee.as_deref(), Some("other@example.org"));
+        assert!(reassigned.enrichments.iter().any(|e| {
+            e.content.as_deref() == Some("Reassigned from dev@example.org to other@example.org")
+        }));
+
+        // Clearing the assignee must clear the timestamp with it.
+        scoped.assign_bug(bug_id, None, None).await.unwrap();
+        let cleared = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert!(cleared.assignee.is_none());
+        assert!(cleared.assigned_at.is_none());
+
+        // An unknown bug reports failure instead of silently doing nothing.
+        assert!(!db.assign_bug(999_999, Some("x@y.org"), None).await.unwrap());
+    }
+
+    /// Filtering by assignee must be able to express both "mine" and
+    /// "nobody has picked this up yet".
+    #[tokio::test]
+    async fn test_list_bugs_by_assignee() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let mine = create_pending_bug(&db, "linux-mine").await;
+        let theirs = create_pending_bug(&db, "linux-theirs").await;
+        let nobody = create_pending_bug(&db, "linux-nobody").await;
+        db.assign_bug(mine, Some("me@example.org"), None)
+            .await
+            .unwrap();
+        db.assign_bug(theirs, Some("them@example.org"), None)
+            .await
+            .unwrap();
+
+        let (items, total) = db
+            .list_bugs(ListBugsParams {
+                assignee: Some(AssigneeFilter::Is("me@example.org")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, mine);
+
+        let (items, total) = db
+            .list_bugs(ListBugsParams {
+                assignee: Some(AssigneeFilter::Unassigned),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, nobody);
     }
 
     /// A bug that keeps failing must not be retried forever, and once it stops
