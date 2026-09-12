@@ -1814,10 +1814,7 @@
 
                 if (res.ok) {
                     msg.style.color = 'var(--status-reviewed)';
-                    msg.innerHTML = "<b>Sign-in link sent!</b><br>Please check your inbox (or server logs) to sign in.";
-                } else if (res.status === 403) {
-                    msg.style.color = 'var(--status-failed)';
-                    msg.textContent = "This email address is not authorized to sign in.";
+                    msg.innerHTML = "<b>Sign-in request received.</b><br>If your address is authorized, a sign-in link has been sent to your inbox.";
                 } else {
                     msg.style.color = 'var(--status-failed)';
                     msg.textContent = "Error requesting sign-in link: " + res.statusText;

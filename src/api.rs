@@ -2945,23 +2945,23 @@ mod tests {
 
         let client = reqwest::Client::new();
 
-        // 1. request_link for blocklisted email (even though it's in admins) -> 403 Forbidden
+        // 1. request_link for blocklisted email (even though it's in admins) -> 200 OK (unconditional)
         let res_blocked_admin = client
             .post(format!("http://{}/api/auth/request-link", addr))
             .json(&serde_json::json!({ "email": "admin@example.com" }))
             .send()
             .await
             .unwrap();
-        assert_eq!(res_blocked_admin.status(), 403);
+        assert_eq!(res_blocked_admin.status(), 200);
 
-        // 2. request_link for blocklisted email with case variations -> 403 Forbidden
+        // 2. request_link for blocklisted email with case variations -> 200 OK (unconditional)
         let res_blocked_case = client
             .post(format!("http://{}/api/auth/request-link", addr))
             .json(&serde_json::json!({ "email": "BLOCKED@example.com" }))
             .send()
             .await
             .unwrap();
-        assert_eq!(res_blocked_case.status(), 403);
+        assert_eq!(res_blocked_case.status(), 200);
 
         // 3. request_link for allowed email -> 200 OK
         let res_allowed = client
@@ -3177,6 +3177,132 @@ mod tests {
                 .body
                 .contains("-- \nSashiko AI review · https://sashiko.dev")
         );
+    }
+
+    #[tokio::test]
+    async fn test_request_link_unconditional_response_equivalence() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.smtp = Some(crate::settings::SmtpSettings {
+            server: "smtp.example.org".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            sender_address: "sashiko@sashiko.dev".to_string(),
+            reply_to: None,
+            dry_run: false,
+        });
+        settings.server.jwt_secret = Some("test_jwt_secret_12345678901234567890".to_string());
+        settings.server.testing_mode = false;
+        settings.server.public_base_url = Some("https://sashiko.dev".to_string());
+        settings
+            .server
+            .acl
+            .bug_reporters
+            .push("eligible@example.com".to_string());
+        settings
+            .server
+            .acl
+            .blocklist
+            .push("blocklisted@example.com".to_string());
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(10);
+        let app = build_router(
+            Arc::new(settings),
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            false,
+            true,
+            false,
+        );
+
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+
+        // 1. Eligible address
+        let res_eligible = client
+            .post(format!("http://{}/api/auth/request-link", addr))
+            .json(&serde_json::json!({ "email": "eligible@example.com" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_eligible.status(), 200);
+        let bytes_eligible = res_eligible.bytes().await.unwrap();
+
+        // 2. Ineligible (unknown) address
+        let res_ineligible = client
+            .post(format!("http://{}/api/auth/request-link", addr))
+            .json(&serde_json::json!({ "email": "unregistered@example.com" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_ineligible.status(), 200);
+        let bytes_ineligible = res_ineligible.bytes().await.unwrap();
+
+        // 3. Blocklisted address
+        let res_blocklisted = client
+            .post(format!("http://{}/api/auth/request-link", addr))
+            .json(&serde_json::json!({ "email": "blocklisted@example.com" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_blocklisted.status(), 200);
+        let bytes_blocklisted = res_blocklisted.bytes().await.unwrap();
+
+        // 4. Malformed address
+        let res_malformed_email = client
+            .post(format!("http://{}/api/auth/request-link", addr))
+            .json(&serde_json::json!({ "email": "not-an-email" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_malformed_email.status(), 200);
+        let bytes_malformed_email = res_malformed_email.bytes().await.unwrap();
+
+        // 5. Malformed payload
+        let res_malformed_json = client
+            .post(format!("http://{}/api/auth/request-link", addr))
+            .header("Content-Type", "application/json")
+            .body("{not valid json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_malformed_json.status(), 200);
+        let bytes_malformed_json = res_malformed_json.bytes().await.unwrap();
+
+        // All responses must be byte-identical
+        assert_eq!(bytes_eligible, bytes_ineligible);
+        assert_eq!(bytes_eligible, bytes_blocklisted);
+        assert_eq!(bytes_eligible, bytes_malformed_email);
+        assert_eq!(bytes_eligible, bytes_malformed_json);
+
+        // Only the eligible address must have queued an email
+        let queued = db
+            .lock_pending_email()
+            .await
+            .unwrap()
+            .expect("eligible email queued");
+        assert_eq!(queued.to_addresses, r#"["eligible@example.com"]"#);
+        assert!(db.lock_pending_email().await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3527,6 +3653,7 @@ fn build_sign_in_link_email(
 
 #[derive(serde::Deserialize)]
 struct RequestLinkRequest {
+    #[serde(default)]
     email: String,
 }
 
@@ -3534,62 +3661,68 @@ async fn request_link(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    axum::extract::Json(payload): axum::extract::Json<RequestLinkRequest>,
+    body: axum::body::Bytes,
 ) -> Result<StatusCode, StatusCode> {
     if let Some(secret) = resolve_jwt_secret(&state) {
-        // Enforce that only identities explicitly configured in our ACL get sign-in links sent to them
-        let acl = &state.settings.server.acl;
-        if acl.is_blocklisted(&payload.email) {
-            tracing::warn!(
-                "Login attempt denied for blocklisted identity: {}",
-                payload.email
-            );
-            return Err(StatusCode::FORBIDDEN);
-        }
-        if !acl.is_known_identity(&payload.email) {
-            tracing::warn!(
-                "Unauthorized login attempt for unknown identity: {}",
-                payload.email
-            );
-            return Err(StatusCode::FORBIDDEN);
-        }
-
+        let payload: Option<RequestLinkRequest> = serde_json::from_slice(&body).ok();
+        let email = payload.as_ref().map(|p| p.email.trim()).unwrap_or("");
         let lifetime = state.settings.server.sign_in_link.lifetime_seconds;
-        let token = crate::auth::create_token(
-            &payload.email,
-            &secret,
-            Some("sign_in_link".to_string()),
-            lifetime.max(0) as u64,
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let base_url = state.settings.server.sign_in_base_url();
-        let link = format!("{}/auth/verify?token={}", base_url, token);
 
-        if state.settings.smtp.is_some() {
-            let client_ip = extract_client_ip(&addr, &headers);
-            let body =
-                build_sign_in_link_email(&payload.email, &link, &base_url, lifetime, client_ip);
-            let status = match &state.settings.smtp {
-                Some(s) if s.dry_run => "Dry-Run",
-                _ => "Pending",
-            };
-            state
-                .db
-                .insert_transactional_email(
-                    crate::db::EmailKind::SignInLink,
-                    status,
-                    &payload.email,
-                    "[sashiko] Your sign-in link",
-                    &body,
-                )
-                .await
-                .map_err(|e| {
-                    tracing::error!("Failed to queue sign-in email: {}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
-            tracing::info!("Queued sign-in link email for {}", payload.email);
+        let acl = &state.settings.server.acl;
+        let is_eligible =
+            !email.is_empty() && !acl.is_blocklisted(email) && acl.is_known_identity(email);
+
+        if is_eligible {
+            let token = crate::auth::create_token(
+                email,
+                &secret,
+                Some("sign_in_link".to_string()),
+                lifetime.max(0) as u64,
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let base_url = state.settings.server.sign_in_base_url();
+            let link = format!("{}/auth/verify?token={}", base_url, token);
+
+            if state.settings.smtp.is_some() {
+                let client_ip = extract_client_ip(&addr, &headers);
+                let body = build_sign_in_link_email(email, &link, &base_url, lifetime, client_ip);
+                let status = match &state.settings.smtp {
+                    Some(s) if s.dry_run => "Dry-Run",
+                    _ => "Pending",
+                };
+                state
+                    .db
+                    .insert_transactional_email(
+                        crate::db::EmailKind::SignInLink,
+                        status,
+                        email,
+                        "[sashiko] Your sign-in link",
+                        &body,
+                    )
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("Failed to queue sign-in email: {}", e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })?;
+                tracing::info!("Queued sign-in link email for {}", email);
+            } else {
+                tracing::info!("SIGN-IN LINK REQUESTED for {}: {}", email, link);
+            }
         } else {
-            tracing::info!("SIGN-IN LINK REQUESTED for {}: {}", payload.email, link);
+            // Timing equalization: simulate token creation and DB roundtrip
+            let _ = crate::auth::create_token(
+                "timing-equalizer@sashiko.internal",
+                &secret,
+                Some("sign_in_link".to_string()),
+                lifetime.max(0) as u64,
+            );
+            if state.settings.smtp.is_some() {
+                let _ = state.db.conn.query("SELECT 1", ()).await;
+            }
+            tracing::debug!(
+                "Ignored sign-in link request for ineligible address: {}",
+                email
+            );
         }
 
         Ok(StatusCode::OK)
