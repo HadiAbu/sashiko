@@ -358,6 +358,10 @@ pub fn build_router(
         .route("/bug/{bugid}", get(redirect_bug))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
+        .route(
+            "/auth/verify",
+            get_service(ServeFile::new("static/index.html")),
+        )
         .nest_service("/static", ServeDir::new("static"))
         .layer(middleware::from_fn(redirect_www))
         .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024))
@@ -3096,6 +3100,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sign_in_link_email_delivery_and_logging() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.jwt_secret = Some("test-jwt-secret-for-email-delivery-123".to_string());
+        settings.server.testing_mode = false;
+        settings.server.public_base_url = Some("https://sashiko.dev".to_string());
+        settings.server.acl.admins = vec!["maintainer@example.org".to_string()];
+        settings.smtp = Some(crate::settings::SmtpSettings {
+            server: "smtp.example.org".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            sender_address: "sashiko@sashiko.dev".to_string(),
+            reply_to: None,
+            dry_run: false,
+        });
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            Arc::new(settings),
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            false,
+            true,
+            false,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/api/auth/request-link", addr))
+            .header("x-forwarded-for", "198.51.100.24, 10.0.0.1")
+            .json(&serde_json::json!({ "email": "maintainer@example.org" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+
+        let email = db
+            .lock_pending_email()
+            .await
+            .unwrap()
+            .expect("email was queued in outbox");
+        assert_eq!(email.kind, crate::db::EmailKind::SignInLink);
+        assert_eq!(email.status, "Sending");
+        assert_eq!(email.to_addresses, r#"["maintainer@example.org"]"#);
+        assert_eq!(email.subject, "[sashiko] Your sign-in link");
+        assert!(
+            email
+                .body
+                .contains("https://sashiko.dev/auth/verify?token=")
+        );
+        assert!(email.body.contains("Requested from 198.51.100.24."));
+        assert!(email.body.contains("Open this link within 15 minutes"));
+        assert!(
+            email
+                .body
+                .contains("-- \nSashiko AI review · https://sashiko.dev")
+        );
+    }
+
+    #[tokio::test]
     async fn test_blocklist_outranks_every_bypass() {
         let db_settings = crate::settings::DatabaseSettings {
             url: ":memory:".to_string(),
@@ -3392,16 +3476,67 @@ pub fn is_authorized(
     false
 }
 
+fn resolve_jwt_secret(state: &AppState) -> Option<String> {
+    state
+        .settings
+        .server
+        .jwt_secret
+        .clone()
+        .or_else(|| std::env::var("JWT_SECRET").ok())
+}
+
+fn extract_client_ip(
+    addr: &std::net::SocketAddr,
+    headers: &axum::http::HeaderMap,
+) -> Option<std::net::IpAddr> {
+    for name in ["x-forwarded-for", "x-real-ip", "forwarded"] {
+        if let Some(val) = headers.get(name).and_then(|v| v.to_str().ok()) {
+            let first = val.split(',').next().unwrap_or("").trim();
+            if let Ok(ip) = first.parse::<std::net::IpAddr>() {
+                return Some(ip);
+            }
+        }
+    }
+    Some(addr.ip())
+}
+
+fn build_sign_in_link_email(
+    email: &str,
+    link: &str,
+    base_url: &str,
+    lifetime_seconds: i64,
+    client_ip: Option<std::net::IpAddr>,
+) -> String {
+    let minutes = lifetime_seconds / 60;
+    let ip_line = match client_ip {
+        Some(ip) => format!("\n\nRequested from {}.", ip),
+        None => String::new(),
+    };
+    format!(
+        "Someone asked to sign in to Sashiko as {email}.\n\n\
+         Open this link within {minutes} minutes to continue:\n\n\
+         {link}\
+         {ip_line}\n\n\
+         The link works once and then stops working. If you did not ask to sign\n\
+         in, ignore this message. Nothing has changed and nobody has gained\n\
+         access.\n\n\
+         -- \n\
+         Sashiko AI review · {base_url}"
+    )
+}
+
 #[derive(serde::Deserialize)]
 struct RequestLinkRequest {
     email: String,
 }
 
 async fn request_link(
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Json(payload): axum::extract::Json<RequestLinkRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    if let Some(secret) = &state.settings.server.jwt_secret {
+    if let Some(secret) = resolve_jwt_secret(&state) {
         // Enforce that only identities explicitly configured in our ACL get sign-in links sent to them
         let acl = &state.settings.server.acl;
         if acl.is_blocklisted(&payload.email) {
@@ -3411,40 +3546,52 @@ async fn request_link(
             );
             return Err(StatusCode::FORBIDDEN);
         }
-        let is_known = acl
-            .admins
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(&payload.email))
-            || acl
-                .ingest
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case(&payload.email))
-            || acl
-                .cancel
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case(&payload.email))
-            || acl
-                .review
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case(&payload.email));
-
-        if !is_known {
+        if !acl.is_known_identity(&payload.email) {
             tracing::warn!(
                 "Unauthorized login attempt for unknown identity: {}",
                 payload.email
             );
             return Err(StatusCode::FORBIDDEN);
         }
-        let token =
-            crate::auth::create_token(&payload.email, secret, Some("sign_in_link".to_string()), 1800)
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        tracing::info!(
-            "SIGN-IN LINK REQUESTED for {}: http://{}:{}/?magic_token={}",
-            payload.email,
-            state.settings.server.host,
-            state.settings.server.port,
-            token
-        );
+
+        let lifetime = state.settings.server.sign_in_link.lifetime_seconds;
+        let token = crate::auth::create_token(
+            &payload.email,
+            &secret,
+            Some("sign_in_link".to_string()),
+            lifetime.max(0) as u64,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let base_url = state.settings.server.sign_in_base_url();
+        let link = format!("{}/auth/verify?token={}", base_url, token);
+
+        if state.settings.smtp.is_some() {
+            let client_ip = extract_client_ip(&addr, &headers);
+            let body =
+                build_sign_in_link_email(&payload.email, &link, &base_url, lifetime, client_ip);
+            let status = match &state.settings.smtp {
+                Some(s) if s.dry_run => "Dry-Run",
+                _ => "Pending",
+            };
+            state
+                .db
+                .insert_transactional_email(
+                    crate::db::EmailKind::SignInLink,
+                    status,
+                    &payload.email,
+                    "[sashiko] Your sign-in link",
+                    &body,
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to queue sign-in email: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            tracing::info!("Queued sign-in link email for {}", payload.email);
+        } else {
+            tracing::info!("SIGN-IN LINK REQUESTED for {}: {}", payload.email, link);
+        }
+
         Ok(StatusCode::OK)
     } else {
         Err(StatusCode::NOT_IMPLEMENTED)
@@ -3460,8 +3607,8 @@ async fn verify_link(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<VerifyLinkQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
-    if let Some(secret) = &state.settings.server.jwt_secret {
-        let claims = crate::auth::verify_token(&query.token, secret)
+    if let Some(secret) = resolve_jwt_secret(&state) {
+        let claims = crate::auth::verify_token(&query.token, &secret)
             .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid sign-in link"))?;
         if claims.typ.as_deref() != Some("sign_in_link") {
             return Err((StatusCode::UNAUTHORIZED, "Invalid token type"));
@@ -3470,7 +3617,7 @@ async fn verify_link(
             return Err((StatusCode::FORBIDDEN, "User is blocklisted"));
         }
         let session_token =
-            crate::auth::create_token(&claims.sub, secret, Some("session".to_string()), 86400)
+            crate::auth::create_token(&claims.sub, &secret, Some("session".to_string()), 86400)
                 .map_err(|_| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -3487,13 +3634,13 @@ async fn refresh_token(
     auth: crate::auth::OptionalAuthUser,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
-    if let Some(secret) = &state.settings.server.jwt_secret {
+    if let Some(secret) = resolve_jwt_secret(&state) {
         if let Some(user) = auth.0 {
             if state.settings.server.acl.is_blocklisted(&user.email) {
                 return Err((StatusCode::FORBIDDEN, "User is blocklisted"));
             }
             let session_token =
-                crate::auth::create_token(&user.email, secret, Some("session".to_string()), 86400)
+                crate::auth::create_token(&user.email, &secret, Some("session".to_string()), 86400)
                     .map_err(|_| {
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,

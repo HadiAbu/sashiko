@@ -507,6 +507,26 @@ impl AclSettings {
         list_contains(&self.bug_reporters, email)
     }
 
+    /// Whether the address appears in any capability list.
+    ///
+    /// This answers "is this somebody the operator has configured", which is
+    /// the question a sign-in request asks. It deliberately covers every list,
+    /// including the ones that grant nothing beyond bug access, because an
+    /// address that can do something must be able to sign in and do it.
+    pub fn is_known_identity(&self, email: &str) -> bool {
+        !self.is_blocklisted(email)
+            && [
+                &self.admins,
+                &self.security,
+                &self.bug_reporters,
+                &self.ingest,
+                &self.cancel,
+                &self.review,
+            ]
+            .iter()
+            .any(|list| list_contains(list, email))
+    }
+
     pub fn has_permission(&self, email: &str, perm: Permission) -> bool {
         if self.is_blocklisted(email) {
             return false;
@@ -1113,6 +1133,36 @@ mod tests {
         };
         assert!(acl.is_bug_reporter("tool@example.com"));
         assert!(!acl.is_security("tool@example.com"));
+    }
+
+    #[test]
+    fn test_every_configured_list_may_sign_in() {
+        let acl = AclSettings {
+            admins: vec!["operator@example.org".to_string()],
+            security: vec!["gregkh@linuxfoundation.org".to_string()],
+            bug_reporters: vec!["tool@example.org".to_string()],
+            ingest: vec!["bot@example.org".to_string()],
+            cancel: vec!["cron@example.org".to_string()],
+            review: vec!["reviewer@example.org".to_string()],
+            blocklist: vec!["mallory@example.org".to_string()],
+        };
+
+        // An address that can do something has to be able to sign in and do
+        // it, whichever list put it there.
+        for known in [
+            "operator@example.org",
+            "GregKH@LinuxFoundation.org",
+            "tool@example.org",
+            "bot@example.org",
+            "cron@example.org",
+            " reviewer@example.org ",
+        ] {
+            assert!(acl.is_known_identity(known), "{} cannot sign in", known);
+        }
+
+        assert!(!acl.is_known_identity("mallory@example.org"));
+        assert!(!acl.is_known_identity("stranger@example.org"));
+        assert!(!AclSettings::default().is_known_identity("anyone@example.org"));
     }
 
     #[test]

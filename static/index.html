@@ -1832,9 +1832,10 @@
 
         window.addEventListener('DOMContentLoaded', () => {
             const urlParams = new URLSearchParams(window.location.search);
-            const signInToken = urlParams.get('magic_token');
+            const signInToken = urlParams.get('token');
             if (signInToken) {
-                window.history.replaceState({}, document.title, window.location.pathname + window.location.hash);
+                const cleanPath = window.location.pathname.startsWith('/auth/verify') ? '/' : window.location.pathname;
+                window.history.replaceState({}, document.title, cleanPath + window.location.hash);
                 fetchNewSessionToken(signInToken);
             } else {
                 // Ensure expired token is purged on load
