@@ -3135,6 +3135,34 @@ mod tests {
             .unwrap();
         assert_eq!(res_refresh_allowed.status(), 200);
 
+        // Sign-in link token cannot be used directly as a session API token
+        let res_bearer_sign_in = client
+            .post(format!("http://{}/api/auth/refresh", addr))
+            .header("Authorization", format!("Bearer {}", allowed_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_bearer_sign_in.status(), 401);
+
+        // Session token whose initial issue date is older than 30 days cannot be refreshed
+        let old_iat = (chrono::Utc::now().timestamp() as usize).saturating_sub(31 * 86400);
+        let expired_session_token = crate::auth::create_token_with_session(
+            "reviewer@example.com",
+            secret,
+            Some("session".to_string()),
+            86400,
+            Some(old_iat),
+            Some("old-session-id".to_string()),
+        )
+        .unwrap();
+        let res_expired_refresh = client
+            .post(format!("http://{}/api/auth/refresh", addr))
+            .header("Authorization", format!("Bearer {}", expired_session_token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_expired_refresh.status(), 401);
+
         // 8. Test is_authorized directly:
         let mut proxy_headers = axum::http::HeaderMap::new();
         proxy_headers.insert("x-forwarded-for", "203.0.113.195".parse().unwrap());
@@ -3160,15 +3188,13 @@ mod tests {
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
         });
 
-        let blocked_user = crate::auth::AuthUser {
-            email: "blocked@example.com".to_string(),
-        };
+        let blocked_user = crate::auth::AuthUser::new("blocked@example.com");
         assert!(!is_authorized(
             &dummy_addr,
             &state_arc,
             &proxy_headers,
             Some(&blocked_user),
-            crate::settings::Permission::Review
+            crate::settings::Permission::Review,
         ));
 
         let empty_headers = axum::http::HeaderMap::new();
@@ -3177,12 +3203,10 @@ mod tests {
             &state_arc,
             &empty_headers,
             Some(&blocked_user),
-            crate::settings::Permission::Review
+            crate::settings::Permission::Review,
         ));
 
-        let allowed_user = crate::auth::AuthUser {
-            email: "reviewer@example.com".to_string(),
-        };
+        let allowed_user = crate::auth::AuthUser::new("reviewer@example.com");
         assert!(is_authorized(
             &dummy_addr,
             &state_arc,
@@ -3557,12 +3581,8 @@ mod tests {
             })
         };
 
-        let blocked = crate::auth::AuthUser {
-            email: "blocked@example.org".to_string(),
-        };
-        let operator = crate::auth::AuthUser {
-            email: "operator@example.org".to_string(),
-        };
+        let blocked = crate::auth::AuthUser::new("blocked@example.org");
+        let operator = crate::auth::AuthUser::new("operator@example.org");
         let addr = "127.0.0.1:12345".parse().unwrap();
         let headers = axum::http::HeaderMap::new();
 
@@ -3998,14 +4018,35 @@ async fn refresh_token(
             if state.settings.server.acl.is_blocklisted(&user.email) {
                 return Err((StatusCode::FORBIDDEN, "User is blocklisted"));
             }
-            let session_token =
-                crate::auth::create_token(&user.email, &secret, Some("session".to_string()), 86400)
-                    .map_err(|_| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "Failed to create session",
-                        )
-                    })?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_secs() as usize;
+
+            let max_session_lifetime = 30 * 24 * 3600; // 30 days
+            if let Some(iat) = user.iat
+                && now.saturating_sub(iat) > max_session_lifetime
+            {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "Session has reached maximum lifetime (30 days). Please log in again.",
+                ));
+            }
+
+            let session_token = crate::auth::create_token_with_session(
+                &user.email,
+                &secret,
+                Some("session".to_string()),
+                86400,
+                user.iat,
+                user.sid,
+            )
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to create session",
+                )
+            })?;
             Ok(Json(serde_json::json!({ "token": session_token })))
         } else {
             Err((StatusCode::UNAUTHORIZED, "Missing or invalid token"))
