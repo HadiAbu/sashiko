@@ -1712,7 +1712,6 @@ async fn get_config(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let is_auth = |perm| is_authorized(&addr, &state, &headers, auth.0.as_ref(), perm);
-    let can_action = !state.read_only && is_auth(crate::settings::Permission::Action);
     let can_review = !state.read_only && is_auth(crate::settings::Permission::Review);
     let can_cancel = !state.read_only && is_auth(crate::settings::Permission::Cancel);
     let can_ingest = !state.read_only && is_auth(crate::settings::Permission::Ingest);
@@ -1725,7 +1724,6 @@ async fn get_config(
         "forge_enabled": state.settings.forge.enabled,
         "read_only": state.read_only,
         "permissions": {
-            "action": can_action,
             "review": can_review,
             "cancel": can_cancel,
             "ingest": can_ingest,
@@ -2859,14 +2857,17 @@ mod tests {
             .unwrap();
         assert_eq!(missing.status(), 404);
 
-        // Test 6: get_config reports permissions, and remote unauthenticated action is denied with clear message
+        // Test 6: get_config reports capabilities, and a remote unauthenticated
+        // action is denied with a clear message. Bug authority is deliberately
+        // absent from that report, since it is per bug rather than global.
         let cfg_loopback: serde_json::Value = get(format!("http://{}/api/config", addr))
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        assert_eq!(cfg_loopback["permissions"]["action"], true);
+        assert_eq!(cfg_loopback["permissions"]["review"], true);
+        assert!(cfg_loopback["permissions"]["action"].is_null());
 
         let cfg_remote: serde_json::Value = client
             .get(format!("http://{}/api/config", addr))
@@ -2877,7 +2878,7 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(cfg_remote["permissions"]["action"], false);
+        assert_eq!(cfg_remote["permissions"]["review"], false);
 
         let remote_denied = reqwest::Client::new()
             .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
@@ -3424,10 +3425,6 @@ async fn request_link(
                 .any(|e| e.eq_ignore_ascii_case(&payload.email))
             || acl
                 .review
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case(&payload.email))
-            || acl
-                .action
                 .iter()
                 .any(|e| e.eq_ignore_ascii_case(&payload.email));
 

@@ -422,7 +422,6 @@ pub enum Permission {
     Ingest,
     Cancel,
     Review,
-    Action,
 }
 
 impl Permission {
@@ -443,7 +442,6 @@ impl Permission {
             Permission::Ingest => true,
             Permission::Cancel => true,
             Permission::Review => true,
-            Permission::Action => true,
         }
     }
 }
@@ -473,8 +471,6 @@ pub struct AclSettings {
     pub cancel: Vec<String>,
     #[serde(default)]
     pub review: Vec<String>,
-    #[serde(default)]
-    pub action: Vec<String>,
     #[serde(default)]
     pub blocklist: Vec<String>,
 }
@@ -522,7 +518,6 @@ impl AclSettings {
             Permission::Ingest => list_contains(&self.ingest, email),
             Permission::Cancel => list_contains(&self.cancel, email),
             Permission::Review => list_contains(&self.review, email),
-            Permission::Action => list_contains(&self.action, email),
         }
     }
 }
@@ -883,7 +878,6 @@ mod tests {
         assert!(!acl.has_permission(email, Permission::Ingest));
         assert!(!acl.has_permission(email, Permission::Cancel));
         assert!(!acl.has_permission(email, Permission::Review));
-        assert!(!acl.has_permission(email, Permission::Action));
     }
 
     #[test]
@@ -895,7 +889,6 @@ mod tests {
         assert!(acl.has_permission("admin@example.com", Permission::Ingest));
         assert!(acl.has_permission("admin@example.com", Permission::Cancel));
         assert!(acl.has_permission("admin@example.com", Permission::Review));
-        assert!(acl.has_permission("admin@example.com", Permission::Action));
     }
 
     #[test]
@@ -904,14 +897,12 @@ mod tests {
             ingest: vec!["bot@example.com".to_string()],
             cancel: vec!["cron@example.com".to_string()],
             review: vec!["reviewer@example.com".to_string()],
-            action: vec!["collab@example.com".to_string()],
             ..Default::default()
         };
 
         assert!(acl.has_permission("bot@example.com", Permission::Ingest));
         assert!(!acl.has_permission("bot@example.com", Permission::Cancel));
         assert!(!acl.has_permission("bot@example.com", Permission::Review));
-        assert!(!acl.has_permission("bot@example.com", Permission::Action));
 
         assert!(acl.has_permission("reviewer@example.com", Permission::Review));
         assert!(!acl.has_permission("reviewer@example.com", Permission::Ingest));
@@ -924,7 +915,6 @@ mod tests {
             ingest: vec!["rogue_admin@example.com".to_string()],
             cancel: vec!["rogue_admin@example.com".to_string()],
             review: vec!["rogue_admin@example.com".to_string()],
-            action: vec!["rogue_admin@example.com".to_string()],
             blocklist: vec!["rogue_admin@example.com".to_string()],
             ..Default::default()
         };
@@ -933,7 +923,6 @@ mod tests {
         assert!(!acl.has_permission("rogue_admin@example.com", Permission::Ingest));
         assert!(!acl.has_permission("rogue_admin@example.com", Permission::Cancel));
         assert!(!acl.has_permission("rogue_admin@example.com", Permission::Review));
-        assert!(!acl.has_permission("rogue_admin@example.com", Permission::Action));
     }
 
     #[test]
@@ -971,12 +960,7 @@ mod tests {
         assert!(acl.is_security("gregkh@linuxfoundation.org"));
         // Membership is about bugs. It must not leak into the capabilities
         // that spend money or move patches around.
-        for perm in [
-            Permission::Ingest,
-            Permission::Cancel,
-            Permission::Review,
-            Permission::Action,
-        ] {
+        for perm in [Permission::Ingest, Permission::Cancel, Permission::Review] {
             assert!(!acl.has_permission("gregkh@linuxfoundation.org", perm));
         }
         assert!(!acl.is_admin("gregkh@linuxfoundation.org"));

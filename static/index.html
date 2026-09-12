@@ -1633,9 +1633,6 @@
 
         function canPerformBugActions() {
             if (config && config.read_only) return false;
-            if (config && config.permissions && typeof config.permissions.action === 'boolean') {
-                return config.permissions.action;
-            }
             return !!getAuthToken();
         }
 

@@ -165,8 +165,6 @@ ingest = []
 cancel = []
 # Review allows triggering intensive AI analyses on existing patches.
 review = []
-# Action allows collaborating on bugs (posting comments, marking duplicates, attaching reproducers).
-action = []
 # Blocklist explicitly denies all capabilities and access, overriding any grants.
 blocklist = []
 
