@@ -17,6 +17,7 @@ pub mod ai;
 pub mod api;
 pub mod auth;
 pub mod baseline;
+pub mod bug_access;
 pub mod compression;
 pub mod db;
 pub mod email_policy;
