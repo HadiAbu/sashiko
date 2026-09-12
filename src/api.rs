@@ -1307,9 +1307,8 @@ struct AnalyzeBugPayload {
 }
 
 async fn analyze_bug(
-    auth: crate::auth::OptionalAuthUser,
+    principal: BugPrincipal,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<AnalyzeBugPayload>,
 ) -> Result<Json<crate::workflows::linux_bug::BugOutcome>, (StatusCode, String)> {
@@ -1320,25 +1319,24 @@ async fn analyze_bug(
         ));
     }
 
-    if !is_authorized(
-        &addr,
-        &state,
-        &headers,
-        auth.0.as_ref(),
-        crate::settings::Permission::Review,
-    ) {
+    // Filing a bug runs an LLM analysis, so it costs money and is granted
+    // explicitly rather than falling out of any read or review capability.
+    if !principal.may_create() {
         return Err((
             StatusCode::FORBIDDEN,
-            "You don't have permissions to analyze bugs.".to_string(),
+            "You don't have permissions to file bugs.".to_string(),
         ));
     }
 
     let provider = match crate::ai::create_provider_cached(&state.settings, false, 0).await {
         Ok(p) => p,
         Err(e) => {
+            // The reason names the provider and its configuration, so it stays
+            // in the log rather than going back over the wire.
+            tracing::error!("Failed to create AI provider: {}", e);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create AI provider: {}", e),
+                "Analysis is unavailable.".to_string(),
             ));
         }
     };
@@ -1389,11 +1387,11 @@ async fn analyze_bug(
             .collect();
     }
 
-    let actor = auth
-        .0
-        .as_ref()
-        .map(|u| u.email.clone())
-        .unwrap_or_else(|| format!("authorized client ({})", addr.ip()));
+    let actor = if principal.email().is_empty() {
+        format!("authorized client ({})", addr.ip())
+    } else {
+        principal.email().to_string()
+    };
     let attributed_db = state.db.with_bug_actor(&actor, &source_tool, source_model);
     match crate::workflows::linux_bug::process_issue(
         provider.as_ref(),
@@ -1406,10 +1404,12 @@ async fn analyze_bug(
     {
         Ok(outcome) => Ok(Json(outcome)),
         Err(e) => {
+            // The failure quotes paths, prompts and provider responses, none of
+            // which belong in a response body.
             tracing::error!("Pre-existing bug analysis failed: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Analysis failed: {}", e),
+                "Analysis failed.".to_string(),
             ))
         }
     }
@@ -3132,6 +3132,8 @@ mod tests {
         settings.server.acl.admins = vec!["operator@example.org".to_string()];
         settings.server.acl.security = Vec::new();
         settings.server.acl.blocklist = Vec::new();
+        settings.server.acl.bug_reporters = Vec::new();
+        settings.server.read_only = false;
         let settings = Arc::new(settings);
 
         let (event_tx, _event_rx) = mpsc::channel(10);
@@ -3244,6 +3246,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unauthenticated_action.status(), 401);
+
+        // Filing a bug spends money, so it needs the create capability. The
+        // principal is resolved before the body is, so an anonymous caller is
+        // turned away without the payload being looked at.
+        let analyze = |bearer: Option<String>| {
+            let mut req = client
+                .post(format!("http://{}/api/bug/analyze", addr))
+                .json(&serde_json::json!({
+                    "problem": "a use after free",
+                    "reasoning": "the pointer outlives the allocation",
+                    "source_files": [],
+                }));
+            if let Some(bearer) = bearer {
+                req = req.header("Authorization", format!("Bearer {}", bearer));
+            }
+            req.send()
+        };
+
+        let unauthenticated_analyze = analyze(None).await.unwrap();
+        assert_eq!(unauthenticated_analyze.status(), 401);
+
+        // A session alone is not enough, and the refusal happens before any
+        // provider is built.
+        let denied_analyze = analyze(Some(stranger)).await.unwrap();
+        assert_eq!(denied_analyze.status(), 403);
+        assert_eq!(
+            denied_analyze.text().await.unwrap(),
+            "You don't have permissions to file bugs."
+        );
     }
 }
 
