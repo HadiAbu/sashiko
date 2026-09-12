@@ -1380,6 +1380,10 @@ impl Reviewer {
                                         } else {
                                             Vec::new()
                                         };
+                                        let matched_subsystems: Vec<_> = matched_subsystems
+                                            .into_iter()
+                                            .map(crate::db::AttributedSubsystem::from_maintainers)
+                                            .collect();
 
                                         let input = crate::workflows::linux_bug::BugInput {
                                             problem,
@@ -3653,7 +3657,7 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 source_ref: None,
                 vector_json: None,
                 duplicate_of_id: None,
-                subsystems: vec!["net".to_string()],
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers("net")],
             })
             .await?;
         db.add_bug_enrichment(

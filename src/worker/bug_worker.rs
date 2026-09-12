@@ -1,5 +1,5 @@
 use crate::ai::AiProvider;
-use crate::db::Database;
+use crate::db::{AttributedSubsystem, Database, SubsystemSource};
 use crate::toolbox::ToolBox;
 use crate::workflows::linux_bug::BugInput;
 use std::sync::Arc;
@@ -84,7 +84,18 @@ impl BugWorker {
                                 .severity_explanation()
                                 .unwrap_or_else(|| "No reasoning provided.".to_string()),
                             locations: bug.locations(),
-                            subsystems: bug.subsystems.clone(),
+                            // The stored bug keeps the subsystem names but the
+                            // read model drops their provenance, so they are
+                            // rebuilt as caller supplied. Nothing is lost: the
+                            // analysis re-resolves subsystems from MAINTAINERS
+                            // before the outcome is written back.
+                            subsystems: bug
+                                .subsystems
+                                .iter()
+                                .map(|name| {
+                                    AttributedSubsystem::new(name, SubsystemSource::CallerSupplied)
+                                })
+                                .collect(),
                             source_files: bug.source_files().unwrap_or_default(),
                             commit_sha: bug.discovered_in_commit.clone(),
                             patchset_id: bug.discovered_in_patchset_id,

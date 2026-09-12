@@ -1264,13 +1264,19 @@ async fn analyze_bug(
         .or_else(|| Some(provider.get_capabilities().model_name));
     let mut payload = payload.input;
     if payload.subsystems.is_empty() && !payload.source_files.is_empty() {
-        if let Some(mindex) = crate::maintainers::get_global_maintainers() {
-            payload.subsystems = mindex.match_files(&payload.source_files);
+        let matched = if let Some(mindex) = crate::maintainers::get_global_maintainers() {
+            mindex.match_files(&payload.source_files)
         } else if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_top_of_trunk(
             &state.settings.git.repository_path,
         ) {
-            payload.subsystems = mindex.match_files(&payload.source_files);
-        }
+            mindex.match_files(&payload.source_files)
+        } else {
+            Vec::new()
+        };
+        payload.subsystems = matched
+            .into_iter()
+            .map(crate::db::AttributedSubsystem::from_maintainers)
+            .collect();
     }
 
     let actor = auth
@@ -2264,7 +2270,9 @@ mod tests {
                 source_ref: None,
                 vector_json: None,
                 duplicate_of_id: None,
-                subsystems: vec!["drivers/net".to_string()],
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                    "drivers/net",
+                )],
             })
             .await
             .unwrap();
@@ -2549,7 +2557,9 @@ mod tests {
                 source_ref: None,
                 vector_json: None,
                 duplicate_of_id: None,
-                subsystems: vec!["drivers/net".to_string()],
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                    "drivers/net",
+                )],
             })
             .await
             .unwrap();

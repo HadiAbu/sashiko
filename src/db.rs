@@ -666,7 +666,110 @@ pub struct NewBug {
     pub vector_json: Option<String>,
     pub duplicate_of_id: Option<i64>,
     #[serde(default)]
-    pub subsystems: Vec<String>,
+    pub subsystems: Vec<AttributedSubsystem>,
+}
+
+/// Where a subsystem name attached to a bug came from.
+///
+/// Only [`SubsystemSource::MaintainersSection`] identifies a real kernel
+/// maintainer, so only that variant can confer access to a bug. The other two
+/// are useful for display and filtering and confer nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubsystemSource {
+    /// A section title matched out of the kernel MAINTAINERS file.
+    MaintainersSection,
+    /// A directory prefix derived from the touched paths, or the `kernel`
+    /// sentinel used when nothing more specific could be determined.
+    PathPrefix,
+    /// Supplied verbatim by whoever filed the bug. The default, because a name
+    /// of unknown origin must not be mistaken for a maintainer's jurisdiction.
+    #[default]
+    CallerSupplied,
+}
+
+impl SubsystemSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MaintainersSection => "maintainers_section",
+            Self::PathPrefix => "path_prefix",
+            Self::CallerSupplied => "caller_supplied",
+        }
+    }
+
+    /// Parses a stored value, treating anything unrecognised as caller
+    /// supplied so that an unexpected string cannot widen access.
+    pub fn from_stored(value: &str) -> Self {
+        match value {
+            "maintainers_section" => Self::MaintainersSection,
+            "path_prefix" => Self::PathPrefix,
+            _ => Self::CallerSupplied,
+        }
+    }
+
+    /// Whether a row with this provenance can grant a maintainer access to the
+    /// bug it is attached to.
+    pub fn confers_authority(&self) -> bool {
+        matches!(self, Self::MaintainersSection)
+    }
+}
+
+/// Attaches a subsystem to a bug, refreshing the provenance when the pair is
+/// already present. Rewriting the provenance matters: a name that used to be
+/// caller supplied and is later matched out of MAINTAINERS has to start
+/// conferring authority, and a name that stops matching has to stop.
+const UPSERT_BUG_SUBSYSTEM_SQL: &str = "INSERT INTO bug_subsystems (bug_id, subsystem, source) \
+     VALUES (?, ?, ?) \
+     ON CONFLICT(bug_id, subsystem) DO UPDATE SET source = excluded.source";
+
+/// A subsystem name together with the provenance of that name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttributedSubsystem {
+    pub name: String,
+    pub source: SubsystemSource,
+}
+
+impl AttributedSubsystem {
+    pub fn new(name: impl Into<String>, source: SubsystemSource) -> Self {
+        Self {
+            name: name.into(),
+            source,
+        }
+    }
+
+    /// A name matched out of MAINTAINERS, which is the only kind that grants
+    /// a maintainer authority over the bug.
+    pub fn from_maintainers(name: impl Into<String>) -> Self {
+        Self::new(name, SubsystemSource::MaintainersSection)
+    }
+
+    /// A directory prefix or sentinel derived from the touched paths.
+    pub fn from_path_prefix(name: impl Into<String>) -> Self {
+        Self::new(name, SubsystemSource::PathPrefix)
+    }
+}
+
+/// Accepts either a bare string or an object. A bare string is recorded as
+/// caller supplied, which is the fail-closed reading of a name whose origin
+/// was never stated.
+impl<'de> Deserialize<'de> for AttributedSubsystem {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bare(String),
+            Attributed {
+                name: String,
+                #[serde(default)]
+                source: SubsystemSource,
+            },
+        }
+
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Bare(name) => Self::new(name, SubsystemSource::CallerSupplied),
+            Repr::Attributed { name, source } => Self::new(name, source),
+        })
+    }
 }
 
 fn default_bug_title() -> String {
@@ -728,7 +831,7 @@ pub struct UpdateBugOutcomeParams<'a> {
     /// never be mistaken for a triage decision.
     pub lifecycle_status: BugLifecycleStatus,
     pub problem: Option<&'a str>,
-    pub subsystems: Option<&'a [String]>,
+    pub subsystems: Option<&'a [AttributedSubsystem]>,
     pub source_files: Option<&'a [String]>,
     pub locations: Option<&'a serde_json::Value>,
     pub severity: Severity,
@@ -1503,13 +1606,12 @@ impl Database {
         if let Some(row) = rows.next().await? {
             let id: i64 = row.get(0)?;
             for sub in &bug.subsystems {
-                let trimmed = sub.trim();
+                let trimmed = sub.name.trim();
                 if !trimmed.is_empty() {
-                    self
-                        .conn
+                    self.conn
                         .execute(
-                            "INSERT OR IGNORE INTO bug_subsystems (bug_id, subsystem) VALUES (?, ?)",
-                            libsql::params![id, trimmed],
+                            UPSERT_BUG_SUBSYSTEM_SQL,
+                            libsql::params![id, trimmed, sub.source.as_str()],
                         )
                         .await?;
                 }
@@ -2492,7 +2594,11 @@ impl Database {
         self.store_bug_vector(id, vector_json).await
     }
 
-    pub async fn update_bug_subsystems(&self, id: i64, subsystems: &[String]) -> Result<()> {
+    pub async fn update_bug_subsystems(
+        &self,
+        id: i64,
+        subsystems: &[AttributedSubsystem],
+    ) -> Result<()> {
         let tx = self.conn.transaction().await?;
         tx.execute("UPDATE bugs SET audit_author = ?, audit_tool = ?, audit_model = ?, updated_at = ? WHERE id = ?", libsql::params![self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), chrono::Utc::now().timestamp(), id]).await?;
         let mut rows = tx
@@ -2501,14 +2607,14 @@ impl Database {
                 libsql::params![id],
             )
             .await?;
-        let wanted: std::collections::BTreeSet<_> = subsystems
+        let wanted: std::collections::BTreeMap<&str, SubsystemSource> = subsystems
             .iter()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
+            .map(|s| (s.name.trim(), s.source))
+            .filter(|(name, _)| !name.is_empty())
             .collect();
         while let Some(row) = rows.next().await? {
             let sub: String = row.get(0)?;
-            if !wanted.contains(sub.as_str()) {
+            if !wanted.contains_key(sub.as_str()) {
                 tx.execute(
                     "DELETE FROM bug_subsystems WHERE bug_id = ? AND subsystem = ?",
                     libsql::params![id, sub],
@@ -2516,10 +2622,10 @@ impl Database {
                 .await?;
             }
         }
-        for sub in wanted {
+        for (name, source) in wanted {
             tx.execute(
-                "INSERT OR IGNORE INTO bug_subsystems (bug_id, subsystem) VALUES (?, ?)",
-                libsql::params![id, sub],
+                UPSERT_BUG_SUBSYSTEM_SQL,
+                libsql::params![id, name, source.as_str()],
             )
             .await?;
         }
@@ -2604,7 +2710,9 @@ impl Database {
                     data_json: Some(serde_json::json!({
                         "severity": params.severity.as_str(),
                         "severity_int": params.severity as i32,
-                        "subsystems": params.subsystems,
+                        "subsystems": params
+                            .subsystems
+                            .map(|subs| subs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()),
                     })),
                     ..Default::default()
                 },
@@ -6677,7 +6785,8 @@ mod tests {
                 json!({"bugid": "scoped", "title": "test"}),
             )?)
             .await?;
-        bot.update_bug_subsystems(id, &["net".into()]).await?;
+        bot.update_bug_subsystems(id, &[AttributedSubsystem::from_maintainers("net")])
+            .await?;
         alice.update_bug_title(id, "Changed by Alice").await?;
         bot.update_bug_vector(id, "{}").await?;
         let bug = db.get_bug(id).await?.unwrap();
@@ -6700,7 +6809,8 @@ mod tests {
         assert_eq!(subsystem.author.as_deref(), Some("bot"));
         assert_eq!(subsystem.model.as_deref(), Some("external-model"));
         let count = bug.enrichments.len();
-        bot.update_bug_subsystems(id, &["net".into()]).await?;
+        bot.update_bug_subsystems(id, &[AttributedSubsystem::from_maintainers("net")])
+            .await?;
         assert_eq!(db.get_bug(id).await?.unwrap().enrichments.len(), count);
         // A legacy report has no invented model attribution.
         let evidence = db.bug_evidence(id).await?;
@@ -6708,6 +6818,92 @@ mod tests {
         assert_eq!(evidence["unknown_models"], 1);
         assert_eq!(evidence["models"], json!([]));
         Ok(())
+    }
+
+    /// Reads the stored provenance for every subsystem attached to a bug.
+    async fn stored_subsystem_sources(db: &Database, bug_id: i64) -> Result<Vec<(String, String)>> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT subsystem, source FROM bug_subsystems WHERE bug_id = ? ORDER BY subsystem",
+                libsql::params![bug_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get(0)?, row.get(1)?));
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn test_bug_subsystem_provenance_is_recorded_and_refreshed() -> Result<()> {
+        let db = setup_db().await;
+        let mut bug: NewBug =
+            serde_json::from_value(json!({"bugid": "provenance", "title": "test"}))?;
+        bug.subsystems = vec![
+            AttributedSubsystem::from_maintainers("NETWORKING [IPv4/IPv6]"),
+            AttributedSubsystem::from_path_prefix("net/ipv4"),
+            AttributedSubsystem::new("whatever the caller said", SubsystemSource::default()),
+        ];
+        let id = db.create_bug(&bug).await?;
+
+        assert_eq!(
+            stored_subsystem_sources(&db, id).await?,
+            vec![
+                (
+                    "NETWORKING [IPv4/IPv6]".to_string(),
+                    "maintainers_section".to_string()
+                ),
+                ("net/ipv4".to_string(), "path_prefix".to_string()),
+                (
+                    "whatever the caller said".to_string(),
+                    "caller_supplied".to_string()
+                ),
+            ]
+        );
+
+        // A later run that matches the same name out of MAINTAINERS has to
+        // upgrade the provenance rather than leave the stale value behind.
+        db.update_bug_subsystems(id, &[AttributedSubsystem::from_maintainers("net/ipv4")])
+            .await?;
+        assert_eq!(
+            stored_subsystem_sources(&db, id).await?,
+            vec![("net/ipv4".to_string(), "maintainers_section".to_string())]
+        );
+
+        let reattributed = db
+            .get_bug(id)
+            .await?
+            .unwrap()
+            .enrichments
+            .iter()
+            .filter(|e| {
+                e.data_json
+                    .as_ref()
+                    .is_some_and(|d| d["action"] == "subsystem_reattributed")
+            })
+            .count();
+        assert_eq!(reattributed, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn test_bare_subsystem_name_deserializes_as_caller_supplied() {
+        let bug: NewBug = serde_json::from_value(json!({
+            "bugid": "b",
+            "title": "t",
+            "subsystems": ["net", {"name": "fs", "source": "maintainers_section"}, {"name": "mm"}],
+        }))
+        .unwrap();
+        assert_eq!(
+            bug.subsystems,
+            vec![
+                AttributedSubsystem::new("net", SubsystemSource::CallerSupplied),
+                AttributedSubsystem::from_maintainers("fs"),
+                AttributedSubsystem::new("mm", SubsystemSource::CallerSupplied),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -6739,7 +6935,7 @@ mod tests {
             source_ref: None,
             vector_json: None,
             duplicate_of_id: None,
-            subsystems: vec!["net".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
         };
         let bug_id = db
             .create_bug_with_enrichment(
@@ -6865,7 +7061,7 @@ mod tests {
             source_ref: None,
             vector_json: None,
             duplicate_of_id: None,
-            subsystems: vec!["net".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
         };
         let bug1_id = db
             .create_bug_with_enrichment(
@@ -6901,7 +7097,7 @@ mod tests {
             source_ref: None,
             vector_json: None,
             duplicate_of_id: None,
-            subsystems: vec!["net".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
         };
         let bug2_id = db
             .create_bug_with_enrichment(
@@ -6944,7 +7140,7 @@ mod tests {
             source_ref: None,
             vector_json: None,
             duplicate_of_id: None,
-            subsystems: vec!["net".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
         };
         let bug3_id = db
             .create_bug_with_enrichment(
@@ -6987,7 +7183,7 @@ mod tests {
             source_ref: None,
             vector_json: None,
             duplicate_of_id: None,
-            subsystems: vec!["net".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
         };
         let bug4_id = db.create_bug(&bug4).await?;
         db.mark_bug_as_duplicate(MarkDuplicateBugParams {
@@ -11992,7 +12188,7 @@ mod tests {
             source_ref: None,
             vector_json: Some("[0.1, 0.2, 0.3]".to_string()),
             duplicate_of_id: None,
-            subsystems: vec!["net/core".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net/core")],
         };
 
         let bug_id = db.create_bug(&bug).await.unwrap();
@@ -12258,7 +12454,7 @@ mod tests {
             source_ref: None,
             vector_json: None,
             duplicate_of_id: None,
-            subsystems: vec!["net/core".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net/core")],
         };
         let dup_id = db.create_bug(&dup_bug).await.unwrap();
         let dup_params = MarkDuplicateBugParams {
@@ -12342,7 +12538,7 @@ mod tests {
             source_ref: None,
             vector_json: None,
             duplicate_of_id: None,
-            subsystems: vec!["kernel".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("kernel")],
         })
         .await
         .unwrap()
@@ -12583,7 +12779,7 @@ mod tests {
             source_ref: Some("https://syzkaller.appspot.com/bug?id=12345".to_string()),
             vector_json: None,
             duplicate_of_id: None,
-            subsystems: vec!["net".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
         };
         let bug_id = db.create_bug(&new_bug).await.unwrap();
 

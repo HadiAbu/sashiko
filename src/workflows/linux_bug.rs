@@ -33,7 +33,7 @@ use crate::ai::vector_search::{
     DEFAULT_SIMILARITY_THRESHOLD, DEFAULT_TOP_CANDIDATES, extract_bug_vector, find_top_candidates,
 };
 use crate::ai::{AiProvider, AiResponse, AiResponseFormat, AiTool};
-use crate::db::{Bug, Database, NewBug, Severity};
+use crate::db::{AttributedSubsystem, Bug, Database, NewBug, Severity};
 use crate::toolbox::ToolBox;
 
 /// Named stages of the Linux kernel bug pipeline, in execution order.
@@ -116,7 +116,7 @@ pub struct BugInput {
     pub reasoning: String,
     pub locations: Option<Value>,
     #[serde(default)]
-    pub subsystems: Vec<String>,
+    pub subsystems: Vec<AttributedSubsystem>,
     pub source_files: Vec<String>,
     pub commit_sha: Option<String>,
     pub patchset_id: Option<i64>,
@@ -549,6 +549,55 @@ pub fn extract_directory_subsystems(files: &[String]) -> Vec<String> {
         vec!["kernel".to_string()]
     } else {
         subs
+    }
+}
+
+/// Resolves the subsystems to record against a bug, retaining where each name
+/// came from.
+///
+/// A MAINTAINERS match is the only origin that names a real maintainer, so the
+/// provenance has to travel with the name from the moment it is produced. The
+/// lookup order is unchanged: an available index wins, a directory prefix is
+/// the fallback, and a name the caller supplied is only used when no index can
+/// be consulted at all.
+fn resolve_official_subsystems(
+    tools: Option<&ToolBox>,
+    input_subsystems: &[AttributedSubsystem],
+    verified_files: &[String],
+) -> Vec<AttributedSubsystem> {
+    let from_index = |index: &crate::maintainers::MaintainersIndex| {
+        let matched = index.match_files(verified_files);
+        (!matched.is_empty()).then(|| {
+            matched
+                .into_iter()
+                .map(AttributedSubsystem::from_maintainers)
+                .collect::<Vec<_>>()
+        })
+    };
+    let from_paths = || {
+        extract_directory_subsystems(verified_files)
+            .into_iter()
+            .map(AttributedSubsystem::from_path_prefix)
+            .collect::<Vec<_>>()
+    };
+
+    if let Some(tb) = tools {
+        return match crate::maintainers::get_global_maintainers() {
+            Some(index) => from_index(&index).unwrap_or_else(from_paths),
+            None => match crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path()) {
+                Ok(index) => from_index(&index).unwrap_or_else(from_paths),
+                Err(_) => from_paths(),
+            },
+        };
+    }
+
+    if !input_subsystems.is_empty() {
+        return input_subsystems.to_vec();
+    }
+
+    match crate::maintainers::get_global_maintainers() {
+        Some(index) => from_index(&index).unwrap_or_else(from_paths),
+        None => from_paths(),
     }
 }
 
@@ -1846,39 +1895,10 @@ pub async fn process_issue_worker(
         verified_files = effective_source_files.clone();
     }
 
-    // Determine official subsystems programmatically from MAINTAINERS
-    let official_subsystems = if let Some(ref tb) = tools {
-        if let Some(mindex) = crate::maintainers::get_global_maintainers() {
-            let matched = mindex.match_files(&verified_files);
-            if !matched.is_empty() {
-                matched
-            } else {
-                extract_directory_subsystems(&verified_files)
-            }
-        } else if let Ok(mindex) =
-            crate::maintainers::MaintainersIndex::from_repo(tb.get_worktree_path())
-        {
-            let matched = mindex.match_files(&verified_files);
-            if !matched.is_empty() {
-                matched
-            } else {
-                extract_directory_subsystems(&verified_files)
-            }
-        } else {
-            extract_directory_subsystems(&verified_files)
-        }
-    } else if !input.subsystems.is_empty() {
-        input.subsystems.clone()
-    } else if let Some(mindex) = crate::maintainers::get_global_maintainers() {
-        let matched = mindex.match_files(&verified_files);
-        if !matched.is_empty() {
-            matched
-        } else {
-            extract_directory_subsystems(&verified_files)
-        }
-    } else {
-        extract_directory_subsystems(&verified_files)
-    };
+    let official_subsystems =
+        resolve_official_subsystems(tools.as_deref(), &input.subsystems, &verified_files);
+    let official_subsystem_names: Vec<String> =
+        official_subsystems.iter().map(|s| s.name.clone()).collect();
 
     let title_prefix = extract_title_prefix(&norm.canonical_title);
 
@@ -1954,7 +1974,7 @@ pub async fn process_issue_worker(
     info!("--- Stage 3: Deduplication ---");
     let query_vector = extract_bug_vector(
         &norm.canonical_title,
-        &official_subsystems,
+        &official_subsystem_names,
         &verified_files,
         verified_locations.as_ref(),
     );
@@ -1982,7 +2002,7 @@ pub async fn process_issue_worker(
             let mut dedup_session = DedupSession {
                 candidate_problem: &norm.canonical_title,
                 candidate_locations: verified_locations.as_ref(),
-                candidate_subsystems: &official_subsystems,
+                candidate_subsystems: &official_subsystem_names,
                 known_candidates: &candidate_bugs,
                 context_tag: context_tag.map(|s| s.to_string()),
             };
@@ -2148,7 +2168,7 @@ pub async fn process_issue_worker(
 mod tests {
     use super::*;
     use crate::ai::{AiRequest, ProviderCapabilities};
-    use crate::db::BugEnrichment;
+    use crate::db::{BugEnrichment, SubsystemSource};
     use serde_json::json;
 
     struct MockAiProvider {
@@ -2186,7 +2206,7 @@ mod tests {
             problem: "Memory leak in net/core/dev.c".to_string(),
             reasoning: "Allocated buffer not freed on error path".to_string(),
             locations: Some(json!([{"file": "net/core/dev.c", "line": 100}])),
-            subsystems: vec!["net".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
             source_files: vec!["net/core/dev.c".to_string()],
             commit_sha: None,
             patchset_id: None,
@@ -2257,7 +2277,7 @@ mod tests {
             problem: "NULL deref in net/core/dev.c".to_string(),
             reasoning: "ptr might be null".to_string(),
             locations: Some(json!([{"file": "net/core/dev.c", "line": 100}])),
-            subsystems: vec!["net".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
             source_files: vec!["net/core/dev.c".to_string()],
             commit_sha: None,
             patchset_id: None,
@@ -2638,7 +2658,7 @@ mod tests {
             problem: "Unchecked length".into(),
             reasoning: "Length is unbounded".into(),
             locations: None,
-            subsystems: vec!["net".into()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
             source_files: vec!["net/core/dev.c".into()],
             commit_sha: None,
             patchset_id: None,
@@ -2722,7 +2742,7 @@ mod tests {
             problem: "UAF in foo()".to_string(),
             reasoning: "Freed then used".to_string(),
             locations: None,
-            subsystems: vec!["net".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net")],
             source_files: vec!["net/foo.c".to_string()],
             commit_sha: None,
             patchset_id: None,
@@ -2730,6 +2750,8 @@ mod tests {
             baseline_sha: None,
         };
         let no_files: Vec<String> = Vec::new();
+        let subsystem_names: Vec<String> =
+            input.subsystems.iter().map(|s| s.name.clone()).collect();
 
         let prompts: Vec<(BugStage, String)> = vec![
             (
@@ -2765,7 +2787,7 @@ mod tests {
                 DedupSession {
                     candidate_problem: &input.problem,
                     candidate_locations: None,
-                    candidate_subsystems: &input.subsystems,
+                    candidate_subsystems: &subsystem_names,
                     known_candidates: &[],
                     context_tag: None,
                 }
@@ -2964,7 +2986,7 @@ mod tests {
             locations: Some(
                 json!([{"file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "line": 250}]),
             ),
-            subsystems: vec!["net/intel".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net/intel")],
             source_files: vec!["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
             commit_sha: Some("abcdef123456".to_string()),
             patchset_id: Some(ps_id),
@@ -3040,7 +3062,7 @@ mod tests {
                 source_ref: None,
                 vector_json: Some(existing_vector.to_json()),
                 duplicate_of_id: None,
-                subsystems: vec!["net/intel".to_string()],
+                subsystems: vec![AttributedSubsystem::from_maintainers("net/intel")],
             })
             .await
             .unwrap();
@@ -3095,7 +3117,7 @@ mod tests {
             locations: Some(
                 json!([{"file": "drivers/net/ethernet/intel/e1000/e1000_main.c", "line": 250}]),
             ),
-            subsystems: vec!["net/intel".to_string()],
+            subsystems: vec![AttributedSubsystem::from_maintainers("net/intel")],
             source_files: vec!["drivers/net/ethernet/intel/e1000/e1000_main.c".to_string()],
             commit_sha: Some("abcdef123456".to_string()),
             patchset_id: None,
@@ -3404,6 +3426,21 @@ Call Trace:
             extract_directory_subsystems(&empty),
             vec!["kernel".to_string()]
         );
+    }
+
+    #[test]
+    fn test_resolve_official_subsystems_keeps_caller_supplied_names_unpromoted() {
+        let caller = vec![
+            AttributedSubsystem::new("NETWORKING [IPv4/IPv6]", SubsystemSource::CallerSupplied),
+            AttributedSubsystem::new("anything at all", SubsystemSource::CallerSupplied),
+        ];
+        let files = vec!["net/ipv4/tcp.c".to_string()];
+        // With no toolbox the caller's own list is used verbatim. Naming a real
+        // MAINTAINERS section must not turn it into a MAINTAINERS match, or
+        // filing a bug would be enough to choose who can read it.
+        let resolved = resolve_official_subsystems(None, &caller, &files);
+        assert_eq!(resolved, caller);
+        assert!(resolved.iter().all(|s| !s.source.confers_authority()));
     }
 
     #[test]

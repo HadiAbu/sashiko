@@ -116,15 +116,31 @@ CREATE INDEX IF NOT EXISTS idx_bug_enrichments_bug_id ON bug_enrichments(bug_id,
 CREATE INDEX IF NOT EXISTS idx_bug_enrichments_kind ON bug_enrichments(kind, bug_id);
 CREATE INDEX IF NOT EXISTS idx_bug_enrichments_tool ON bug_enrichments(tool);
 
+-- Three unrelated producers write subsystem names here: MAINTAINERS section
+-- titles, directory prefixes derived from the touched paths, and whatever a
+-- caller supplied. Only the first identifies a real maintainer, so access
+-- control has to be able to tell them apart. Recording where a row came from
+-- is what makes that possible; without it a caller could choose who is allowed
+-- to see the bug they file, simply by naming a subsystem.
+--
+-- The default is the least privileged value on purpose: a writer that forgets
+-- to say where a name came from grants nobody anything.
 CREATE TABLE IF NOT EXISTS bug_subsystems (
     bug_id INTEGER NOT NULL,
     subsystem TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'caller_supplied'
+        CHECK (source IN ('maintainers_section', 'path_prefix', 'caller_supplied')),
     PRIMARY KEY (bug_id, subsystem),
     FOREIGN KEY(bug_id) REFERENCES bugs(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_bug_subsystems_subsystem ON bug_subsystems(subsystem, bug_id);
 CREATE INDEX IF NOT EXISTS idx_bug_subsystems_bug_id ON bug_subsystems(bug_id);
+-- Serves the authorization lookup, which only ever asks for the rows that can
+-- confer authority.
+CREATE INDEX IF NOT EXISTS idx_bug_subsystems_authorizing
+    ON bug_subsystems(bug_id, subsystem)
+    WHERE source = 'maintainers_section';
 
 CREATE TABLE IF NOT EXISTS bug_reviews (
     review_id INTEGER NOT NULL,
@@ -274,6 +290,35 @@ BEGIN
         strftime('%s', 'now'),
         'Subsystem "' || new.subsystem || '" added',
         json_object('action', 'subsystem_added', 'subsystem', new.subsystem)
+    );
+END;
+
+-- Reattributing a subsystem decides whether a maintainer can reach the bug at
+-- all, so the change is audited for the same reason a lifecycle transition is.
+-- Rewriting a row with the provenance it already has is not a change and is
+-- deliberately not recorded.
+CREATE TRIGGER IF NOT EXISTS trg_bug_subsystems_audit_source
+AFTER UPDATE OF source ON bug_subsystems
+FOR EACH ROW
+WHEN old.source <> new.source
+BEGIN
+    INSERT INTO bug_enrichments (
+        bug_id, kind, tool, author, model, created_at, content, data_json
+    ) VALUES (
+        new.bug_id,
+        'audit',
+        IFNULL((SELECT audit_tool FROM bugs WHERE id = new.bug_id), 'system'),
+        (SELECT audit_author FROM bugs WHERE id = new.bug_id),
+        (SELECT audit_model FROM bugs WHERE id = new.bug_id),
+        strftime('%s', 'now'),
+        'Subsystem "' || new.subsystem || '" reattributed from ' || old.source
+            || ' to ' || new.source,
+        json_object(
+            'action', 'subsystem_reattributed',
+            'subsystem', new.subsystem,
+            'old', old.source,
+            'new', new.source
+        )
     );
 END;
 
