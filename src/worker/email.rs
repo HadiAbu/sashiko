@@ -28,8 +28,10 @@ impl EmailWorker {
             match self.db.lock_pending_email().await {
                 Ok(Some(email)) => {
                     info!(
-                        "Locked pending email ID {} for patch {:?}",
-                        email.id, email.patch_id
+                        "Locked pending {} email ID {} for patch {:?}",
+                        email.kind.as_str(),
+                        email.id,
+                        email.patch_id
                     );
                     match self.send_email(&email).await {
                         Ok(_) => {
@@ -70,9 +72,18 @@ impl EmailWorker {
             return Ok(());
         }
 
+        let from = parse_lenient(&self.settings.sender_address)?;
         let mut builder = Message::builder()
-            .from(self.settings.sender_address.parse()?)
+            .from(from.clone())
             .subject(&email_row.subject);
+
+        if email_row.kind == crate::db::EmailKind::SignInLink {
+            // Mail a person receives because they just asked for it must not
+            // provoke a vacation autoresponder, and should be filable.
+            builder = builder
+                .header(AutoSubmitted("auto-generated".to_string()))
+                .header(ListId(format!("<sashiko-auth.{}>", from.email.domain())));
+        }
 
         if let Some(reply_to) = &self.settings.reply_to {
             match reply_to.parse() {
@@ -133,6 +144,40 @@ impl EmailWorker {
         Ok(())
     }
 }
+
+/// Headers lettre does not model, declared here so the builder can carry them.
+macro_rules! text_header {
+    ($name:ident, $wire:literal, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone)]
+        struct $name(String);
+
+        impl lettre::message::header::Header for $name {
+            fn name() -> lettre::message::header::HeaderName {
+                lettre::message::header::HeaderName::new_from_ascii_str($wire)
+            }
+
+            fn parse(s: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(Self(s.to_string()))
+            }
+
+            fn display(&self) -> lettre::message::header::HeaderValue {
+                lettre::message::header::HeaderValue::new(Self::name(), self.0.clone())
+            }
+        }
+    };
+}
+
+text_header!(
+    AutoSubmitted,
+    "Auto-Submitted",
+    "Tells autoresponders that nobody is waiting for a reply."
+);
+text_header!(
+    ListId,
+    "List-Id",
+    "Gives recipients something stable to filter transactional mail on."
+);
 
 fn parse_lenient(s: &str) -> anyhow::Result<lettre::message::Mailbox> {
     if let Some(start) = s.find('<')

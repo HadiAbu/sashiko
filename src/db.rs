@@ -908,9 +908,49 @@ pub enum AssigneeFilter<'a> {
     Is(&'a str),
 }
 
+/// What an outbox row is for.
+///
+/// Review notifications and transactional mail share a transport but differ in
+/// how they are deduplicated, rate limited and observed, so the purpose is
+/// carried explicitly rather than inferred from whether a patch is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmailKind {
+    /// A review result or a patchwork notification, tied to a patch.
+    #[default]
+    ReviewNotification,
+    /// A sign-in link, tied to a person.
+    SignInLink,
+}
+
+impl EmailKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EmailKind::ReviewNotification => "review_notification",
+            EmailKind::SignInLink => "sign_in_link",
+        }
+    }
+
+    /// Reads a stored value.
+    ///
+    /// A value written by a newer binary is reported as a review notification,
+    /// which is the treatment that adds no headers and grants no exemption, so
+    /// an unrecognized row is delivered plainly rather than dropped.
+    pub fn from_stored(value: &str) -> Self {
+        match value {
+            "sign_in_link" => EmailKind::SignInLink,
+            "review_notification" => EmailKind::ReviewNotification,
+            other => {
+                tracing::warn!("Unrecognized email kind {:?}, treating as review", other);
+                EmailKind::ReviewNotification
+            }
+        }
+    }
+}
+
 pub struct EmailOutboxRow {
     pub id: i64,
     pub patch_id: Option<i64>,
+    pub kind: EmailKind,
     pub status: String,
     pub to_addresses: String,
     pub cc_addresses: String,
@@ -1275,7 +1315,16 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 2.");
+        if current_version < 3 {
+            info!("Applying database migration version 3 (email outbox kind)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/003_email_outbox_kind.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 3", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 3.");
         Ok(())
     }
 
@@ -6428,27 +6477,29 @@ impl Database {
             "UPDATE email_outbox 
              SET status = 'Sending', locked_at = ? 
              WHERE id = (SELECT id FROM email_outbox WHERE status = 'Pending' LIMIT 1)
-             RETURNING id, patch_id, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, locked_at, error_log, created_at",
+             RETURNING id, patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, locked_at, error_log, created_at",
             libsql::params![now]
         ).await?;
 
         if let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
             let patch_id: Option<i64> = row.get::<i64>(1).ok();
-            let status: String = row.get(2)?;
-            let to_addresses: String = row.get(3)?;
-            let cc_addresses: String = row.get(4)?;
-            let subject: String = row.get(5)?;
-            let in_reply_to: String = row.get(6)?;
-            let references_hdr: String = row.get(7)?;
-            let body: String = row.get(8)?;
-            let locked_at: Option<i64> = row.get(9).ok();
-            let error_log: Option<String> = row.get(10).ok();
-            let created_at: i64 = row.get(11)?;
+            let kind = EmailKind::from_stored(&row.get::<String>(2)?);
+            let status: String = row.get(3)?;
+            let to_addresses: String = row.get(4)?;
+            let cc_addresses: String = row.get(5)?;
+            let subject: String = row.get(6)?;
+            let in_reply_to: String = row.get(7)?;
+            let references_hdr: String = row.get(8)?;
+            let body: String = row.get(9)?;
+            let locked_at: Option<i64> = row.get(10).ok();
+            let error_log: Option<String> = row.get(11).ok();
+            let created_at: i64 = row.get(12)?;
 
             Ok(Some(EmailOutboxRow {
                 id,
                 patch_id,
+                kind,
                 status,
                 to_addresses,
                 cc_addresses,
@@ -6679,6 +6730,45 @@ impl Database {
             .await?;
         Ok(())
     }
+
+    /// Queue a message addressed to a person rather than to a patch.
+    ///
+    /// There is deliberately no dedup guard. Two sign-in requests are two
+    /// distinct messages, and suppressing the second would look to the
+    /// recipient exactly like the feature being broken. Volume is bounded at
+    /// the request endpoint instead.
+    ///
+    /// The caller supplies the status so that a dry-run deployment can park
+    /// the row where the poller will not pick it up, which is how review mail
+    /// already behaves; inheriting only the worker's dry-run check would leave
+    /// rows sitting Pending forever.
+    pub async fn insert_transactional_email(
+        &self,
+        kind: EmailKind,
+        status: &str,
+        to_address: &str,
+        subject: &str,
+        body: &str,
+    ) -> Result<()> {
+        let created_at = chrono::Utc::now().timestamp();
+        let to_json = serde_json::to_string(&[to_address])
+            .map_err(|e| libsql::Error::Misuse(e.to_string()))?;
+        self.conn
+            .execute(
+                "INSERT INTO email_outbox (patch_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES (NULL, ?, ?, ?, '[]', ?, '', '', ?, ?)",
+                libsql::params![
+                    kind.as_str(),
+                    status,
+                    to_json,
+                    subject,
+                    body,
+                    created_at,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -6747,6 +6837,55 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == "audit" && e.author.as_deref() == Some("new author"))
         );
+        Ok(())
+    }
+
+    /// Sign-in mail is addressed to a person rather than a patch, so it must
+    /// escape the per-patch dedup guard: a second request is a second message,
+    /// and swallowing it would look exactly like the feature being broken.
+    #[tokio::test]
+    async fn test_transactional_email_escapes_patch_dedup() -> Result<()> {
+        let db = setup_db().await;
+
+        for _ in 0..2 {
+            db.insert_transactional_email(
+                EmailKind::SignInLink,
+                "Pending",
+                "maintainer@example.org",
+                "[sashiko] Your sign-in link",
+                "body",
+            )
+            .await?;
+        }
+
+        let first = db
+            .lock_pending_email()
+            .await?
+            .expect("first message queued");
+        assert_eq!(first.kind, EmailKind::SignInLink);
+        assert_eq!(first.patch_id, None);
+        assert_eq!(first.to_addresses, r#"["maintainer@example.org"]"#);
+        db.mark_email_sent(first.id).await?;
+
+        let second = db
+            .lock_pending_email()
+            .await?
+            .expect("second message queued");
+        assert_eq!(second.kind, EmailKind::SignInLink);
+        db.mark_email_sent(second.id).await?;
+
+        // A dry-run deployment parks the row in a status the poller never
+        // selects, rather than relying on the worker to drop it on the floor.
+        db.insert_transactional_email(
+            EmailKind::SignInLink,
+            "Dry-Run",
+            "maintainer@example.org",
+            "[sashiko] Your sign-in link",
+            "body",
+        )
+        .await?;
+        assert!(db.lock_pending_email().await?.is_none());
+
         Ok(())
     }
 
