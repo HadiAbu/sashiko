@@ -4534,63 +4534,82 @@ impl Database {
             let mut current_subject_index = matches[0].1;
 
             // If we have multiple matches, merge others into target_id
-            for (merge_from_id, merge_subject_index, merge_baseline_id, merge_baseline_part) in
-                matches.iter().skip(1)
-            {
-                let merge_from_id = *merge_from_id;
-                info!("Merging patchset {} into {}", merge_from_id, target_id);
+            if matches.len() > 1 {
+                let tx = self.conn.transaction().await?;
+                for (merge_from_id, merge_subject_index, merge_baseline_id, merge_baseline_part) in
+                    matches.iter().skip(1)
+                {
+                    let merge_from_id = *merge_from_id;
+                    info!("Merging patchset {} into {}", merge_from_id, target_id);
 
-                // Reassign patches
-                self.conn
-                    .execute(
+                    // Reassign patches: first remove duplicates that already exist on target_id
+                    // to prevent unique constraint conflicts and lingering foreign key references.
+                    tx.execute(
+                        "DELETE FROM patches WHERE patchset_id = ? AND message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)",
+                        libsql::params![merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    // Reassign remaining patches
+                    tx.execute(
                         "UPDATE OR IGNORE patches SET patchset_id = ? WHERE patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
 
-                // Reassign reviews
-                self.conn
-                    .execute(
+                    // Reassign reviews
+                    tx.execute(
                         "UPDATE reviews SET patchset_id = ? WHERE patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
 
-                // Merge subsystems
-                self.conn
-                    .execute(
+                    // Merge subsystems
+                    tx.execute(
                         "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id)
                          SELECT ?, subsystem_id FROM patchsets_subsystems WHERE patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
-                self.conn
-                    .execute(
+                    tx.execute(
                         "DELETE FROM patchsets_subsystems WHERE patchset_id = ?",
                         libsql::params![merge_from_id],
                     )
                     .await?;
 
-                // If the merged patchset had a better subject index, track it
-                if *merge_subject_index < current_subject_index {
-                    current_subject_index = *merge_subject_index;
-                }
+                    // If the merged patchset had a better subject index, track it
+                    if *merge_subject_index < current_subject_index {
+                        current_subject_index = *merge_subject_index;
+                    }
 
-                // A baseline from a lower-numbered part than the target's
-                // is lost when the row is deleted below, with no part left
-                // to supply it again.
-                if let Some(bid) = *merge_baseline_id {
-                    self.record_series_baseline(target_id, bid, *merge_baseline_part)
+                    // A baseline from a lower-numbered part than the target's
+                    // is lost when the row is deleted below, with no part left
+                    // to supply it again.
+                    if let Some(bid) = *merge_baseline_id {
+                        tx.execute(
+                            "UPDATE patchsets SET baseline_id = ?, baseline_part_index = ?
+                             WHERE id = ?
+                               AND (baseline_id IS NULL
+                                    OR baseline_part_index IS NULL
+                                    OR ? <= baseline_part_index)",
+                            libsql::params![
+                                bid,
+                                *merge_baseline_part,
+                                target_id,
+                                *merge_baseline_part
+                            ],
+                        )
                         .await?;
-                }
+                    }
 
-                // Delete the merged patchset
-                self.conn
-                    .execute(
+                    // Delete the merged patchset
+                    tx.execute(
                         "DELETE FROM patchsets WHERE id = ?",
                         libsql::params![merge_from_id],
                     )
                     .await?;
+                }
+                tx.commit().await?;
             }
 
             // Update the target patchset
