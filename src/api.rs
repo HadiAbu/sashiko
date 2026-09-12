@@ -3800,6 +3800,56 @@ mod tests {
             "You don't have permissions to file bugs."
         );
     }
+
+    #[test]
+    fn test_is_sign_in_eligible_checks_maintainers_and_blocklist() {
+        let maintainers_text = r#"
+Maintainers List
+===================
+
+BTRFS FILE SYSTEM
+M:	Chris Mason <clm@fb.com>
+S:	Maintained
+F:	fs/btrfs/
+
+NETWORKING [GENERAL]
+M:	David S. Miller <davem@davemloft.net>
+S:	Maintained
+F:	net/
+"#;
+        let index =
+            crate::maintainers::MaintainersIndex::from_reader(maintainers_text.as_bytes()).unwrap();
+        let acl = crate::settings::AclSettings {
+            admins: vec!["operator@example.org".to_string()],
+            blocklist: vec!["clm@fb.com".to_string()],
+            ..Default::default()
+        };
+
+        // Subsystem maintainer in MAINTAINERS (not in Settings.toml ACL) can sign in.
+        assert!(is_sign_in_eligible(
+            "davem@davemloft.net",
+            &acl,
+            Some(&index)
+        ));
+        assert!(is_sign_in_eligible(
+            "  DAVEM@davemloft.net ",
+            &acl,
+            Some(&index)
+        ));
+
+        // Blocklist revokes sign-in even for a maintainer listed in MAINTAINERS.
+        assert!(!is_sign_in_eligible("clm@fb.com", &acl, Some(&index)));
+
+        // Configured operator can sign in even without a MAINTAINERS index.
+        assert!(is_sign_in_eligible("operator@example.org", &acl, None));
+
+        // Unknown address cannot sign in.
+        assert!(!is_sign_in_eligible(
+            "stranger@example.org",
+            &acl,
+            Some(&index)
+        ));
+    }
 }
 
 pub fn is_authorized(
@@ -3894,6 +3944,17 @@ struct RequestLinkRequest {
     email: String,
 }
 
+fn is_sign_in_eligible(
+    email: &str,
+    acl: &crate::settings::AclSettings,
+    maintainers: Option<&crate::maintainers::MaintainersIndex>,
+) -> bool {
+    !email.is_empty()
+        && !acl.is_blocklisted(email)
+        && (acl.is_known_identity(email)
+            || maintainers.is_some_and(|m| m.subsystems_for_address(email).is_some()))
+}
+
 async fn request_link(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
@@ -3914,8 +3975,8 @@ async fn request_link(
             .check_and_record(email, &client_ip_str);
 
         let acl = &state.settings.server.acl;
-        let is_eligible =
-            !email.is_empty() && !acl.is_blocklisted(email) && acl.is_known_identity(email);
+        let maintainers = crate::maintainers::get_global_maintainers();
+        let is_eligible = is_sign_in_eligible(email, acl, maintainers.as_deref());
 
         if is_eligible && rate_ok {
             let token = crate::auth::create_token(
