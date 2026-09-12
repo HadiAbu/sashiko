@@ -1244,6 +1244,9 @@ async fn get_bug(
     val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
 
     attach_duplicate_relations(&state, &principal, &bug, &mut val).await?;
+    let access = bug_access(&state, &principal, bug.id).await?;
+    val["can_comment"] = serde_json::Value::Bool(!state.read_only && access.can_comment());
+    val["can_manage"] = serde_json::Value::Bool(!state.read_only && access.can_manage());
     val["evidence"] = state
         .db
         .bug_evidence(bug.id)
@@ -3747,6 +3750,8 @@ mod tests {
         assert_eq!(allowed.status(), 200);
         let body: serde_json::Value = allowed.json().await.unwrap();
         assert_eq!(body["bugid"], "linux-authz01");
+        assert_eq!(body["can_comment"], true);
+        assert_eq!(body["can_manage"], true);
 
         let listing: serde_json::Value = get("/api/bugs".to_string(), Some(operator))
             .await

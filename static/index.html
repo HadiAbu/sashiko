@@ -1636,6 +1636,28 @@
             return !!getAuthToken();
         }
 
+        function getCommentDisabledTitle() {
+            if (config && config.read_only) {
+                return "Server is running in read-only mode.";
+            }
+            const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
+            if (!isAuthed) {
+                return "Please sign in to add comments.";
+            }
+            return "You don't have permissions to comment on this bug.";
+        }
+
+        function getManageDisabledTitle() {
+            if (config && config.read_only) {
+                return "Server is running in read-only mode.";
+            }
+            const isAuthed = (config && config.user && config.user.is_authenticated) || !!getAuthToken();
+            if (!isAuthed) {
+                return "Please sign in with maintainer credentials to manage this bug.";
+            }
+            return "You don't have maintainer permissions to manage this bug.";
+        }
+
         function getActionDisabledTitle() {
             if (config && config.read_only) {
                 return "Server is running in read-only mode.";
@@ -2797,6 +2819,20 @@
 
             try {
                 const res = await fetch(url, { signal });
+                if (res.status === 401 && state.listMode === 'bugs') {
+                    logoutAuth();
+                    clearAuthSession();
+                    if (tbody) {
+                        tbody.innerHTML = `<tr><td colspan="100%" style="text-align: center; padding: 48px 16px;">
+                            <div style="font-weight: 500; font-size: 1.1em; margin-bottom: 8px;">Authentication Required</div>
+                            <div class="text-muted-sm" style="margin-bottom: 16px;">Please sign in to view Linux kernel bugs.</div>
+                            <button class="primary" onclick="openAuthModal('Please sign in to access bugs.')">Sign In</button>
+                        </td></tr>`;
+                    }
+                    updatePagination(0);
+                    openAuthModal("Please sign in to access bugs.");
+                    return;
+                }
                 if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
                 const data = await res.json();
 
@@ -4091,7 +4127,30 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         async function renderBugView(slugOrId, initialTab) {
             const queryParam = /^\d+$/.test(slugOrId) ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
             const res = await fetch(`/api/bug?${queryParam}`);
-            if (!res.ok) throw new Error('Bug could not be loaded');
+            if (res.status === 401) {
+                logoutAuth();
+                clearAuthSession();
+                document.getElementById('app').innerHTML = `
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Authentication Required</h2>
+                        <p class="text-muted-sm" style="margin-bottom: 24px;">Please sign in to access Linux kernel bugs.</p>
+                        <button class="primary" onclick="openAuthModal('Please sign in to access bugs.')">Sign In</button>
+                    </div>
+                `;
+                openAuthModal("Please sign in to access bugs.");
+                return;
+            }
+            if (res.status === 404) {
+                document.getElementById('app').innerHTML = `
+                    <div class="nav"><a href="#/">← Back to bugs</a></div>
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Bug Not Found</h2>
+                        <p class="text-muted-sm">The requested bug does not exist or you do not have access to view it.</p>
+                    </div>
+                `;
+                return;
+            }
+            if (!res.ok) throw new Error(`Bug could not be loaded (${res.status} ${res.statusText})`);
             const data = await res.json();
             const bugid = data.bugid || data.slug || data.internal_id;
             const id = Number(data.internal_id || data.id);
@@ -4204,16 +4263,30 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 ? data.subsystems.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('')
                 : '<span class="status-placeholder">None</span>';
 
-            const canAct = canPerformBugActions();
-            const actionDisabledTitle = getActionDisabledTitle();
+            const canManage = Boolean(data.can_manage);
+            const canComment = Boolean(data.can_comment);
+            state.currentBugCanManage = canManage;
+            state.currentBugCanComment = canComment;
+            const commentDisabledTitle = getCommentDisabledTitle();
+            const manageDisabledTitle = getManageDisabledTitle();
 
             // Remembered so the assign modal opens prefilled for reassignment
             // rather than making the user retype the current owner.
             state.currentBugAssignee = data.assignee || '';
 
-            const actionButtonsHtml = canAct ? `
+            const commentBtnHtml = canComment ? `
                 <button class="primary" onclick="openBugActionModal('comment', '${id}')">Add Comment</button>
+            ` : `
+                <button class="primary" disabled title="${escapeHtml(commentDisabledTitle)}">Add Comment</button>
+            `;
+
+            const assignBtnHtml = canManage ? `
                 <button class="btn" onclick="openBugActionModal('assign', '${id}')">${data.assignee ? 'Reassign' : 'Assign'}</button>
+            ` : `
+                <button class="btn" disabled title="${escapeHtml(manageDisabledTitle)}">${data.assignee ? 'Reassign' : 'Assign'}</button>
+            `;
+
+            const statusBtnHtml = canManage ? `
                 <details class="subsystem-dropdown" id="bugStatusDropdown" style="position:relative; display:inline-block;">
                     <summary class="subsystem-dropdown-btn">Change Status ▾</summary>
                     <div class="subsystem-dropdown-menu" style="display:block; min-width:180px;">
@@ -4223,16 +4296,20 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     </div>
                 </details>
             ` : `
-                <button class="primary" disabled title="${escapeHtml(actionDisabledTitle)}">Add Comment</button>
-                <button class="btn" disabled title="${escapeHtml(actionDisabledTitle)}">Assign</button>
-                <button class="btn" disabled title="${escapeHtml(actionDisabledTitle)}">Change Status ▾</button>
+                <button class="btn" disabled title="${escapeHtml(manageDisabledTitle)}">Change Status ▾</button>
+            `;
+
+            const actionButtonsHtml = `
+                ${commentBtnHtml}
+                ${assignBtnHtml}
+                ${statusBtnHtml}
             `;
 
             const commentsPanelHtml = sortedComments.length > 0 ? `
                 <div class="section" id="bug-panel-comments" data-bug-panel="comments" role="tabpanel" aria-labelledby="bug-tab-comments" ${activeTab === 'comments' ? '' : 'hidden'}>
                     <div class="controls" style="justify-content:space-between; margin-bottom: 12px;">
                         <h2 style="border:none; margin:0; padding:0;">Comments (${sortedComments.length})</h2>
-                        ${canAct ? `<button class="primary" onclick="openBugActionModal('comment', '${id}')">Add Comment</button>` : ''}
+                        ${canComment ? `<button class="primary" onclick="openBugActionModal('comment', '${id}')">Add Comment</button>` : ''}
                     </div>
                     ${sortedComments.map(c => `
                         <div class="review-card" style="margin-bottom: 10px;">
@@ -4253,7 +4330,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             </div>` : ''}
                         </div>
                     `).join('')}
-                    ${canAct ? `
+                    ${canComment ? `
                         <div style="margin-top: 16px;">
                             <button class="btn" onclick="openBugActionModal('comment', '${id}')">Add another comment...</button>
                         </div>
@@ -4491,6 +4568,39 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         async function renderBugLogView(slugOrId) {
             const queryParam = /^\d+$/.test(slugOrId) ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
             const res = await fetch(`/api/bug/raw?${queryParam}`);
+            if (res.status === 401) {
+                logoutAuth();
+                clearAuthSession();
+                document.getElementById('app').innerHTML = `
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Authentication Required</h2>
+                        <p class="text-muted-sm" style="margin-bottom: 24px;">Please sign in to access interaction logs.</p>
+                        <button class="primary" onclick="openAuthModal('Please sign in to access bugs.')">Sign In</button>
+                    </div>
+                `;
+                openAuthModal("Please sign in to access bugs.");
+                return;
+            }
+            if (res.status === 404) {
+                document.getElementById('app').innerHTML = `
+                    <div class="nav"><a href="#/">← Back to bugs</a></div>
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Bug Not Found</h2>
+                        <p class="text-muted-sm">The requested bug does not exist or you do not have access to view it.</p>
+                    </div>
+                `;
+                return;
+            }
+            if (res.status === 403) {
+                document.getElementById('app').innerHTML = `
+                    <div class="nav"><a href="#/bug/${encodeURIComponent(slugOrId)}">← Back to bug</a></div>
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Access Restricted</h2>
+                        <p class="text-muted-sm">Raw interaction logs and analysis transcripts are restricted to security team and operators.</p>
+                    </div>
+                `;
+                return;
+            }
             if (!res.ok) throw new Error(`Interaction log could not be loaded (${res.status}). Please try again.`);
             const payload = await res.json();
             const records = payload.records || [];
@@ -4583,6 +4693,39 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         async function renderBugInputView(slugOrId) {
             const queryParam = /^\d+$/.test(slugOrId) ? `id=${encodeURIComponent(slugOrId)}` : `slug=${encodeURIComponent(slugOrId)}`;
             const res = await fetch(`/api/bug/input?${queryParam}`);
+            if (res.status === 401) {
+                logoutAuth();
+                clearAuthSession();
+                document.getElementById('app').innerHTML = `
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Authentication Required</h2>
+                        <p class="text-muted-sm" style="margin-bottom: 24px;">Please sign in to access raw workflow inputs.</p>
+                        <button class="primary" onclick="openAuthModal('Please sign in to access bugs.')">Sign In</button>
+                    </div>
+                `;
+                openAuthModal("Please sign in to access bugs.");
+                return;
+            }
+            if (res.status === 404) {
+                document.getElementById('app').innerHTML = `
+                    <div class="nav"><a href="#/">← Back to bugs</a></div>
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Bug Not Found</h2>
+                        <p class="text-muted-sm">The requested bug does not exist or you do not have access to view it.</p>
+                    </div>
+                `;
+                return;
+            }
+            if (res.status === 403) {
+                document.getElementById('app').innerHTML = `
+                    <div class="nav"><a href="#/bug/${encodeURIComponent(slugOrId)}">← Back to bug</a></div>
+                    <div class="empty-state" style="text-align: center; padding: 64px 16px;">
+                        <h2>Access Restricted</h2>
+                        <p class="text-muted-sm">Raw workflow inputs are restricted to security team and operators.</p>
+                    </div>
+                `;
+                return;
+            }
             if (!res.ok) throw new Error(`Raw input could not be loaded (${res.status}). Please try again.`);
             const payload = await res.json();
             const bugid = payload.bugid;
@@ -5233,6 +5376,17 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         loadSettings();
         fetchConfig().then(router);
         function openBugActionModal(action, id) {
+            if (action === 'comment') {
+                if (state.currentBugCanComment !== undefined && !state.currentBugCanComment) {
+                    alert(getCommentDisabledTitle());
+                    return;
+                }
+            } else {
+                if (state.currentBugCanManage !== undefined && !state.currentBugCanManage) {
+                    alert(getManageDisabledTitle());
+                    return;
+                }
+            }
             if (!canPerformBugActions()) {
                 alert(getActionDisabledTitle());
                 return;
@@ -5299,6 +5453,21 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             errorEl.style.display = 'none';
             submitBtn.disabled = true;
             
+            if (action === 'comment') {
+                if (state.currentBugCanComment !== undefined && !state.currentBugCanComment) {
+                    errorEl.textContent = getCommentDisabledTitle();
+                    errorEl.style.display = 'block';
+                    submitBtn.disabled = false;
+                    return;
+                }
+            } else {
+                if (state.currentBugCanManage !== undefined && !state.currentBugCanManage) {
+                    errorEl.textContent = getManageDisabledTitle();
+                    errorEl.style.display = 'block';
+                    submitBtn.disabled = false;
+                    return;
+                }
+            }
             if (!canPerformBugActions()) {
                 errorEl.textContent = getActionDisabledTitle();
                 errorEl.style.display = 'block';
@@ -5351,9 +5520,13 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 if (!res.ok) {
                     let errStr = res.statusText;
                     try { errStr = (await res.text()) || errStr; } catch(e) {}
-                    if (res.status === 403) {
+                    if (res.status === 401) {
+                        logoutAuth();
+                        clearAuthSession();
+                        openAuthModal("Please sign in to perform bug actions.");
+                    } else if (res.status === 403) {
                         if (!errStr || errStr === "Forbidden" || errStr.toLowerCase().includes("remote mutations disallowed")) {
-                            errStr = getActionDisabledTitle();
+                            errStr = (action === 'comment') ? getCommentDisabledTitle() : getManageDisabledTitle();
                         }
                     }
                     throw new Error(errStr);
