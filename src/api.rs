@@ -1075,6 +1075,29 @@ async fn readable_bug(
     Ok(bug)
 }
 
+/// Loads the bug for one of the raw transcript endpoints.
+///
+/// Transcripts are narrower than the bug itself. The deduplication stage
+/// compares a bug against every other bug in the database and the prompt
+/// embeds each candidate's problem statement, so a transcript discloses
+/// unrelated bugs by construction. Only a principal who can already read every
+/// bug learns nothing new from one; for a subsystem-scoped maintainer it would
+/// cross exactly the boundary the rest of this model draws.
+///
+/// The refusal is 403 rather than 404 because the caller reached this point by
+/// passing the read check, so the bug's existence is already known to them.
+async fn transcript_bug(
+    state: &AppState,
+    principal: &BugPrincipal,
+    query: &BugQuery,
+) -> Result<crate::db::Bug, StatusCode> {
+    let bug = readable_bug(state, principal, query).await?;
+    if !principal.has_global_bug_visibility() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(bug)
+}
+
 /// Removes embedded bug summaries the caller may not read.
 ///
 /// The patchset and review payloads carry each bug's problem statement,
@@ -1197,7 +1220,7 @@ async fn get_bug_raw(
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let bug = readable_bug(&state, &principal, &query).await?;
+    let bug = transcript_bug(&state, &principal, &query).await?;
     let records = state
         .db
         .bug_family(bug.id, true)
@@ -1216,7 +1239,7 @@ async fn get_bug_input(
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let bug = readable_bug(&state, &principal, &query).await?;
+    let bug = transcript_bug(&state, &principal, &query).await?;
 
     let inputs: Vec<serde_json::Value> = bug
         .enrichments
@@ -1258,7 +1281,7 @@ async fn get_bug_logs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let bug = readable_bug(&state, &principal, &query).await?;
+    let bug = transcript_bug(&state, &principal, &query).await?;
     let result = state.db.get_bug_logs(bug.id).await;
 
     match result {

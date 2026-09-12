@@ -381,6 +381,27 @@ F:	*/
     }
 
     #[test]
+    fn test_scope_is_reported_as_maintainers_spells_it() {
+        // The database stores titles verbatim, so the projection that feeds the
+        // query has to hand back the original spelling, not the normalized one
+        // used for comparison.
+        let davem = BugPrincipal::resolve(
+            "davem@davemloft.net",
+            &AclSettings::default(),
+            Some(&index()),
+        );
+        assert_eq!(
+            davem.maintained_section_names(),
+            vec!["NETWORKING [GENERAL]".to_string()]
+        );
+        assert!(
+            BugPrincipal::anonymous()
+                .maintained_section_names()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn test_security_list_comments_everywhere_but_manages_nothing() {
         let index = index();
         let principal = BugPrincipal::resolve("security@example.org", &acl(), Some(&index));
