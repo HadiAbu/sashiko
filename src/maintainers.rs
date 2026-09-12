@@ -141,7 +141,48 @@ pub struct MaintainerSection {
     pub trees: Vec<(String, Option<String>)>,
 }
 
+/// Extracts the address from a MAINTAINERS entry such as
+/// `Linus Torvalds <torvalds@linux-foundation.org>`.
+///
+/// Entries are conventionally a display name followed by an address in angle
+/// brackets, but a bare address also occurs, so the brackets are optional. The
+/// result is lowercased because the addresses are later compared against an
+/// address a person typed into a sign-in form.
+///
+/// Anything that does not look like an address yields None rather than a
+/// best-effort string: an entry that cannot be parsed must not become a
+/// principal that some other entry could collide with.
+pub fn maintainer_address(entry: &str) -> Option<String> {
+    let candidate = match (entry.find('<'), entry.rfind('>')) {
+        (Some(open), Some(close)) if close > open + 1 => &entry[open + 1..close],
+        _ => entry,
+    };
+    let address = candidate
+        .trim()
+        .trim_matches('"')
+        .trim()
+        .to_ascii_lowercase();
+    let (local, domain) = address.split_once('@')?;
+    let looks_like_an_address = !local.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !address.contains(char::is_whitespace)
+        && address.matches('@').count() == 1;
+    looks_like_an_address.then_some(address)
+}
+
 impl MaintainerSection {
+    /// The addresses of everyone listed on an `M:` or `R:` line.
+    ///
+    /// Reviewers are deliberately not distinguished from maintainers: both are
+    /// people the kernel already trusts with the subsystem.
+    pub fn maintainer_addresses(&self) -> impl Iterator<Item = String> + '_ {
+        self.maintainers
+            .iter()
+            .filter_map(|m| maintainer_address(m))
+    }
+
     /// Checks if a file path matches this section.
     /// Returns `Some(depth)` with the matched pattern depth if matched, or `None` if not matched or excluded.
     pub fn match_file(&self, file_path: &str) -> Option<usize> {
@@ -518,6 +559,59 @@ S:	Maintained
 F:	mm/
 F:	include/linux/mm*
 "#;
+
+    #[test]
+    fn test_maintainer_address_handles_the_shapes_that_occur() {
+        // Every shape below appears verbatim in the kernel MAINTAINERS file.
+        assert_eq!(
+            maintainer_address("Linus Torvalds <torvalds@linux-foundation.org>").as_deref(),
+            Some("torvalds@linux-foundation.org")
+        );
+        assert_eq!(
+            maintainer_address("\"Rafael J. Wysocki\" <rafael@kernel.org>").as_deref(),
+            Some("rafael@kernel.org")
+        );
+        assert_eq!(
+            maintainer_address("linux@roeck-us.net").as_deref(),
+            Some("linux@roeck-us.net")
+        );
+        // The address is compared against whatever a person types into the
+        // sign-in form, so case must not decide whether they get in.
+        assert_eq!(
+            maintainer_address("Guenter Roeck <LINUX@Roeck-us.NET>").as_deref(),
+            Some("linux@roeck-us.net")
+        );
+    }
+
+    #[test]
+    fn test_maintainer_address_rejects_entries_that_are_not_addresses() {
+        for entry in [
+            "",
+            "Just A Name",
+            "<>",
+            "Name <>",
+            "Name <not an address>",
+            "@no-local-part.org",
+            "two@addresses@example.org",
+            "no-dot@localhost",
+        ] {
+            assert_eq!(maintainer_address(entry), None, "entry: {entry:?}");
+        }
+    }
+
+    #[test]
+    fn test_section_maintainer_addresses_are_extracted() {
+        let index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
+        let btrfs = index
+            .sections()
+            .iter()
+            .find(|s| s.name == "BTRFS FILE SYSTEM")
+            .unwrap();
+        assert_eq!(
+            btrfs.maintainer_addresses().collect::<Vec<_>>(),
+            vec!["clm@fb.com".to_string()]
+        );
+    }
 
     #[test]
     fn test_parse_maintainers() {
