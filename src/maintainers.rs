@@ -20,7 +20,7 @@
 
 use anyhow::{Context, Result};
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -139,6 +139,14 @@ pub struct MaintainerSection {
     pub maintainers: Vec<String>,
     /// `T:` SCM source trees.
     pub trees: Vec<(String, Option<String>)>,
+    /// Whether a file pattern claims the whole tree, which in the current file
+    /// means `F: *` or `F: */` and only occurs in THE REST.
+    ///
+    /// This cannot be recovered from the compiled patterns: `*` compiles to a
+    /// glob that matches only top-level files, and `*/` to a prefix that
+    /// matches nothing at all. Both are plainly meant as "everything", so the
+    /// intent is recorded while the raw text is still in hand.
+    pub catch_all: bool,
 }
 
 /// Extracts the address from a MAINTAINERS entry such as
@@ -222,14 +230,60 @@ impl MaintainerSection {
 #[derive(Debug, Clone, Default)]
 pub struct MaintainersIndex {
     sections: Vec<MaintainerSection>,
+    /// Every section title an address is listed against, keyed by lowercased
+    /// address. Built once so that resolving a caller's authority costs one
+    /// hash lookup rather than a scan of several thousand sections.
+    subsystems_by_address: HashMap<String, BTreeSet<String>>,
+    /// Addresses listed on a section that claims the whole tree.
+    global_addresses: HashSet<String>,
 }
 
 impl MaintainersIndex {
     /// Creates a new empty index.
     pub fn new() -> Self {
-        Self {
-            sections: Vec::new(),
+        Self::default()
+    }
+
+    /// Builds the index, including the address lookups derived from it.
+    fn from_sections(sections: Vec<MaintainerSection>) -> Self {
+        let mut subsystems_by_address: HashMap<String, BTreeSet<String>> = HashMap::new();
+        let mut global_addresses = HashSet::new();
+        for section in &sections {
+            for address in section.maintainer_addresses() {
+                if section.catch_all {
+                    global_addresses.insert(address.clone());
+                }
+                subsystems_by_address
+                    .entry(address)
+                    .or_default()
+                    .insert(section.name.clone());
+            }
         }
+        Self {
+            sections,
+            subsystems_by_address,
+            global_addresses,
+        }
+    }
+
+    /// The section titles the given address is listed against.
+    ///
+    /// The address is matched case insensitively, since it arrives from a
+    /// sign-in form rather than from the file.
+    pub fn subsystems_for_address(&self, address: &str) -> Option<&BTreeSet<String>> {
+        self.subsystems_by_address
+            .get(&address.trim().to_ascii_lowercase())
+    }
+
+    /// Whether the address is listed on a section that claims the whole tree,
+    /// which today means THE REST and therefore Linus Torvalds.
+    ///
+    /// Such a maintainer is responsible for every file, so scoping them to the
+    /// handful of top-level paths their patterns literally match would be an
+    /// accident of the pattern syntax rather than a decision.
+    pub fn is_global_maintainer(&self, address: &str) -> bool {
+        self.global_addresses
+            .contains(&address.trim().to_ascii_lowercase())
     }
 
     /// Loads and parses MAINTAINERS from a file path.
@@ -296,6 +350,7 @@ impl MaintainersIndex {
         let mut current_lists = Vec::new();
         let mut current_maintainers = Vec::new();
         let mut current_trees = Vec::new();
+        let mut current_catch_all = false;
 
         let mut in_header = true;
 
@@ -325,6 +380,7 @@ impl MaintainersIndex {
                         mailing_lists: std::mem::take(&mut current_lists),
                         maintainers: std::mem::take(&mut current_maintainers),
                         trees: std::mem::take(&mut current_trees),
+                        catch_all: std::mem::take(&mut current_catch_all),
                     });
                 }
                 current_name.clear();
@@ -344,6 +400,9 @@ impl MaintainersIndex {
                 let val = value.trim();
                 match tag {
                     "F" => {
+                        // A pattern of "*" or "*/" is how the file spells "the
+                        // whole tree"; neither survives compilation as such.
+                        current_catch_all |= val == "*" || val == "*/";
                         current_files.push(CompiledPattern::compile(val));
                     }
                     "X" => {
@@ -404,11 +463,12 @@ impl MaintainersIndex {
                 mailing_lists: current_lists,
                 maintainers: current_maintainers,
                 trees: current_trees,
+                catch_all: current_catch_all,
             });
         }
 
         info!("Loaded and indexed {} MAINTAINERS sections", sections.len());
-        Ok(Self { sections })
+        Ok(Self::from_sections(sections))
     }
 
     /// Matches a single file path against all MAINTAINERS sections.
@@ -554,10 +614,17 @@ N:	btrfs
 
 MEMORY MANAGEMENT
 M:	Andrew Morton <akpm@linux-foundation.org>
+R:	Chris Mason <clm@fb.com>
 L:	linux-mm@kvack.org
 S:	Maintained
 F:	mm/
 F:	include/linux/mm*
+
+THE REST
+M:	Linus Torvalds <torvalds@linux-foundation.org>
+S:	Buried alive in reporters
+F:	*
+F:	*/
 "#;
 
     #[test]
@@ -616,7 +683,37 @@ F:	include/linux/mm*
     #[test]
     fn test_parse_maintainers() {
         let index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
-        assert_eq!(index.len(), 5);
+        assert_eq!(index.len(), 6);
+    }
+
+    #[test]
+    fn test_subsystems_for_address_covers_maintainers_and_reviewers() {
+        let index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
+        // Listed once as a maintainer and once as a reviewer; both count.
+        assert_eq!(
+            index
+                .subsystems_for_address("clm@fb.com")
+                .unwrap()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "BTRFS FILE SYSTEM".to_string(),
+                "MEMORY MANAGEMENT".to_string()
+            ]
+        );
+        // The address arrives from a sign-in form, not from the file.
+        assert!(index.subsystems_for_address("  CLM@FB.COM ").is_some());
+        assert!(index.subsystems_for_address("nobody@example.org").is_none());
+    }
+
+    #[test]
+    fn test_catch_all_section_confers_global_scope() {
+        let index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
+        assert!(index.is_global_maintainer("torvalds@linux-foundation.org"));
+        // A subsystem maintainer, however senior, is not global.
+        assert!(!index.is_global_maintainer("akpm@linux-foundation.org"));
+        assert!(!index.is_global_maintainer("nobody@example.org"));
     }
 
     #[test]
@@ -682,7 +779,7 @@ F:	include/linux/mm*
         init_global_maintainers(arc.clone());
 
         let retrieved = get_global_maintainers().expect("Expected global maintainers to be set");
-        assert_eq!(retrieved.len(), 5);
+        assert_eq!(retrieved.len(), 6);
         assert_eq!(
             retrieved.match_file("fs/btrfs/inode.c"),
             vec!["BTRFS FILE SYSTEM"]
