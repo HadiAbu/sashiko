@@ -3095,6 +3095,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_blocklist_outranks_every_bypass() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let state_with = |testing_mode: bool, allow_all_submit: bool| {
+            let mut settings = crate::settings::Settings::new().unwrap();
+            settings.server.testing_mode = testing_mode;
+            settings.server.acl.admins = vec!["operator@example.org".to_string()];
+            // Spelled with stray padding and mixed case to pin the tolerant
+            // comparison, since a revocation that a capital letter defeats is
+            // not a revocation.
+            settings.server.acl.blocklist = vec![" Blocked@Example.ORG ".to_string()];
+            let (event_tx, _event_rx) = mpsc::channel(10);
+            let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+            Arc::new(AppState {
+                settings: Arc::new(settings),
+                db: db.clone(),
+                sender: event_tx,
+                fetch_sender: fetch_tx,
+                read_only: false,
+                forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
+                allow_all_submit,
+                smtp_enabled: false,
+                dry_run: true,
+                stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+                stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
+                stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
+                messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
+                patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
+                patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+                messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+                bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+            })
+        };
+
+        let blocked = crate::auth::AuthUser {
+            email: "blocked@example.org".to_string(),
+        };
+        let operator = crate::auth::AuthUser {
+            email: "operator@example.org".to_string(),
+        };
+        let addr = "127.0.0.1:12345".parse().unwrap();
+        let headers = axum::http::HeaderMap::new();
+
+        for (testing_mode, allow_all_submit) in [(true, false), (false, true), (true, true)] {
+            let state = state_with(testing_mode, allow_all_submit);
+            assert!(
+                !is_authorized(
+                    &addr,
+                    &state,
+                    &headers,
+                    Some(&blocked),
+                    crate::settings::Permission::Review
+                ),
+                "blocklisted caller admitted with testing_mode={} allow_all_submit={}",
+                testing_mode,
+                allow_all_submit
+            );
+            assert!(
+                is_authorized(
+                    &addr,
+                    &state,
+                    &headers,
+                    Some(&operator),
+                    crate::settings::Permission::Review
+                ),
+                "bypass stopped working for everyone else"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_bug_reads_require_an_authorized_principal() {
         const SECRET: &str = "bug-authz-secret-12345678901234567890";
         let db_settings = crate::settings::DatabaseSettings {
@@ -3285,14 +3361,19 @@ pub fn is_authorized(
     auth: Option<&crate::auth::AuthUser>,
     perm: crate::settings::Permission,
 ) -> bool {
+    // The blocklist is a revocation, so it outranks every bypass below it. It
+    // can only match an address the caller actually presented; a blocklisted
+    // person who omits their token and calls from loopback is covered by the
+    // loopback bypass's trust assumption instead, and that bypass does not
+    // reach bug routes.
+    if auth.is_some_and(|user| state.settings.server.acl.is_blocklisted(&user.email)) {
+        return false;
+    }
     if state.settings.server.testing_mode {
         return true;
     }
     if state.allow_all_submit {
         return true;
-    }
-    if auth.is_some_and(|user| state.settings.server.acl.is_blocklisted(&user.email)) {
-        return false;
     }
     if addr.ip().to_canonical().is_loopback() && perm.allows_loopback_bypass() {
         let has_proxy = headers.contains_key("x-forwarded-for")
