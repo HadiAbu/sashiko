@@ -3234,6 +3234,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(listing["total"], 1);
+
+        // Mutations are not bypassable from loopback either, even though every
+        // capability in the Permission enum is.
+        let unauthenticated_action = client
+            .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
+            .json(&serde_json::json!({"action": "comment", "content": "hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated_action.status(), 401);
     }
 }
 
@@ -3253,7 +3263,7 @@ pub fn is_authorized(
     if auth.is_some_and(|user| state.settings.server.acl.is_blocklisted(&user.email)) {
         return false;
     }
-    if addr.ip().to_canonical().is_loopback() {
+    if addr.ip().to_canonical().is_loopback() && perm.allows_loopback_bypass() {
         let has_proxy = headers.contains_key("x-forwarded-for")
             || headers.contains_key("x-real-ip")
             || headers.contains_key("forwarded");

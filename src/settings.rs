@@ -425,6 +425,29 @@ pub enum Permission {
     Action,
 }
 
+impl Permission {
+    /// Whether a credential-free request from a loopback address may exercise
+    /// this capability.
+    ///
+    /// The bypass exists so a developer running the server locally can drive it
+    /// without configuring a JWT secret, and it is tolerable only where the
+    /// blast radius is that local instance. Authority over a Linux kernel bug
+    /// is deliberately not a Permission: it is resolved per bug by
+    /// BugPrincipal, which never reaches this path, so no amount of local
+    /// access opens the bug database.
+    ///
+    /// The match is exhaustive rather than defaulted so that a capability
+    /// added later is not bypassable until someone writes it down here.
+    pub fn allows_loopback_bypass(self) -> bool {
+        match self {
+            Permission::Ingest => true,
+            Permission::Cancel => true,
+            Permission::Review => true,
+            Permission::Action => true,
+        }
+    }
+}
+
 /// Access Control List settings utilizing fine-grained capability endpoints.
 /// By default (if omitted), all vectors are safely initialized empty (Fail-Closed).
 /// Users must explicitly be added to the necessary capability lists to perform mutations.
