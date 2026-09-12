@@ -8,17 +8,30 @@
 
 use crate::maintainers::MaintainersIndex;
 use crate::settings::AclSettings;
+use axum::extract::FromRequestParts;
+use axum::http::StatusCode;
+use axum::http::request::Parts;
 use std::collections::HashSet;
+use std::sync::Arc;
 
-/// A MAINTAINERS section title, normalized for comparison.
+/// A MAINTAINERS section title, carried both as written and normalized for
+/// comparison.
 ///
 /// The type exists so that it is a compile error to compare a section title
 /// against a directory prefix. Both are strings that name a subsystem, and
 /// conflating them is the single most likely way to get this wrong: a
 /// directory prefix is derived from the touched paths and names nobody, while
 /// a section title names the people the kernel trusts with that code.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SectionTitle(String);
+///
+/// Equality, ordering and hashing all run on the normalized form, so two
+/// spellings of the same section are the same title. The original is retained
+/// because the database stores titles as MAINTAINERS spells them, and a query
+/// parameter has to match that.
+#[derive(Debug, Clone)]
+pub struct SectionTitle {
+    original: String,
+    normalized: String,
+}
 
 impl SectionTitle {
     /// Normalizes a title by trimming, collapsing internal whitespace and
@@ -32,11 +45,46 @@ impl SectionTitle {
             }
             normalized.extend(word.chars().flat_map(char::to_lowercase));
         }
-        Self(normalized)
+        Self {
+            original: title.trim().to_string(),
+            normalized,
+        }
     }
 
+    /// The normalized form, which is what comparisons use.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.normalized
+    }
+
+    /// The title as MAINTAINERS spells it, for matching against stored rows.
+    pub fn original(&self) -> &str {
+        &self.original
+    }
+}
+
+impl PartialEq for SectionTitle {
+    fn eq(&self, other: &Self) -> bool {
+        self.normalized == other.normalized
+    }
+}
+
+impl Eq for SectionTitle {}
+
+impl std::hash::Hash for SectionTitle {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.normalized.hash(state);
+    }
+}
+
+impl PartialOrd for SectionTitle {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SectionTitle {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.normalized.cmp(&other.normalized)
     }
 }
 
@@ -175,6 +223,90 @@ impl BugPrincipal {
     /// Whether this principal may file a new bug.
     pub fn may_create(&self) -> bool {
         self.may_create
+    }
+
+    /// The sections this principal maintains, spelled as MAINTAINERS spells
+    /// them, for use as query parameters. Sorted so that the value is stable
+    /// enough to key a cache on.
+    pub fn maintained_section_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .maintained_sections
+            .iter()
+            .map(|title| title.original().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// How much of the bug database this principal may list, as a database
+    /// filter.
+    pub fn visibility<'a>(&self, scope: &'a [String]) -> crate::db::BugVisibility<'a> {
+        if self.has_global_bug_visibility() {
+            crate::db::BugVisibility::Unrestricted
+        } else {
+            crate::db::BugVisibility::Sections(scope)
+        }
+    }
+
+    /// The principal a server running in testing mode answers as.
+    ///
+    /// Testing mode already bypasses every other capability check, so bug
+    /// routes follow it rather than becoming the one part of the server a
+    /// developer cannot exercise locally. It carries no address, because no
+    /// address was proved.
+    fn testing_operator() -> Self {
+        Self {
+            operator: true,
+            may_create: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Extractor. Rejects with 401 when the request carries no valid session
+/// token, then resolves the configuration and MAINTAINERS authority behind the
+/// address that token names.
+///
+/// Being fallible is the point: a bug route cannot reach bug data without
+/// naming this extractor in its signature, so forgetting the check does not
+/// compile into an open route. The loopback bypass in `is_authorized` is
+/// deliberately not consulted here.
+impl FromRequestParts<Arc<crate::api::AppState>> for BugPrincipal {
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<crate::api::AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        if state.settings.server.testing_mode {
+            return Ok(BugPrincipal::testing_operator());
+        }
+        let user = crate::auth::AuthUser::from_request_parts(parts, state).await?;
+        Ok(BugPrincipal::resolve(
+            &user.email,
+            &state.settings.server.acl,
+            crate::maintainers::get_global_maintainers().as_deref(),
+        ))
+    }
+}
+
+/// Extractor for routes that are not bug routes but embed bug summaries, such
+/// as the patchset and review views. Those stay readable without a session, so
+/// a missing or invalid token resolves to the anonymous principal and the
+/// embedded bugs are filtered out rather than the whole page being refused.
+pub struct OptionalBugPrincipal(pub BugPrincipal);
+
+impl FromRequestParts<Arc<crate::api::AppState>> for OptionalBugPrincipal {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<crate::api::AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        match BugPrincipal::from_request_parts(parts, state).await {
+            Ok(principal) => Ok(OptionalBugPrincipal(principal)),
+            Err(_) => Ok(OptionalBugPrincipal(BugPrincipal::anonymous())),
+        }
     }
 }
 

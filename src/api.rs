@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::bug_access::{BugAccess, BugPrincipal, OptionalBugPrincipal, SectionTitle};
 use crate::db::Database;
 use crate::events::{Event, MessageSource};
 use crate::fetcher::FetchRequest;
@@ -843,6 +844,7 @@ async fn list_messages(
 }
 
 async fn get_patchset(
+    OptionalBugPrincipal(principal): OptionalBugPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -878,6 +880,7 @@ async fn get_patchset(
                     serde_json::Value::Bool(state.dry_run),
                 );
             }
+            redact_embedded_bugs(&state, &principal, &mut details).await?;
             Ok(Json(details))
         }
         Ok(None) => {
@@ -892,6 +895,7 @@ async fn get_patchset(
 }
 
 async fn get_review(
+    OptionalBugPrincipal(principal): OptionalBugPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -906,7 +910,10 @@ async fn get_review(
     };
 
     match result {
-        Ok(Some(details)) => Ok(Json(details)),
+        Ok(Some(mut details)) => {
+            redact_embedded_bugs(&state, &principal, &mut details).await?;
+            Ok(Json(details))
+        }
         Ok(None) => {
             info!("Review not found");
             Err(StatusCode::NOT_FOUND)
@@ -962,6 +969,7 @@ async fn get_patchset_summary(
 }
 
 async fn get_review_log(
+    OptionalBugPrincipal(principal): OptionalBugPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -976,7 +984,10 @@ async fn get_review_log(
     };
 
     match result {
-        Ok(Some(details)) => Ok(Json(details)),
+        Ok(Some(mut details)) => {
+            redact_embedded_bugs(&state, &principal, &mut details).await?;
+            Ok(Json(details))
+        }
         Ok(None) => {
             info!("Review not found");
             Err(StatusCode::NOT_FOUND)
@@ -988,96 +999,63 @@ async fn get_review_log(
     }
 }
 
-async fn get_bug(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<BugQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let result = if let Some(id) = query.id {
-        state.db.get_bug(id).await
-    } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
-        state.db.get_bug_by_bugid(bugid).await
-    } else {
-        return Err(StatusCode::BAD_REQUEST);
-    };
-
-    match result {
-        Ok(Some(bug)) => {
-            let mut val = serde_json::to_value(&bug).unwrap_or(serde_json::json!({}));
-            val["slug"] = serde_json::Value::String(bug.bugid.clone());
-            val["problem"] = serde_json::Value::String(bug.problem().to_string());
-            val["severity"] = serde_json::to_value(bug.severity()).unwrap();
-            val["severity_explanation"] = serde_json::to_value(bug.severity_explanation()).unwrap();
-            val["description"] = serde_json::to_value(bug.description()).unwrap();
-            val["inline_review"] = serde_json::Value::String(bug.inline_review());
-            val["locations"] = serde_json::to_value(bug.locations()).unwrap();
-            val["source_files"] = serde_json::to_value(bug.source_files()).unwrap();
-            val["introduced_in_commit"] = serde_json::to_value(bug.introduced_in_commit()).unwrap();
-            val["verified_on_sha"] = serde_json::to_value(bug.verified_on_sha()).unwrap();
-            val["is_fixed"] = serde_json::Value::Bool(bug.is_fixed());
-            val["fixed_in_commit"] = serde_json::to_value(bug.fixed_in_commit()).unwrap();
-            val["raw_input"] = serde_json::to_value(bug.raw_input()).unwrap();
-            val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
-            val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
-            val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
-
-            if bug.lifecycle_status == crate::db::BugLifecycleStatus::Duplicate {
-                let canonical = if let Some(canon_id) = bug.duplicate_of_id {
-                    state.db.get_bug(canon_id).await.ok().flatten()
-                } else {
-                    None
-                };
-                if let Some(c) = canonical {
-                    val["duplicate_of"] = serde_json::json!({
-                        "id": c.id,
-                        "bugid": c.bugid,
-                        "problem": c.problem(),
-                    });
-                }
-            } else if let Ok(dups) = state.db.list_duplicates_for_bug(bug.id).await {
-                let dup_summaries: Vec<serde_json::Value> = dups
-                    .into_iter()
-                    .map(|d| {
-                        serde_json::json!({
-                            "id": d.id,
-                            "bugid": d.bugid,
-                            "problem": d.problem(),
-                            "created_at": d.created_at,
-                        })
-                    })
-                    .collect();
-                val["duplicates"] = serde_json::Value::Array(dup_summaries);
-            }
-            val["evidence"] = state
-                .db
-                .bug_evidence(bug.id)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            if let Some(obj) = val.as_object_mut() {
-                for key in [
-                    "raw_input",
-                    "vector_json",
-                    "enrichments",
-                    "tokens_in",
-                    "tokens_out",
-                    "tokens_cached",
-                ] {
-                    obj.remove(key);
-                }
-            }
-            Ok(Json(val))
-        }
-        Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            tracing::error!("Database error fetching preexisting bug: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
+/// Resolves what the caller may do to one bug, from the MAINTAINERS sections
+/// attributed to it. Subsystem names derived from a path prefix or supplied by
+/// the reporter name nobody and are excluded by the accessor.
+async fn bug_access(
+    state: &AppState,
+    principal: &BugPrincipal,
+    bug_id: i64,
+) -> Result<BugAccess, StatusCode> {
+    let sections = state
+        .db
+        .authorizing_sections_for_bug(bug_id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database error resolving bug authority: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let titles: Vec<SectionTitle> = sections.iter().map(|s| SectionTitle::new(s)).collect();
+    Ok(principal.access_to(&titles))
 }
 
-async fn get_bug_raw(
-    State(state): State<Arc<AppState>>,
-    Query(query): Query<BugQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+/// The subset of the given bugs the caller may read, resolved in one query.
+async fn readable_bug_ids(
+    state: &AppState,
+    principal: &BugPrincipal,
+    bug_ids: &[i64],
+) -> Result<std::collections::HashSet<i64>, StatusCode> {
+    let sections = state
+        .db
+        .authorizing_sections_for_bugs(bug_ids)
+        .await
+        .map_err(|e| {
+            tracing::error!("Database error resolving bug authority: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    Ok(bug_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            let titles: Vec<SectionTitle> = sections
+                .get(id)
+                .map(|names| names.iter().map(|s| SectionTitle::new(s)).collect())
+                .unwrap_or_default();
+            principal.access_to(&titles).can_read()
+        })
+        .collect())
+}
+
+/// Loads the bug the query names and confirms the caller may read it.
+///
+/// A bug outside the caller's authority answers 404, byte for byte the same as
+/// a bug that does not exist, so the response does not disclose which of the
+/// two it was.
+async fn readable_bug(
+    state: &AppState,
+    principal: &BugPrincipal,
+    query: &BugQuery,
+) -> Result<crate::db::Bug, StatusCode> {
     let bug = if let Some(id) = query.id {
         state.db.get_bug(id).await
     } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
@@ -1085,8 +1063,141 @@ async fn get_bug_raw(
     } else {
         return Err(StatusCode::BAD_REQUEST);
     }
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|e| {
+        tracing::error!("Database error fetching bug: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
     .ok_or(StatusCode::NOT_FOUND)?;
+
+    if !bug_access(state, principal, bug.id).await?.can_read() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(bug)
+}
+
+/// Removes embedded bug summaries the caller may not read.
+///
+/// The patchset and review payloads carry each bug's problem statement,
+/// severity and inline review. That is bug data and answers to the same
+/// authority as `/api/bug`, so it is filtered here rather than being left to
+/// the single-bug endpoints to protect.
+async fn redact_embedded_bugs(
+    state: &AppState,
+    principal: &BugPrincipal,
+    payload: &mut serde_json::Value,
+) -> Result<(), StatusCode> {
+    let Some(bugs) = payload.get("bugs").and_then(|b| b.as_array()) else {
+        return Ok(());
+    };
+    if bugs.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i64> = bugs.iter().filter_map(|b| b["id"].as_i64()).collect();
+    let readable = readable_bug_ids(state, principal, &ids).await?;
+    if let Some(array) = payload.get_mut("bugs").and_then(|b| b.as_array_mut()) {
+        array.retain(|b| b["id"].as_i64().is_some_and(|id| readable.contains(&id)));
+    }
+    Ok(())
+}
+
+async fn get_bug(
+    principal: BugPrincipal,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BugQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let bug = readable_bug(&state, &principal, &query).await?;
+    let mut val = serde_json::to_value(&bug).unwrap_or(serde_json::json!({}));
+    val["slug"] = serde_json::Value::String(bug.bugid.clone());
+    val["problem"] = serde_json::Value::String(bug.problem().to_string());
+    val["severity"] = serde_json::to_value(bug.severity()).unwrap();
+    val["severity_explanation"] = serde_json::to_value(bug.severity_explanation()).unwrap();
+    val["description"] = serde_json::to_value(bug.description()).unwrap();
+    val["inline_review"] = serde_json::Value::String(bug.inline_review());
+    val["locations"] = serde_json::to_value(bug.locations()).unwrap();
+    val["source_files"] = serde_json::to_value(bug.source_files()).unwrap();
+    val["introduced_in_commit"] = serde_json::to_value(bug.introduced_in_commit()).unwrap();
+    val["verified_on_sha"] = serde_json::to_value(bug.verified_on_sha()).unwrap();
+    val["is_fixed"] = serde_json::Value::Bool(bug.is_fixed());
+    val["fixed_in_commit"] = serde_json::to_value(bug.fixed_in_commit()).unwrap();
+    val["raw_input"] = serde_json::to_value(bug.raw_input()).unwrap();
+    val["tokens_in"] = serde_json::Value::Number(bug.tokens_in().into());
+    val["tokens_out"] = serde_json::Value::Number(bug.tokens_out().into());
+    val["tokens_cached"] = serde_json::Value::Number(bug.tokens_cached().into());
+
+    attach_duplicate_relations(&state, &principal, &bug, &mut val).await?;
+    val["evidence"] = state
+        .db
+        .bug_evidence(bug.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if let Some(obj) = val.as_object_mut() {
+        for key in [
+            "raw_input",
+            "vector_json",
+            "enrichments",
+            "tokens_in",
+            "tokens_out",
+            "tokens_cached",
+        ] {
+            obj.remove(key);
+        }
+    }
+    Ok(Json(val))
+}
+
+/// Attaches the bug's duplicate relations, omitting any counterpart the caller
+/// may not read. A pointer to an invisible bug would disclose both that it
+/// exists and what it is about.
+async fn attach_duplicate_relations(
+    state: &AppState,
+    principal: &BugPrincipal,
+    bug: &crate::db::Bug,
+    val: &mut serde_json::Value,
+) -> Result<(), StatusCode> {
+    if bug.lifecycle_status == crate::db::BugLifecycleStatus::Duplicate {
+        let Some(canonical_id) = bug.duplicate_of_id else {
+            return Ok(());
+        };
+        if !bug_access(state, principal, canonical_id).await?.can_read() {
+            return Ok(());
+        }
+        if let Some(canonical) = state.db.get_bug(canonical_id).await.ok().flatten() {
+            val["duplicate_of"] = serde_json::json!({
+                "id": canonical.id,
+                "bugid": canonical.bugid,
+                "problem": canonical.problem(),
+            });
+        }
+        return Ok(());
+    }
+
+    let Ok(duplicates) = state.db.list_duplicates_for_bug(bug.id).await else {
+        return Ok(());
+    };
+    let ids: Vec<i64> = duplicates.iter().map(|d| d.id).collect();
+    let readable = readable_bug_ids(state, principal, &ids).await?;
+    let summaries: Vec<serde_json::Value> = duplicates
+        .iter()
+        .filter(|d| readable.contains(&d.id))
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "bugid": d.bugid,
+                "problem": d.problem(),
+                "created_at": d.created_at,
+            })
+        })
+        .collect();
+    val["duplicates"] = serde_json::Value::Array(summaries);
+    Ok(())
+}
+
+async fn get_bug_raw(
+    principal: BugPrincipal,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BugQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let bug = readable_bug(&state, &principal, &query).await?;
     let records = state
         .db
         .bug_family(bug.id, true)
@@ -1101,18 +1212,11 @@ async fn get_bug_raw(
 /// Duplicates keep their own candidate records, so each one resolves to the
 /// input that produced it rather than the canonical bug's input.
 async fn get_bug_input(
+    principal: BugPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let bug = if let Some(id) = query.id {
-        state.db.get_bug(id).await
-    } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
-        state.db.get_bug_by_bugid(bugid).await
-    } else {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    let bug = readable_bug(&state, &principal, &query).await?;
 
     let inputs: Vec<serde_json::Value> = bug
         .enrichments
@@ -1139,40 +1243,23 @@ async fn get_bug_input(
 }
 
 async fn get_bug_enrichments(
+    principal: BugPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let bug = if let Some(id) = query.id {
-        state.db.get_bug(id).await
-    } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
-        state.db.get_bug_by_bugid(bugid).await
-    } else {
-        return Err(StatusCode::BAD_REQUEST);
-    };
-
-    match bug {
-        Ok(Some(bug)) => Ok(Json(
-            serde_json::to_value(&bug.enrichments).unwrap_or_default(),
-        )),
-        Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(e) => {
-            tracing::error!("Database error fetching enrichments: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-    }
+    let bug = readable_bug(&state, &principal, &query).await?;
+    Ok(Json(
+        serde_json::to_value(&bug.enrichments).unwrap_or_default(),
+    ))
 }
 
 async fn get_bug_logs(
+    principal: BugPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let result = if let Some(id) = query.id {
-        state.db.get_bug_logs(id).await
-    } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
-        state.db.get_bug_logs_by_bugid(bugid).await
-    } else {
-        return Err(StatusCode::BAD_REQUEST);
-    };
+    let bug = readable_bug(&state, &principal, &query).await?;
+    let result = state.db.get_bug_logs(bug.id).await;
 
     match result {
         Ok(Some(logs_str)) => {
@@ -1730,9 +1817,11 @@ async fn forge_webhook(
 }
 
 async fn list_bugs(
+    principal: BugPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugListQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let scope = principal.maintained_section_names();
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query.per_page.unwrap_or(50).clamp(1, 100);
 
@@ -1815,6 +1904,7 @@ async fn list_bugs(
             search: query.q.as_deref(),
             sort_by: query.sort_by.as_deref(),
             sort_order: query.sort_order.as_deref(),
+            visibility: principal.visibility(&scope),
         })
         .await
     {
@@ -1867,6 +1957,7 @@ async fn list_bugs(
 }
 
 async fn list_bug_subsystems(
+    principal: BugPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugSubsystemsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1875,16 +1966,24 @@ async fn list_bug_subsystems(
         Some(Err(_)) => return Err(StatusCode::BAD_REQUEST),
         None => crate::db::BugLifecycleStatus::Open,
     };
-    // Key the cache on the parsed value so the alias and the canonical spelling
-    // do not each get their own entry.
-    let status_key = Some(lifecycle_status.as_str().to_string());
+    let scope = principal.maintained_section_names();
+    let visibility = principal.visibility(&scope);
+    // Key the cache on the parsed status so the alias and the canonical
+    // spelling do not each get their own entry, and on the principal's scope so
+    // that one caller's counts are never served to a caller with a different
+    // reach. Every principal who reads everything shares one entry.
+    let scope_key = match visibility {
+        crate::db::BugVisibility::Unrestricted => "*".to_string(),
+        crate::db::BugVisibility::Sections(sections) => sections.join("\n"),
+    };
+    let cache_key = Some(format!("{}|{}", lifecycle_status.as_str(), scope_key));
 
     let res = state
         .bug_subsystems_cache
-        .get_or_fetch(status_key, || async {
+        .get_or_fetch(cache_key, || async {
             let db = state.db.clone();
             let counts = db
-                .get_subsystems_bug_counts(Some(lifecycle_status))
+                .get_subsystems_bug_counts(Some(lifecycle_status), visibility)
                 .await
                 .map_err(|e| {
                     tracing::error!("Failed to fetch bug subsystem counts: {}", e);
@@ -2189,7 +2288,12 @@ mod tests {
         .await
         .unwrap();
 
-        let settings = Arc::new(crate::settings::Settings::new().unwrap());
+        // Bug routes require a resolved principal. Testing mode supplies an
+        // operator one, so that this test exercises the handler rather than
+        // the authorization layer, which is covered separately.
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = true;
+        let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (fetch_tx, _fetch_rx) = mpsc::channel(10);
         let app = build_router(
@@ -2315,8 +2419,14 @@ mod tests {
         .await
         .unwrap();
 
+        // Bug reads need a principal with authority over the bug. The security
+        // list reads every bug and holds no other capability, which keeps the
+        // capability assertions further down honest.
+        const SECRET: &str = "bug-test-secret-12345678901234567890";
         let mut settings = crate::settings::Settings::new().unwrap();
-        settings.server.jwt_secret = Some("bug-test-secret-12345678901234567890".into());
+        settings.server.jwt_secret = Some(SECRET.to_string());
+        settings.server.acl.security = vec!["security@example.org".to_string()];
+        settings.server.acl.blocklist = Vec::new();
         let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (fetch_tx, _fetch_rx) = mpsc::channel(10);
@@ -2331,6 +2441,24 @@ mod tests {
             true,
         );
 
+        let token = crate::auth::create_token(
+            "security@example.org",
+            SECRET,
+            Some("session".to_string()),
+            3600,
+        )
+        .unwrap();
+        let mut auth_headers = reqwest::header::HeaderMap::new();
+        auth_headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", token).parse().unwrap(),
+        );
+        let client = reqwest::Client::builder()
+            .default_headers(auth_headers)
+            .build()
+            .unwrap();
+        let get = |url: String| client.get(url).send();
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2343,7 +2471,7 @@ mod tests {
         });
 
         // Test 1: get_bug by bugid (logs omitted)
-        let res = reqwest::get(format!("http://{}/api/bug?bugid=linux-12345678", addr))
+        let res = get(format!("http://{}/api/bug?bugid=linux-12345678", addr))
             .await
             .unwrap();
         assert_eq!(res.status(), 200);
@@ -2357,7 +2485,7 @@ mod tests {
         assert_eq!(json["evidence"]["activity"].as_array().unwrap().len(), 4);
 
         // Test 1c: get_bug_enrichments
-        let res_enrich = reqwest::get(format!(
+        let res_enrich = get(format!(
             "http://{}/api/bug/enrichments?bugid=linux-12345678",
             addr
         ))
@@ -2375,13 +2503,13 @@ mod tests {
         );
 
         // Test 1b: get_bug by legacy slug param
-        let res_slug = reqwest::get(format!("http://{}/api/bug?slug=linux-12345678", addr))
+        let res_slug = get(format!("http://{}/api/bug?slug=linux-12345678", addr))
             .await
             .unwrap();
         assert_eq!(res_slug.status(), 200);
 
         // Test 2: get_bug_logs by bugid
-        let res_logs = reqwest::get(format!("http://{}/api/bug/logs?bugid=linux-12345678", addr))
+        let res_logs = get(format!("http://{}/api/bug/logs?bugid=linux-12345678", addr))
             .await
             .unwrap();
         assert_eq!(res_logs.status(), 200);
@@ -2390,20 +2518,19 @@ mod tests {
         assert_eq!(logs_json[0]["role"], "user");
 
         // Test 2b: get_bug_logs by legacy slug param
-        let res_logs_slug =
-            reqwest::get(format!("http://{}/api/bug/logs?slug=linux-12345678", addr))
-                .await
-                .unwrap();
+        let res_logs_slug = get(format!("http://{}/api/bug/logs?slug=linux-12345678", addr))
+            .await
+            .unwrap();
         assert_eq!(res_logs_slug.status(), 200);
 
         // Test 2b: get_bug_logs by id
-        let res_logs_id = reqwest::get(format!("http://{}/api/bug/logs?id={}", addr, bug_id))
+        let res_logs_id = get(format!("http://{}/api/bug/logs?id={}", addr, bug_id))
             .await
             .unwrap();
         assert_eq!(res_logs_id.status(), 200);
 
         // Test 3: list_bugs with subsystem filter
-        let res_sub = reqwest::get(format!("http://{}/api/bugs?subsystem=drivers/net", addr))
+        let res_sub = get(format!("http://{}/api/bugs?subsystem=drivers/net", addr))
             .await
             .unwrap();
         assert_eq!(res_sub.status(), 200);
@@ -2413,7 +2540,7 @@ mod tests {
         assert!(list_json["items"][0]["logs"].is_null());
 
         // Test 3a: list_bugs with hierarchical parent subsystem filter ("drivers" matches "drivers/net")
-        let res_hier = reqwest::get(format!("http://{}/api/bugs?subsystem=drivers", addr))
+        let res_hier = get(format!("http://{}/api/bugs?subsystem=drivers", addr))
             .await
             .unwrap();
         assert_eq!(res_hier.status(), 200);
@@ -2421,7 +2548,7 @@ mod tests {
         assert_eq!(hier_json["total"], 1);
 
         // Test 3b: list_bugs with non-matching subsystem filter
-        let res_other_sub = reqwest::get(format!("http://{}/api/bugs?subsystem=btrfs", addr))
+        let res_other_sub = get(format!("http://{}/api/bugs?subsystem=btrfs", addr))
             .await
             .unwrap();
         assert_eq!(res_other_sub.status(), 200);
@@ -2429,7 +2556,7 @@ mod tests {
         assert_eq!(empty_list["total"], 0);
 
         // Test 3c: list_bugs with lifecycle filter
-        let res_status = reqwest::get(format!("http://{}/api/bugs?lifecycle_status=new", addr))
+        let res_status = get(format!("http://{}/api/bugs?lifecycle_status=new", addr))
             .await
             .unwrap();
         assert_eq!(res_status.status(), 200);
@@ -2437,7 +2564,7 @@ mod tests {
         assert_eq!(status_json["total"], 1);
 
         // Test 3d: list_bugs with lifecycle filter mismatch
-        let res_open = reqwest::get(format!("http://{}/api/bugs?lifecycle_status=open", addr))
+        let res_open = get(format!("http://{}/api/bugs?lifecycle_status=open", addr))
             .await
             .unwrap();
         assert_eq!(res_open.status(), 200);
@@ -2446,7 +2573,7 @@ mod tests {
 
         // Test 3d1: the historical status spelling still selects the lifecycle
         // axis, so bookmarked URLs keep working.
-        let res_alias = reqwest::get(format!("http://{}/api/bugs?status=new", addr))
+        let res_alias = get(format!("http://{}/api/bugs?status=new", addr))
             .await
             .unwrap();
         assert_eq!(res_alias.status(), 200);
@@ -2454,7 +2581,7 @@ mod tests {
         assert_eq!(alias_json["total"], 1);
 
         // Test 3d2: the pipeline axis is filterable independently.
-        let res_pipeline = reqwest::get(format!("http://{}/api/bugs?pipeline_state=pending", addr))
+        let res_pipeline = get(format!("http://{}/api/bugs?pipeline_state=pending", addr))
             .await
             .unwrap();
         assert_eq!(res_pipeline.status(), 200);
@@ -2463,13 +2590,13 @@ mod tests {
 
         // Test 3d3: an unknown state is rejected rather than silently matching
         // nothing, which would look identical to an empty result set.
-        let res_bogus = reqwest::get(format!("http://{}/api/bugs?lifecycle_status=raw", addr))
+        let res_bogus = get(format!("http://{}/api/bugs?lifecycle_status=raw", addr))
             .await
             .unwrap();
         assert_eq!(res_bogus.status(), 400);
 
         // Test 3e: list_bugs with sorting
-        let res_sort = reqwest::get(format!(
+        let res_sort = get(format!(
             "http://{}/api/bugs?sort_by=severity&sort_order=desc",
             addr
         ))
@@ -2478,7 +2605,7 @@ mod tests {
         assert_eq!(res_sort.status(), 200);
 
         // Test 3f: list_bugs with multi-subsystem filter (subsystems parameter)
-        let res_multi = reqwest::get(format!(
+        let res_multi = get(format!(
             "http://{}/api/bugs?subsystems=drivers/net,btrfs",
             addr
         ))
@@ -2489,7 +2616,7 @@ mod tests {
         assert_eq!(multi_json["total"], 1);
 
         // Test 3g: list_bugs with comma-separated single subsystem parameter
-        let res_comma = reqwest::get(format!("http://{}/api/bugs?subsystem=drivers/net,fs", addr))
+        let res_comma = get(format!("http://{}/api/bugs?subsystem=drivers/net,fs", addr))
             .await
             .unwrap();
         assert_eq!(res_comma.status(), 200);
@@ -2497,16 +2624,15 @@ mod tests {
         assert_eq!(comma_json["total"], 1);
 
         // Test 3h: list_bugs with non-matching multi-subsystem
-        let res_multi_none =
-            reqwest::get(format!("http://{}/api/bugs?subsystems=btrfs,ext4", addr))
-                .await
-                .unwrap();
+        let res_multi_none = get(format!("http://{}/api/bugs?subsystems=btrfs,ext4", addr))
+            .await
+            .unwrap();
         assert_eq!(res_multi_none.status(), 200);
         let multi_none_json: serde_json::Value = res_multi_none.json().await.unwrap();
         assert_eq!(multi_none_json["total"], 0);
 
         // Test 3i: GET /api/bugs/subsystems with lifecycle_status=new
-        let res_subs_api = reqwest::get(format!(
+        let res_subs_api = get(format!(
             "http://{}/api/bugs/subsystems?lifecycle_status=new",
             addr
         ))
@@ -2521,7 +2647,7 @@ mod tests {
         assert_eq!(subs_arr[0]["open_bugs"], 1);
 
         // Test 3j: GET /api/subsystems alias
-        let res_subs_alias = reqwest::get(format!(
+        let res_subs_alias = get(format!(
             "http://{}/api/subsystems?lifecycle_status=new",
             addr
         ))
@@ -2531,7 +2657,7 @@ mod tests {
 
         // Test 3k: GET /api/bugs/subsystems with lifecycle_status=open (should
         // skip 0-bug entries)
-        let res_subs_open = reqwest::get(format!(
+        let res_subs_open = get(format!(
             "http://{}/api/bugs/subsystems?lifecycle_status=open",
             addr
         ))
@@ -2576,7 +2702,7 @@ mod tests {
         .unwrap();
 
         // Check duplicate_of on the duplicate bug
-        let res_dup = reqwest::get(format!("http://{}/api/bug?id={}", addr, dup_id))
+        let res_dup = get(format!("http://{}/api/bug?id={}", addr, dup_id))
             .await
             .unwrap();
         assert_eq!(res_dup.status(), 200);
@@ -2585,7 +2711,7 @@ mod tests {
         assert_eq!(dup_resp["duplicate_of"]["bugid"], "linux-12345678");
 
         // Check duplicates array on canonical bug
-        let res_canon = reqwest::get(format!("http://{}/api/bug?id={}", addr, bug_id))
+        let res_canon = get(format!("http://{}/api/bug?id={}", addr, bug_id))
             .await
             .unwrap();
         assert_eq!(res_canon.status(), 200);
@@ -2645,13 +2771,12 @@ mod tests {
         assert_eq!(comment.author.as_deref(), Some("maintainer@example.org"));
         assert_eq!(comment.tool, "web");
         assert!(comment.model.is_none());
-        let raw: serde_json::Value =
-            reqwest::get(format!("http://{}/api/bug/raw?id={}", addr, bug_id))
-                .await
-                .unwrap()
-                .json()
-                .await
-                .unwrap();
+        let raw: serde_json::Value = get(format!("http://{}/api/bug/raw?id={}", addr, bug_id))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(raw["records"].as_array().unwrap().len(), 2);
         assert!(
             raw["records"]
@@ -2661,13 +2786,13 @@ mod tests {
                 .flat_map(|b| b["enrichments"].as_array().unwrap())
                 .any(|e| e["logs"].as_str().is_some_and(|s| s.contains("test")))
         );
-        let missing = reqwest::get(format!("http://{}/api/bug/raw?id=999999", addr))
+        let missing = get(format!("http://{}/api/bug/raw?id=999999", addr))
             .await
             .unwrap();
         assert_eq!(missing.status(), 404);
 
         // Test 6: get_config reports permissions, and remote unauthenticated action is denied with clear message
-        let cfg_loopback: serde_json::Value = reqwest::get(format!("http://{}/api/config", addr))
+        let cfg_loopback: serde_json::Value = get(format!("http://{}/api/config", addr))
             .await
             .unwrap()
             .json()
@@ -2675,7 +2800,6 @@ mod tests {
             .unwrap();
         assert_eq!(cfg_loopback["permissions"]["action"], true);
 
-        let client = reqwest::Client::new();
         let cfg_remote: serde_json::Value = client
             .get(format!("http://{}/api/config", addr))
             .header("x-forwarded-for", "203.0.113.1")
@@ -2903,6 +3027,148 @@ mod tests {
             Some(&allowed_user),
             crate::settings::Permission::Review
         ));
+    }
+
+    #[tokio::test]
+    async fn test_bug_reads_require_an_authorized_principal() {
+        const SECRET: &str = "bug-authz-secret-12345678901234567890";
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let bug_id = db
+            .create_bug(&crate::db::NewBug {
+                bugid: "linux-authz01".to_string(),
+                title: "UAF in btrfs".to_string(),
+                lifecycle_status: crate::db::BugLifecycleStatus::New,
+                pipeline_state: crate::db::BugPipelineState::Pending,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 123456,
+                discovered_in_patchset_id: None,
+                discovered_in_patch_id: None,
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![crate::db::AttributedSubsystem::from_maintainers(
+                    "BTRFS FILE SYSTEM",
+                )],
+            })
+            .await
+            .unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        settings.server.jwt_secret = Some(SECRET.to_string());
+        settings.server.acl.admins = vec!["operator@example.org".to_string()];
+        settings.server.acl.security = Vec::new();
+        settings.server.acl.blocklist = Vec::new();
+        let settings = Arc::new(settings);
+
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings.clone(),
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            false,
+            false,
+            true,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let token = |email: &str| {
+            crate::auth::create_token(email, SECRET, Some("session".to_string()), 3600).unwrap()
+        };
+        let get = |path: String, bearer: Option<String>| {
+            let mut req = client.get(format!("http://{}{}", addr, path));
+            if let Some(bearer) = bearer {
+                req = req.header("Authorization", format!("Bearer {}", bearer));
+            }
+            req.send()
+        };
+
+        // The request comes from loopback with no credentials, which is exactly
+        // the shape the loopback bypass admits elsewhere. Bug routes do not
+        // honour it.
+        let anonymous = get(format!("/api/bug?id={}", bug_id), None).await.unwrap();
+        assert_eq!(anonymous.status(), 401);
+
+        let garbage = get(format!("/api/bug?id={}", bug_id), Some("nonsense".into()))
+            .await
+            .unwrap();
+        assert_eq!(garbage.status(), 401);
+
+        // Authenticated, but maintains nothing and holds no capability. The
+        // answer has to be indistinguishable from a bug that is not there.
+        let stranger = token("stranger@example.org");
+        let denied = get(format!("/api/bug?id={}", bug_id), Some(stranger.clone()))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), 404);
+        let absent = get("/api/bug?id=999999".to_string(), Some(stranger.clone()))
+            .await
+            .unwrap();
+        assert_eq!(absent.status(), 404);
+
+        for path in ["/api/bug/logs", "/api/bug/raw", "/api/bug/input"] {
+            let res = get(format!("{}?id={}", path, bug_id), Some(stranger.clone()))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 404, "{} leaked to a stranger", path);
+            let res = get(format!("{}?id={}", path, bug_id), None).await.unwrap();
+            assert_eq!(res.status(), 401, "{} served without a session", path);
+        }
+
+        let listing: serde_json::Value = get("/api/bugs".to_string(), Some(stranger.clone()))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listing["total"], 0);
+        assert!(listing["items"].as_array().unwrap().is_empty());
+
+        let facets: serde_json::Value =
+            get("/api/bugs/subsystems".to_string(), Some(stranger.clone()))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert!(facets.as_array().unwrap().is_empty());
+
+        // The operator sees everything.
+        let operator = token("operator@example.org");
+        let allowed = get(format!("/api/bug?id={}", bug_id), Some(operator.clone()))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), 200);
+        let body: serde_json::Value = allowed.json().await.unwrap();
+        assert_eq!(body["bugid"], "linux-authz01");
+
+        let listing: serde_json::Value = get("/api/bugs".to_string(), Some(operator))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(listing["total"], 1);
     }
 }
 

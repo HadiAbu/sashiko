@@ -859,6 +859,28 @@ pub struct MarkDuplicateBugParams<'a> {
     pub tokens_cached: Option<usize>,
 }
 
+/// Which bugs a listing may return.
+///
+/// The default is the empty scope rather than everything: a caller that forgets
+/// to say what the principal may see gets nothing back, so widening access has
+/// to be written down deliberately.
+#[derive(Debug, Clone, Copy)]
+pub enum BugVisibility<'a> {
+    /// Every bug. For Sashiko operators, the kernel security list, and
+    /// maintainers of a section that claims the whole tree.
+    Unrestricted,
+    /// Only bugs that the MAINTAINERS file attributes to one of these section
+    /// titles. Matching is ASCII case-insensitive, and rows attributed by a
+    /// directory prefix or by the caller are never matched.
+    Sections(&'a [String]),
+}
+
+impl Default for BugVisibility<'_> {
+    fn default() -> Self {
+        BugVisibility::Sections(&[])
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ListBugsParams<'a> {
     pub page: Option<u32>,
@@ -872,6 +894,9 @@ pub struct ListBugsParams<'a> {
     pub search: Option<&'a str>,
     pub sort_by: Option<&'a str>,
     pub sort_order: Option<&'a str>,
+    /// What the calling principal is allowed to see. Applied on top of every
+    /// other filter, so a subsystem filter can only ever narrow the result.
+    pub visibility: BugVisibility<'a>,
 }
 
 /// Selects bugs by who they are assigned to.
@@ -1842,6 +1867,52 @@ impl Database {
         Ok(subs)
     }
 
+    /// Returns the MAINTAINERS section titles attributed to this bug.
+    ///
+    /// Rows whose provenance is a directory prefix or a caller-supplied string
+    /// are excluded, because they name nobody and therefore confer no
+    /// authority. Authorization must call this rather than read
+    /// `Bug::subsystems`, which `parse_bug_row_core` always leaves empty.
+    pub async fn authorizing_sections_for_bug(&self, bug_id: i64) -> Result<Vec<String>> {
+        Ok(self
+            .authorizing_sections_for_bugs(&[bug_id])
+            .await?
+            .remove(&bug_id)
+            .unwrap_or_default())
+    }
+
+    /// Batch form of [`Database::authorizing_sections_for_bug`], so that
+    /// filtering a page of bugs costs one query rather than one per bug.
+    pub async fn authorizing_sections_for_bugs(
+        &self,
+        bug_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<String>>> {
+        let mut sections: std::collections::HashMap<i64, Vec<String>> =
+            std::collections::HashMap::new();
+        if bug_ids.is_empty() {
+            return Ok(sections);
+        }
+        let placeholders = vec!["?"; bug_ids.len()].join(", ");
+        let sql = format!(
+            "SELECT bug_id, subsystem FROM bug_subsystems
+             WHERE source = '{}' AND bug_id IN ({})
+             ORDER BY subsystem ASC",
+            SubsystemSource::MaintainersSection.as_str(),
+            placeholders
+        );
+        let params: Vec<libsql::Value> = bug_ids
+            .iter()
+            .map(|&id| libsql::Value::Integer(id))
+            .collect();
+        let mut rows = self.conn.query(&sql, params).await?;
+        while let Some(row) = rows.next().await? {
+            let bug_id: i64 = row.get(0)?;
+            let subsystem: String = row.get(1)?;
+            sections.entry(bug_id).or_default().push(subsystem);
+        }
+        Ok(sections)
+    }
+
     /// Each candidate is a discovery; analysis stages never increase this count.
     /// UNION makes historical malformed duplicate graphs terminate safely.
     pub async fn bug_family(&self, id: i64, raw: bool) -> Result<Vec<Bug>> {
@@ -2757,6 +2828,33 @@ impl Database {
         let mut conditions: Vec<std::borrow::Cow<'static, str>> = Vec::new();
         let mut query_params = Vec::new();
 
+        // The scope predicate goes in before the caller's own filters so that a
+        // subsystem filter can only narrow what the principal may already see.
+        // Filtering in Rust after the query would corrupt the pagination count.
+        if let BugVisibility::Sections(scope) = params.visibility {
+            let titles: Vec<&str> = scope
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if titles.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
+            let placeholders = vec!["?"; titles.len()].join(", ");
+            conditions.push(
+                format!(
+                    "id IN (SELECT bug_id FROM bug_subsystems
+                            WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({}))",
+                    SubsystemSource::MaintainersSection.as_str(),
+                    placeholders
+                )
+                .into(),
+            );
+            for title in titles {
+                query_params.push(libsql::Value::Text(title.to_string()));
+            }
+        }
+
         if let Some(subs) = params.subsystems {
             let valid_subs: Vec<&str> = subs
                 .iter()
@@ -2980,19 +3078,50 @@ impl Database {
         Ok((bugs, total))
     }
 
+    /// Counts open bugs per subsystem, over only the bugs the principal may
+    /// read. Counting every bug would turn this endpoint into an oracle for the
+    /// existence of bugs in subsystems the caller has no authority over.
     pub async fn get_subsystems_bug_counts(
         &self,
         lifecycle_status: Option<BugLifecycleStatus>,
+        visibility: BugVisibility<'_>,
     ) -> Result<Vec<(String, usize)>> {
         let st = lifecycle_status.unwrap_or(BugLifecycleStatus::Open);
-        let sql = "SELECT bs.subsystem, COUNT(DISTINCT b.id) AS bug_count
+        let mut params: Vec<libsql::Value> = vec![libsql::Value::Text(st.as_str().to_string())];
+        let scope_clause = match visibility {
+            BugVisibility::Unrestricted => String::new(),
+            BugVisibility::Sections(scope) => {
+                let titles: Vec<&str> = scope
+                    .iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if titles.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let placeholders = vec!["?"; titles.len()].join(", ");
+                for title in &titles {
+                    params.push(libsql::Value::Text((*title).to_string()));
+                }
+                format!(
+                    " AND b.id IN (SELECT bug_id FROM bug_subsystems
+                                   WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({}))",
+                    SubsystemSource::MaintainersSection.as_str(),
+                    placeholders
+                )
+            }
+        };
+        let sql = format!(
+            "SELECT bs.subsystem, COUNT(DISTINCT b.id) AS bug_count
                    FROM bug_subsystems bs
                    JOIN bugs b ON bs.bug_id = b.id
-                   WHERE b.lifecycle_status = ?
+                   WHERE b.lifecycle_status = ?{}
                    GROUP BY bs.subsystem
                    HAVING bug_count > 0
-                   ORDER BY bug_count DESC, bs.subsystem ASC";
-        let mut rows = self.conn.query(sql, libsql::params![st.as_str()]).await?;
+                   ORDER BY bug_count DESC, bs.subsystem ASC",
+            scope_clause
+        );
+        let mut rows = self.conn.query(&sql, params).await?;
         let mut results = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let name: String = row.get(0)?;
@@ -3104,22 +3233,6 @@ impl Database {
             )
             .await?;
         Ok(())
-    }
-
-    pub async fn get_bugs_list(
-        &self,
-        limit: usize,
-        offset: usize,
-        q: Option<&str>,
-    ) -> Result<(Vec<Bug>, usize)> {
-        let page = (offset / limit.max(1)) + 1;
-        self.list_bugs(ListBugsParams {
-            page: Some(page as u32),
-            limit: Some(limit as u32),
-            search: q,
-            ..Default::default()
-        })
-        .await
     }
 
     pub async fn list_duplicates_for_bug(&self, canonical_id: i64) -> Result<Vec<Bug>> {
@@ -6885,6 +6998,85 @@ mod tests {
             })
             .count();
         assert_eq!(reattributed, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bug_visibility_scopes_listings_to_maintained_sections() -> Result<()> {
+        let db = setup_db().await;
+        let mut btrfs: NewBug = serde_json::from_value(json!({"bugid": "b1", "title": "t"}))?;
+        btrfs.subsystems = vec![AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM")];
+        let btrfs = db.create_bug(&btrfs).await?;
+
+        let mut net: NewBug = serde_json::from_value(json!({"bugid": "b2", "title": "t"}))?;
+        net.subsystems = vec![AttributedSubsystem::from_maintainers("NETWORKING DRIVERS")];
+        let net = db.create_bug(&net).await?;
+
+        // Attributed by path and by the reporter, so it names no maintainer.
+        let mut unclaimed: NewBug = serde_json::from_value(json!({"bugid": "b3", "title": "t"}))?;
+        unclaimed.subsystems = vec![
+            AttributedSubsystem::from_path_prefix("drivers/misc"),
+            AttributedSubsystem::new("btrfs file system", SubsystemSource::CallerSupplied),
+        ];
+        let unclaimed = db.create_bug(&unclaimed).await?;
+
+        assert_eq!(
+            db.authorizing_sections_for_bug(btrfs).await?,
+            vec!["BTRFS FILE SYSTEM".to_string()]
+        );
+        assert!(db.authorizing_sections_for_bug(unclaimed).await?.is_empty());
+
+        let batch = db
+            .authorizing_sections_for_bugs(&[btrfs, net, unclaimed])
+            .await?;
+        assert_eq!(batch.len(), 2);
+        assert!(!batch.contains_key(&unclaimed));
+
+        // The scope matches the stored title regardless of case, and a name the
+        // reporter invented never brings a bug into scope.
+        let scope = vec!["btrfs file system".to_string()];
+        let (items, total) = db
+            .list_bugs(ListBugsParams {
+                visibility: BugVisibility::Sections(&scope),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(total, 1);
+        assert_eq!(items[0].id, btrfs);
+
+        // The default is the empty scope, so a caller who says nothing sees
+        // nothing.
+        let (items, total) = db.list_bugs(ListBugsParams::default()).await?;
+        assert_eq!(total, 0);
+        assert!(items.is_empty());
+
+        let (_, total) = db
+            .list_bugs(ListBugsParams {
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(total, 3);
+
+        // Facet counts follow the same scope, so they cannot be used to infer
+        // that a bug exists in someone else's subsystem.
+        let counts = db
+            .get_subsystems_bug_counts(
+                Some(BugLifecycleStatus::New),
+                BugVisibility::Sections(&scope),
+            )
+            .await?;
+        assert_eq!(counts, vec![("BTRFS FILE SYSTEM".to_string(), 1)]);
+
+        let counts = db
+            .get_subsystems_bug_counts(Some(BugLifecycleStatus::New), BugVisibility::default())
+            .await?;
+        assert!(counts.is_empty());
+
+        let counts = db
+            .get_subsystems_bug_counts(Some(BugLifecycleStatus::New), BugVisibility::Unrestricted)
+            .await?;
+        assert_eq!(counts.len(), 4);
         Ok(())
     }
 
@@ -12355,6 +12547,7 @@ mod tests {
                 subsystem: Some("net"),
                 lifecycle_status: Some(BugLifecycleStatus::Open),
                 search: Some("e1000"),
+                visibility: BugVisibility::Unrestricted,
                 ..Default::default()
             })
             .await
@@ -12369,6 +12562,7 @@ mod tests {
                 page: Some(1),
                 limit: Some(10),
                 subsystem: Some("net"),
+                visibility: BugVisibility::Unrestricted,
                 ..Default::default()
             })
             .await
@@ -12382,6 +12576,7 @@ mod tests {
                 page: Some(1),
                 limit: Some(10),
                 subsystem: Some("cor"),
+                visibility: BugVisibility::Unrestricted,
                 ..Default::default()
             })
             .await
@@ -12394,6 +12589,7 @@ mod tests {
                 page: Some(1),
                 limit: Some(10),
                 lifecycle_status: Some(BugLifecycleStatus::Dismissed),
+                visibility: BugVisibility::Unrestricted,
                 ..Default::default()
             })
             .await
@@ -12407,6 +12603,7 @@ mod tests {
                 page: Some(1),
                 limit: Some(10),
                 min_severity: Some(Severity::Critical),
+                visibility: BugVisibility::Unrestricted,
                 ..Default::default()
             })
             .await
@@ -12421,6 +12618,7 @@ mod tests {
                 limit: Some(10),
                 sort_by: Some("severity"),
                 sort_order: Some("asc"),
+                visibility: BugVisibility::Unrestricted,
                 ..Default::default()
             })
             .await
@@ -12433,6 +12631,7 @@ mod tests {
                 limit: Some(10),
                 sort_by: Some("discoveries"),
                 sort_order: Some("desc"),
+                visibility: BugVisibility::Unrestricted,
                 ..Default::default()
             })
             .await
@@ -12684,6 +12883,7 @@ mod tests {
         let (items, total) = db
             .list_bugs(ListBugsParams {
                 assignee: Some(AssigneeFilter::Is("me@example.org")),
+                visibility: BugVisibility::Unrestricted,
                 ..Default::default()
             })
             .await
@@ -12694,6 +12894,7 @@ mod tests {
         let (items, total) = db
             .list_bugs(ListBugsParams {
                 assignee: Some(AssigneeFilter::Unassigned),
+                visibility: BugVisibility::Unrestricted,
                 ..Default::default()
             })
             .await
