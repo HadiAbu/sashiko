@@ -435,6 +435,15 @@ pub enum Permission {
 pub struct AclSettings {
     #[serde(default)]
     pub admins: Vec<String>,
+    /// The kernel security list. Reads and comments on every bug, and reads
+    /// the raw analysis transcripts, without gaining any of the capabilities
+    /// below.
+    #[serde(default)]
+    pub security: Vec<String>,
+    /// Principals allowed to file a bug over HTTP. Empty means only operators
+    /// can, which is the shipped configuration.
+    #[serde(default)]
+    pub bug_reporters: Vec<String>,
     #[serde(default)]
     pub ingest: Vec<String>,
     #[serde(default)]
@@ -447,23 +456,50 @@ pub struct AclSettings {
     pub blocklist: Vec<String>,
 }
 
+/// Matches an address against a capability list.
+///
+/// Both sides are trimmed and compared case insensitively: the list is written
+/// by hand in a configuration file and the address arrives from a sign-in
+/// form, so a stray space on either side must not decide who gets in or,
+/// worse, let a blocklisted address slip past.
+fn list_contains(list: &[String], email: &str) -> bool {
+    let email = email.trim();
+    list.iter().any(|e| e.trim().eq_ignore_ascii_case(email))
+}
+
 impl AclSettings {
     pub fn is_blocklisted(&self, email: &str) -> bool {
-        self.blocklist.iter().any(|e| e.eq_ignore_ascii_case(email))
+        list_contains(&self.blocklist, email)
+    }
+
+    /// Whether the address is an operator. Operators are never blocklisted
+    /// implicitly; the caller checks the blocklist first.
+    pub fn is_admin(&self, email: &str) -> bool {
+        list_contains(&self.admins, email)
+    }
+
+    /// Whether the address is on the kernel security list.
+    pub fn is_security(&self, email: &str) -> bool {
+        list_contains(&self.security, email)
+    }
+
+    /// Whether the address may file a bug over HTTP.
+    pub fn is_bug_reporter(&self, email: &str) -> bool {
+        list_contains(&self.bug_reporters, email)
     }
 
     pub fn has_permission(&self, email: &str, perm: Permission) -> bool {
         if self.is_blocklisted(email) {
             return false;
         }
-        if self.admins.iter().any(|e| e.eq_ignore_ascii_case(email)) {
+        if self.is_admin(email) {
             return true;
         }
         match perm {
-            Permission::Ingest => self.ingest.iter().any(|e| e.eq_ignore_ascii_case(email)),
-            Permission::Cancel => self.cancel.iter().any(|e| e.eq_ignore_ascii_case(email)),
-            Permission::Review => self.review.iter().any(|e| e.eq_ignore_ascii_case(email)),
-            Permission::Action => self.action.iter().any(|e| e.eq_ignore_ascii_case(email)),
+            Permission::Ingest => list_contains(&self.ingest, email),
+            Permission::Cancel => list_contains(&self.cancel, email),
+            Permission::Review => list_contains(&self.review, email),
+            Permission::Action => list_contains(&self.action, email),
         }
     }
 }
@@ -867,6 +903,7 @@ mod tests {
             review: vec!["rogue_admin@example.com".to_string()],
             action: vec!["rogue_admin@example.com".to_string()],
             blocklist: vec!["rogue_admin@example.com".to_string()],
+            ..Default::default()
         };
 
         assert!(acl.is_blocklisted("rogue_admin@example.com"));
@@ -900,5 +937,63 @@ mod tests {
         let acl: AclSettings = toml::from_str(toml_blocklist).expect("deserialization failed");
         assert_eq!(acl.blocklist, vec!["mallory@example.com"]);
         assert!(acl.is_blocklisted("mallory@example.com"));
+    }
+
+    #[test]
+    fn test_security_list_grants_no_capabilities() {
+        let acl = AclSettings {
+            security: vec!["gregkh@linuxfoundation.org".to_string()],
+            ..Default::default()
+        };
+        assert!(acl.is_security("gregkh@linuxfoundation.org"));
+        // Membership is about bugs. It must not leak into the capabilities
+        // that spend money or move patches around.
+        for perm in [
+            Permission::Ingest,
+            Permission::Cancel,
+            Permission::Review,
+            Permission::Action,
+        ] {
+            assert!(!acl.has_permission("gregkh@linuxfoundation.org", perm));
+        }
+        assert!(!acl.is_admin("gregkh@linuxfoundation.org"));
+        assert!(!acl.is_bug_reporter("gregkh@linuxfoundation.org"));
+    }
+
+    #[test]
+    fn test_bug_reporters_defaults_to_nobody() {
+        let acl = AclSettings::default();
+        assert!(!acl.is_bug_reporter("tool@example.com"));
+
+        let acl = AclSettings {
+            bug_reporters: vec!["tool@example.com".to_string()],
+            ..Default::default()
+        };
+        assert!(acl.is_bug_reporter("tool@example.com"));
+        assert!(!acl.is_security("tool@example.com"));
+    }
+
+    #[test]
+    fn test_list_matching_tolerates_surrounding_whitespace() {
+        let acl = AclSettings {
+            security: vec![" gregkh@linuxfoundation.org ".to_string()],
+            blocklist: vec!["  mallory@example.com".to_string()],
+            ..Default::default()
+        };
+        assert!(acl.is_security("gregkh@linuxfoundation.org"));
+        // A space in the configuration file must not let a denied address
+        // through.
+        assert!(acl.is_blocklisted("mallory@example.com"));
+        assert!(acl.is_blocklisted(" mallory@example.com "));
+    }
+
+    #[test]
+    fn test_acl_rejects_unknown_keys() {
+        // The lists are the whole security model, so a typo has to be loud.
+        let toml = r#"
+            admins = ["alice@example.com"]
+            securty = ["typo@example.com"]
+        "#;
+        assert!(toml::from_str::<AclSettings>(toml).is_err());
     }
 }

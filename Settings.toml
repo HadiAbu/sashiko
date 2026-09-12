@@ -149,6 +149,16 @@ port = 8080
 [server.acl]
 # Admins have all capabilities, including root-level maintenance operations.
 admins = []
+# The kernel security list. Reads and comments on every bug and reads the raw
+# AI transcripts. Deliberately not admins: this grants no ingest, cancel or
+# review capability, and no authority over bugs outside the member's own
+# maintained subsystems beyond commenting.
+security = [
+    "gregkh@linuxfoundation.org",
+    "linux@roeck-us.net",
+]
+# Principals permitted to file new bugs over HTTP. Empty means only admins can.
+bug_reporters = []
 # Ingest limits users/bots to only submit new patches into the system (/api/submit).
 ingest = []
 # Cancel permits halting workloads (useful for automation / cron scripts).
