@@ -123,6 +123,96 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> AsyncMapCache<K, V> {
     }
 }
 
+/// In-process rate limiter for sign-in link requests.
+///
+/// Limits:
+/// - Per address: 3 requests per 15 minutes, 10 requests per 24 hours (caps mail bombs)
+/// - Per source IP: 10 requests per 15 minutes (caps enumeration sweeps)
+/// - Global: 100 requests per 1 hour (caps total outbound login mail)
+#[derive(Default)]
+pub struct SignInLinkRateLimiter {
+    state: std::sync::Mutex<SignInLinkRateLimiterState>,
+}
+
+#[derive(Default)]
+struct SignInLinkRateLimiterState {
+    per_address: std::collections::HashMap<String, Vec<Instant>>,
+    per_ip: std::collections::HashMap<String, Vec<Instant>>,
+    global: Vec<Instant>,
+}
+
+impl SignInLinkRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(SignInLinkRateLimiterState::default()),
+        }
+    }
+
+    /// Checks if a request is allowed by all rate-limit buckets.
+    /// If allowed, records the attempt in all buckets and returns true.
+    /// If any limit is exceeded, returns false without recording an outbound grant.
+    pub fn check_and_record(&self, email: &str, client_ip: &str) -> bool {
+        let now = Instant::now();
+        let fifteen_mins = Duration::from_secs(15 * 60);
+        let one_hour = Duration::from_secs(60 * 60);
+        let one_day = Duration::from_secs(24 * 60 * 60);
+
+        let mut guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        // 1. Per client IP: 10 per 15 minutes
+        let ip_attempts = guard.per_ip.entry(client_ip.to_string()).or_default();
+        ip_attempts.retain(|&t| now.saturating_duration_since(t) < fifteen_mins);
+        if ip_attempts.len() >= 10 {
+            return false;
+        }
+
+        // 2. Per address: 3 per 15 minutes, 10 per day
+        let normalized_email = email.trim().to_lowercase();
+        if !normalized_email.is_empty() {
+            let addr_attempts = guard
+                .per_address
+                .entry(normalized_email.clone())
+                .or_default();
+            addr_attempts.retain(|&t| now.saturating_duration_since(t) < one_day);
+            let in_15m = addr_attempts
+                .iter()
+                .filter(|&&t| now.saturating_duration_since(t) < fifteen_mins)
+                .count();
+            if in_15m >= 3 || addr_attempts.len() >= 10 {
+                return false;
+            }
+        }
+
+        // 3. Global: 100 per hour
+        guard
+            .global
+            .retain(|&t| now.saturating_duration_since(t) < one_hour);
+        if guard.global.len() >= 100 {
+            return false;
+        }
+
+        // Passed all limits; record the attempt
+        guard
+            .per_ip
+            .entry(client_ip.to_string())
+            .or_default()
+            .push(now);
+        if !normalized_email.is_empty() {
+            guard
+                .per_address
+                .entry(normalized_email)
+                .or_default()
+                .push(now);
+        }
+        guard.global.push(now);
+
+        true
+    }
+}
+
 pub struct AppState {
     pub settings: Arc<crate::settings::Settings>,
     pub db: Arc<Database>,
@@ -133,6 +223,7 @@ pub struct AppState {
     pub allow_all_submit: bool,
     pub smtp_enabled: bool,
     pub dry_run: bool,
+    pub sign_in_link_rate_limiter: SignInLinkRateLimiter,
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     stats_reviews_cache: AsyncCache<serde_json::Value>,
     stats_tools_cache: AsyncCache<serde_json::Value>,
@@ -313,6 +404,7 @@ pub fn build_router(
         allow_all_submit,
         smtp_enabled,
         dry_run,
+        sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
         stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3057,6 +3149,7 @@ mod tests {
             allow_all_submit: false,
             smtp_enabled: false,
             dry_run: true,
+            sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
             stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
             stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3305,6 +3398,124 @@ mod tests {
         assert!(db.lock_pending_email().await.unwrap().is_none());
     }
 
+    #[test]
+    fn test_sign_in_link_rate_limiter_buckets() {
+        let limiter = SignInLinkRateLimiter::new();
+
+        // 1. Per-address limit (3 per 15 mins)
+        assert!(limiter.check_and_record("dev@example.org", "192.0.2.1"));
+        assert!(limiter.check_and_record("dev@example.org", "192.0.2.2"));
+        assert!(limiter.check_and_record("dev@example.org", "192.0.2.3"));
+        // 4th attempt for the same address fails even from another IP
+        assert!(!limiter.check_and_record("dev@example.org", "192.0.2.4"));
+
+        // Another address from 192.0.2.1 still succeeds
+        assert!(limiter.check_and_record("dev2@example.org", "192.0.2.1"));
+
+        // 2. Per-IP limit (10 per 15 mins)
+        // 192.0.2.1 already made 2 requests above (dev@example.org and dev2@example.org)
+        for i in 3..=10 {
+            assert!(limiter.check_and_record(&format!("user{}@example.org", i), "192.0.2.1"));
+        }
+        // 11th request from 192.0.2.1 fails regardless of address
+        assert!(!limiter.check_and_record("user11@example.org", "192.0.2.1"));
+        // But another IP can still request
+        assert!(limiter.check_and_record("user11@example.org", "192.0.2.99"));
+
+        // 3. Global limit (100 per hour)
+        let global_limiter = SignInLinkRateLimiter::new();
+        for i in 0..100 {
+            assert!(global_limiter.check_and_record(
+                &format!("batch{}@example.org", i),
+                &format!("198.51.100.{}", i % 250),
+            ));
+        }
+        // 101st request fails globally
+        assert!(!global_limiter.check_and_record("overflow@example.org", "198.51.100.254"));
+    }
+
+    #[tokio::test]
+    async fn test_request_link_rate_limiting_suppresses_mail_but_returns_200() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.smtp = Some(crate::settings::SmtpSettings {
+            server: "smtp.example.org".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            sender_address: "sashiko@sashiko.dev".to_string(),
+            reply_to: None,
+            dry_run: false,
+        });
+        settings.server.jwt_secret = Some("test_jwt_secret_12345678901234567890".to_string());
+        settings.server.testing_mode = false;
+        settings.server.public_base_url = Some("https://sashiko.dev".to_string());
+        settings
+            .server
+            .acl
+            .bug_reporters
+            .push("maintainer@example.org".to_string());
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = tokio::sync::mpsc::channel(10);
+        let app = build_router(
+            Arc::new(settings),
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            false,
+            true,
+            false,
+        );
+
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+
+        // 3 allowed requests within 15 minutes
+        for _ in 0..3 {
+            let res = client
+                .post(format!("http://{}/api/auth/request-link", addr))
+                .json(&serde_json::json!({ "email": "maintainer@example.org" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200);
+        }
+
+        // 4th request exceeds rate limit: still returns 200 OK
+        let res_4th = client
+            .post(format!("http://{}/api/auth/request-link", addr))
+            .json(&serde_json::json!({ "email": "maintainer@example.org" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_4th.status(), 200);
+
+        // Verify exactly 3 emails were queued, not 4
+        let mut queued_count = 0;
+        while let Ok(Some(_email)) = db.lock_pending_email().await {
+            queued_count += 1;
+        }
+        assert_eq!(queued_count, 3);
+    }
+
     #[tokio::test]
     async fn test_blocklist_outranks_every_bypass() {
         let db_settings = crate::settings::DatabaseSettings {
@@ -3334,6 +3545,7 @@ mod tests {
                 allow_all_submit,
                 smtp_enabled: false,
                 dry_run: true,
+                sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
                 stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
                 stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3668,11 +3880,19 @@ async fn request_link(
         let email = payload.as_ref().map(|p| p.email.trim()).unwrap_or("");
         let lifetime = state.settings.server.sign_in_link.lifetime_seconds;
 
+        let client_ip = extract_client_ip(&addr, &headers);
+        let client_ip_str = client_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| addr.ip().to_string());
+        let rate_ok = state
+            .sign_in_link_rate_limiter
+            .check_and_record(email, &client_ip_str);
+
         let acl = &state.settings.server.acl;
         let is_eligible =
             !email.is_empty() && !acl.is_blocklisted(email) && acl.is_known_identity(email);
 
-        if is_eligible {
+        if is_eligible && rate_ok {
             let token = crate::auth::create_token(
                 email,
                 &secret,
@@ -3684,7 +3904,6 @@ async fn request_link(
             let link = format!("{}/auth/verify?token={}", base_url, token);
 
             if state.settings.smtp.is_some() {
-                let client_ip = extract_client_ip(&addr, &headers);
                 let body = build_sign_in_link_email(email, &link, &base_url, lifetime, client_ip);
                 let status = match &state.settings.smtp {
                     Some(s) if s.dry_run => "Dry-Run",
@@ -3709,6 +3928,13 @@ async fn request_link(
                 tracing::info!("SIGN-IN LINK REQUESTED for {}: {}", email, link);
             }
         } else {
+            if !rate_ok {
+                tracing::warn!(
+                    "Sign-in link request rate limit exceeded for address '{}' from IP '{}'",
+                    email,
+                    client_ip_str
+                );
+            }
             // Timing equalization: simulate token creation and DB roundtrip
             let _ = crate::auth::create_token(
                 "timing-equalizer@sashiko.internal",
@@ -3720,7 +3946,7 @@ async fn request_link(
                 let _ = state.db.conn.query("SELECT 1", ()).await;
             }
             tracing::debug!(
-                "Ignored sign-in link request for ineligible address: {}",
+                "Ignored sign-in link request for ineligible or rate-limited address: {}",
                 email
             );
         }
