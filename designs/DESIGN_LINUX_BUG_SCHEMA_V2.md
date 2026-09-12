@@ -363,30 +363,20 @@ hijacking at [bug_worker.rs:94](file:///usr/local/google/home/kfree/sashiko/src/
 
 ## 6. Migration strategy
 
-Per decision, a **clean break**: existing bug data is discarded. Migration `005` drops the v1
-bug tables and their triggers, then creates the v2 schema. Migrations 002-004 are left
-untouched so the `user_version` chain stays linear and honest for any existing database;
-they will run and then be immediately superseded by 005, which costs nothing on the empty or
-discarded tables.
+Per decision, a **clean break**: no bug data is carried forward. The whole bug schema ships as
+a single migration, `002_bugs.sql`, which creates the layout described in section 4
+directly.
 
-```sql
--- 005_linux_bug_schema_v2.sql (ordering matters)
-DROP TRIGGER IF EXISTS trg_bugs_audit_insert;
-DROP TRIGGER IF EXISTS trg_bugs_audit_status;
-DROP TRIGGER IF EXISTS trg_bugs_audit_title;
-DROP TRIGGER IF EXISTS trg_bugs_audit_dup_of_id;
-DROP TRIGGER IF EXISTS trg_bugs_subsystems_audit_insert;
+An earlier draft of this branch built the schema across four migrations, 002 through 005, with
+005 dropping what the earlier three had created. That history is not worth preserving: the
+branch merges and deploys atomically, and production has never held a bug table, so the
+intermediate states existed only inside this branch. Collapsing them removes a drop-and-recreate
+step that had to run outside a transaction, because SQLite refuses to toggle
+`PRAGMA foreign_keys` inside one, and which could therefore leave a partially applied schema
+behind on failure.
 
-DROP TABLE IF EXISTS bugs_subsystems;
-DROP TABLE IF EXISTS review_bugs;
-DROP TABLE IF EXISTS bug_enrichments;
-DROP TABLE IF EXISTS bugs;
-
--- ... CREATE statements from section 4 ...
-```
-
-`Database::migrate` gains a `current_version < 5` arm wrapped in a transaction, matching the
-style of the 003 and 004 arms, and the closing log line moves to version 5.
+`Database::migrate` is consequently two arms: version 1 for the initial schema, version 2 for
+the bug schema, both wrapped in a transaction.
 
 ---
 
@@ -524,8 +514,8 @@ BEGIN
 END;
 ```
 
-All audit triggers are rewritten to use `old.x IS NOT new.x`, replacing the three-clause
-`WHEN` boilerplate in migration 003 with the equivalent null-safe operator (D6).
+All audit triggers use `old.x IS NOT new.x`, the null-safe operator, rather than the
+three-clause `WHEN` boilerplate an earlier draft carried (D6).
 
 API surface — one new variant on the existing `BugAction` enum, so it inherits the current
 authorization path unchanged:
@@ -580,7 +570,7 @@ tests passing.
 
 ```mermaid
 flowchart TD
-    S1["1. Schema v2 cutover (atomic)<br/>migration 005, FK pragma, state enums, vectors table,<br/>db.rs + api.rs + workflow + frontend retarget,<br/>projections replace the json_extract subqueries"]
+    S1["1. Schema v2 cutover (atomic)<br/>migration 002, FK pragma, state enums, vectors table,<br/>db.rs + api.rs + workflow + frontend retarget,<br/>projections replace the json_extract subqueries"]
     S2["2. Worker lease<br/>atomic claim, TTL, retry cap, dead letter, settings"]
     S3["3. Assignment end to end<br/>assign_bug, BugAction::Assign, filter, UI"]
     S4["4. Follow-ups<br/>patchset/review payload fields, docs, invariant checks"]
@@ -590,7 +580,7 @@ flowchart TD
     S3 --> S4
 ```
 
-Steps 2 and 3 are independent of each other and depend only on step 1, since migration 005
+Steps 2 and 3 are independent of each other and depend only on step 1, since migration 002
 already creates the lease and assignee columns they need.
 
 ---

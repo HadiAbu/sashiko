@@ -1,41 +1,17 @@
--- Migration 005: Linux bug workflow schema v2.
+-- Migration 002: Bug workflow schema.
+-- Shared infrastructure tables (people, subsystems, mailing_lists, messages,
+-- threads) intentionally keep their unprefixed names.
 --
--- Renames every table owned by the Linux bug workflow to carry a workflow
--- prefix, so that additional workflows can add their own tables without
--- colliding. Shared infrastructure tables (people, subsystems, mailing_lists,
--- messages, threads) intentionally keep their unprefixed names.
+-- The schema separates two independent notions of state that a single status
+-- column had previously conflated:
 --
---   bugs             -> bugs
---   bug_enrichments  -> bug_enrichments
---   bugs_subsystems  -> bug_subsystems
---   review_bugs      -> bug_reviews
---   (new)               bug_vectors
+--   * lifecycle_status is triage, owned by humans, so that re-running an
+--     analysis can no longer destroy a triage decision,
+--   * pipeline_state is execution, owned by the bug worker.
 --
--- This is a deliberate clean break: the previous bug tables are dropped rather
--- than migrated, because the workflow is pre-production and the column layout
--- changes substantially.
---
--- Beyond the rename this migration:
---   * splits the overloaded status column into lifecycle_status (triage, owned
---     by humans) and pipeline_state (execution, owned by the worker), so that
---     re-running analysis can no longer destroy triage state,
---   * adds an assignee, so a bug can be assigned to whoever is working on it,
---   * adds worker lease columns for atomic claiming with retry limits,
---   * projects hot query fields out of enrichment JSON into indexed columns,
---   * moves the dedup embedding off the core row into bug_vectors,
---   * adds CHECK constraints so invalid states are unrepresentable.
-
-DROP TRIGGER IF EXISTS trg_bugs_audit_insert;
-DROP TRIGGER IF EXISTS trg_bugs_audit_status;
-DROP TRIGGER IF EXISTS trg_bugs_audit_title;
-DROP TRIGGER IF EXISTS trg_bugs_audit_dup_of_id;
-DROP TRIGGER IF EXISTS trg_bugs_subsystems_audit_insert;
-
--- Children first so the drops stay valid once foreign keys are enforced.
-DROP TABLE IF EXISTS bugs_subsystems;
-DROP TABLE IF EXISTS review_bugs;
-DROP TABLE IF EXISTS bug_enrichments;
-DROP TABLE IF EXISTS bugs;
+-- It also projects hot query fields out of enrichment JSON into indexed
+-- columns, keeps the dedup embedding off the core row, and adds CHECK
+-- constraints so that invalid states are unrepresentable.
 
 CREATE TABLE IF NOT EXISTS bugs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

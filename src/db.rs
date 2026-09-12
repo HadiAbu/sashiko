@@ -1139,43 +1139,15 @@ impl Database {
         }
 
         if current_version < 2 {
-            info!("Applying database migration version 2 (extensible bugs)...");
-            let schema = include_str!("migrations/002_add_bugs.sql");
-            self.conn.execute_batch(schema).await?;
-            self.conn.execute("PRAGMA user_version = 2", ()).await?;
-        }
-
-        if current_version < 3 {
+            info!("Applying database migration version 2 (bugs)...");
             let tx = self.conn.transaction().await?;
-            tx.execute_batch(include_str!("migrations/003_bug_provenance.sql"))
+            tx.execute_batch(include_str!("migrations/002_bugs.sql"))
                 .await?;
-            tx.execute("PRAGMA user_version = 3", ()).await?;
+            tx.execute("PRAGMA user_version = 2", ()).await?;
             tx.commit().await?;
         }
 
-        if current_version < 4 {
-            let tx = self.conn.transaction().await?;
-            tx.execute_batch(include_str!("migrations/004_backfill_bug_models.sql"))
-                .await?;
-            tx.execute("PRAGMA user_version = 4", ()).await?;
-            tx.commit().await?;
-        }
-        if current_version < 5 {
-            info!("Applying database migration version 5 (linux bug schema v2)...");
-            // Foreign key enforcement is suspended for the duration of this
-            // migration: it drops and recreates the bug tables, and SQLite
-            // refuses to change the pragma inside a transaction, so the whole
-            // batch runs unwrapped with enforcement restored afterwards.
-            self.conn.execute("PRAGMA foreign_keys = OFF;", ()).await?;
-            let result = self
-                .conn
-                .execute_batch(include_str!("migrations/005_linux_bug_schema_v2.sql"))
-                .await;
-            self.conn.execute("PRAGMA foreign_keys = ON;", ()).await?;
-            result?;
-            self.conn.execute("PRAGMA user_version = 5", ()).await?;
-        }
-        info!("Database schema is up to date at version 5.");
+        info!("Database schema is up to date at version 2.");
         Ok(())
     }
 
@@ -6490,44 +6462,27 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    /// Schema v2 is a deliberate clean break: it drops the pre-v2 bug tables
-    /// instead of migrating them. This pins that behaviour so the data loss
-    /// stays intentional rather than becoming a surprise, and checks that the
-    /// recreated schema is immediately usable.
+    /// The bug schema ships as a single migration, so a fresh database reaches
+    /// the final layout in one step. This pins that migrate is idempotent, that
+    /// it leaves shared infrastructure tables alone, and that the resulting
+    /// schema is immediately usable.
     #[tokio::test]
-    async fn test_bug_schema_v2_discards_legacy_records() -> Result<()> {
+    async fn test_bug_schema_migrates_and_is_usable() -> Result<()> {
         let db = Database::new(&DatabaseSettings {
             url: ":memory:".into(),
             token: String::new(),
         })
         .await?;
-        db.conn
-            .execute_batch(include_str!("migrations/001_initial.sql"))
-            .await?;
-        db.conn
-            .execute_batch(include_str!("migrations/002_add_bugs.sql"))
-            .await?;
-        db.conn.execute_batch(r#"PRAGMA user_version = 2;
-            INSERT INTO bugs (id, bugid, title, status, reporter, reported_at, created_at, updated_at) VALUES (1, 'legacy', 'Old report', 'open', 'legacy reporter', 1, 1, 1);
-            INSERT INTO bug_enrichments (bug_id, kind, tool, created_at, data_json, logs) VALUES (1, 'candidate', 'legacy-tool', 1, '{"original":true}', 'original log');
-            INSERT INTO people (name, email) VALUES ('Shared Row', 'shared@example.org');"#).await?;
 
         db.migrate().await?;
-        // Re-running must be a no-op rather than dropping the tables again.
+        // Re-running must be a no-op rather than recreating anything.
         db.migrate().await?;
 
-        assert!(db.get_bug(1).await?.is_none(), "legacy bug survived v2");
-        assert_eq!(
-            db.conn
-                .query("SELECT COUNT(*) FROM bug_enrichments", ())
-                .await?
-                .next()
-                .await?
-                .unwrap()
-                .get::<i64>(0)?,
-            0,
-            "legacy enrichment survived v2"
-        );
+        db.conn
+            .execute_batch(
+                "INSERT INTO people (name, email) VALUES ('Shared Row', 'shared@example.org');",
+            )
+            .await?;
         assert_eq!(
             db.conn
                 .query("SELECT COUNT(*) FROM people", ())
@@ -6537,10 +6492,10 @@ mod tests {
                 .unwrap()
                 .get::<i64>(0)?,
             1,
-            "v2 must not touch shared infrastructure tables"
+            "the bug migration must not touch shared infrastructure tables"
         );
 
-        // The recreated schema starts bugs in the untriaged, unanalysed state
+        // The schema starts bugs in the untriaged, unanalysed state
         // and still records attributed audit history.
         let id = db
             .create_bug(&NewBug {
