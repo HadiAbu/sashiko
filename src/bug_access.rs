@@ -128,6 +128,17 @@ impl BugAccess {
     pub fn can_manage(self) -> bool {
         self >= BugAccess::Manage
     }
+
+    /// Names the level for a refusal message. Only meaningful for a level that
+    /// was demanded and not met, so the caller already knows the bug exists.
+    pub fn describe(self) -> &'static str {
+        match self {
+            BugAccess::None => "no",
+            BugAccess::Read => "read",
+            BugAccess::Comment => "comment",
+            BugAccess::Manage => "maintainer",
+        }
+    }
 }
 
 /// The bug-domain authority of one caller, resolved once per request from the

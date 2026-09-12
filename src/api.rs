@@ -2082,10 +2082,38 @@ fn is_plausible_email(value: &str) -> bool {
     }
 }
 
+/// The authority each action demands.
+///
+/// Commenting is a conversation and is open to anyone who may read the bug,
+/// which includes the kernel security list. Everything else rewrites the bug's
+/// state and belongs to whoever maintains the affected code.
+fn required_access(action: &BugAction) -> BugAccess {
+    match action {
+        BugAction::Comment { .. } => BugAccess::Comment,
+        BugAction::Close { .. }
+        | BugAction::Dismiss { .. }
+        | BugAction::MarkDuplicate { .. }
+        | BugAction::Assign { .. } => BugAccess::Manage,
+    }
+}
+
+/// Renders a failed bug lookup for an endpoint that answers with a message.
+///
+/// A bug the caller has no authority over is reported as absent, exactly as
+/// the read endpoints report it, so that the two cases stay indistinguishable.
+fn bug_lookup_denial(status: StatusCode) -> (StatusCode, String) {
+    let message = match status {
+        StatusCode::BAD_REQUEST => "Missing id or bugid param",
+        StatusCode::NOT_FOUND => "Bug not found",
+        StatusCode::UNAUTHORIZED => "Please log in to access bugs repository.",
+        _ => "Database error",
+    };
+    (status, message.to_string())
+}
+
 async fn bug_action(
-    auth: crate::auth::OptionalAuthUser,
+    principal: BugPrincipal,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
-    headers: axum::http::HeaderMap,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<BugQuery>,
     axum::extract::Json(payload): axum::extract::Json<BugActionPayload>,
@@ -2097,42 +2125,32 @@ async fn bug_action(
         ));
     }
 
-    if !is_authorized(
-        &addr,
-        &state,
-        &headers,
-        auth.0.as_ref(),
-        crate::settings::Permission::Action,
-    ) {
+    // The check can only run once the bug is loaded, because what the caller
+    // may do depends on which subsystems the bug is attributed to.
+    let bug = readable_bug(&state, &principal, &query)
+        .await
+        .map_err(bug_lookup_denial)?;
+    let access = bug_access(&state, &principal, bug.id)
+        .await
+        .map_err(bug_lookup_denial)?;
+    let required = required_access(&payload.action);
+    if access < required {
         return Err((
             StatusCode::FORBIDDEN,
-            "You don't have permissions to perform bug actions.".into(),
+            format!(
+                "This action requires {} authority over the bug.",
+                required.describe()
+            ),
         ));
     }
 
-    let bug_res = if let Some(id) = query.id {
-        state.db.get_bug(id).await
-    } else if let Some(bugid) = query.bugid.as_ref().or(query.slug.as_ref()) {
-        state.db.get_bug_by_bugid(bugid).await
+    // Testing mode resolves an operator that proved no address, so fall back to
+    // naming the peer rather than attributing the change to nobody.
+    let actor = if principal.email().is_empty() {
+        format!("authorized client ({})", addr.ip())
     } else {
-        return Err((StatusCode::BAD_REQUEST, "Missing id or bugid param".into()));
+        principal.email().to_string()
     };
-
-    let bug = bug_res.map_err(|e| {
-        tracing::error!("Database error fetching bug: {}", e);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Database error".into())
-    })?;
-
-    let bug = match bug {
-        Some(b) => b,
-        None => return Err((StatusCode::NOT_FOUND, "Bug not found".into())),
-    };
-
-    let actor = auth
-        .0
-        .as_ref()
-        .map(|u| u.email.clone())
-        .unwrap_or_else(|| format!("authorized client ({})", addr.ip()));
     let tool = payload
         .tool
         .as_deref()
@@ -2201,6 +2219,18 @@ async fn bug_action(
                         "Choose an existing canonical bug, distinct from this bug".into(),
                     )
                 })?;
+            // Marking a bug duplicate of one the caller cannot manage would
+            // both disclose that the target exists and rewrite its history, so
+            // that case answers exactly like a target that is not there.
+            let target_access = bug_access(&state, &principal, target.id)
+                .await
+                .map_err(bug_lookup_denial)?;
+            if !target_access.can_manage() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Choose an existing canonical bug, distinct from this bug".into(),
+                ));
+            }
             let duplicate_of_id = target.id;
             db.mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
                 ephemeral_id: bug.id,
@@ -2449,6 +2479,7 @@ mod tests {
         let mut settings = crate::settings::Settings::new().unwrap();
         settings.server.jwt_secret = Some(SECRET.to_string());
         settings.server.acl.security = vec!["security@example.org".to_string()];
+        settings.server.acl.admins = vec!["operator@example.org".to_string()];
         settings.server.acl.blocklist = Vec::new();
         let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
@@ -2743,11 +2774,11 @@ mod tests {
         assert_eq!(canon_resp["duplicates"][0]["id"], dup_id);
 
         // Test 4: redirect_bug
-        let client = reqwest::Client::builder()
+        let no_redirect = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
-        let res = client
+        let res = no_redirect
             .get(format!("http://{}/bug/pb-12345678", addr))
             .send()
             .await
@@ -2758,8 +2789,8 @@ mod tests {
             "/#/bug/pb-12345678"
         );
 
-        // Test 5: bug_action
-        let action_res = reqwest::Client::new()
+        // Test 5: bug_action. The security list may comment on any bug.
+        let action_res = client
             .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
             .json(&serde_json::json!({
                 "action": "comment",
@@ -2770,16 +2801,30 @@ mod tests {
             .unwrap();
         assert_eq!(action_res.status(), 200);
 
-        let token = crate::auth::create_token(
-            "maintainer@example.org",
-            settings.server.jwt_secret.as_deref().unwrap(),
-            None,
+        // Closing rewrites the bug's state, which the security list may not do
+        // outside its own subsystems.
+        let refused = client
+            .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
+            .json(&serde_json::json!({"action":"close", "reason":"Fixed upstream"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 403);
+        assert_eq!(
+            refused.text().await.unwrap(),
+            "This action requires maintainer authority over the bug."
+        );
+
+        let operator_token = crate::auth::create_token(
+            "operator@example.org",
+            SECRET,
+            Some("session".to_string()),
             3600,
         )
         .unwrap();
         let close = reqwest::Client::new()
             .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
-            .bearer_auth(token)
+            .bearer_auth(operator_token)
             .json(&serde_json::json!({"action":"close", "reason":"Fixed upstream", "tool":"web"}))
             .send()
             .await
@@ -2791,7 +2836,7 @@ mod tests {
             .iter()
             .find(|e| e.content.as_deref() == Some("Fixed upstream"))
             .unwrap();
-        assert_eq!(comment.author.as_deref(), Some("maintainer@example.org"));
+        assert_eq!(comment.author.as_deref(), Some("operator@example.org"));
         assert_eq!(comment.tool, "web");
         assert!(comment.model.is_none());
         let raw: serde_json::Value = get(format!("http://{}/api/bug/raw?id={}", addr, bug_id))
@@ -2834,7 +2879,7 @@ mod tests {
             .unwrap();
         assert_eq!(cfg_remote["permissions"]["action"], false);
 
-        let remote_denied = client
+        let remote_denied = reqwest::Client::new()
             .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
             .header("x-forwarded-for", "203.0.113.1")
             .json(&serde_json::json!({
@@ -2844,12 +2889,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(remote_denied.status(), 403);
+        assert_eq!(remote_denied.status(), 401);
         let err_msg = remote_denied.text().await.unwrap();
-        assert_eq!(
-            err_msg,
-            "You don't have permissions to perform bug actions."
-        );
+        assert_eq!(err_msg, "Please log in to access bugs repository.");
     }
 
     #[tokio::test]
