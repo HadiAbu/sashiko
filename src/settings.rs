@@ -528,6 +528,13 @@ impl AclSettings {
 pub struct ServerSettings {
     pub host: String,
     pub port: u16,
+    /// The URL the service is reachable at from outside, without a trailing
+    /// slash, for example "https://sashiko.dev".
+    ///
+    /// The bind address cannot stand in for this: the shipped host is the
+    /// wildcard "::", which renders a sign-in link nobody can open.
+    #[serde(default)]
+    pub public_base_url: Option<String>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default)]
@@ -535,6 +542,107 @@ pub struct ServerSettings {
     pub jwt_secret: Option<String>,
     #[serde(default)]
     pub acl: AclSettings,
+    #[serde(default)]
+    pub sign_in_link: SignInLinkSettings,
+}
+
+/// Sign-in link lifetime and the limits on how often one can be asked for.
+///
+/// Every limit is a count over a window. They are keyed independently so that
+/// one noisy client cannot consume another person's allowance, and the global
+/// one caps total outbound sign-in mail however the requests are distributed.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct SignInLinkSettings {
+    /// How long a link stays usable. Short, because the link is a bearer
+    /// credential sitting in a mailbox.
+    #[serde(default = "default_sign_in_link_lifetime_seconds")]
+    pub lifetime_seconds: i64,
+    /// Links mailed to one address per quarter hour. Caps use of the endpoint
+    /// as a mail bomb against one person.
+    #[serde(default = "default_per_address_burst")]
+    pub per_address_burst: u32,
+    /// Links mailed to one address per day.
+    #[serde(default = "default_per_address_daily")]
+    pub per_address_daily: u32,
+    /// Requests accepted from one client address per quarter hour. Caps
+    /// enumeration sweeps.
+    #[serde(default = "default_per_client_burst")]
+    pub per_client_burst: u32,
+    /// Total links mailed per hour, regardless of who asked.
+    #[serde(default = "default_global_hourly")]
+    pub global_hourly: u32,
+}
+
+impl Default for SignInLinkSettings {
+    fn default() -> Self {
+        Self {
+            lifetime_seconds: default_sign_in_link_lifetime_seconds(),
+            per_address_burst: default_per_address_burst(),
+            per_address_daily: default_per_address_daily(),
+            per_client_burst: default_per_client_burst(),
+            global_hourly: default_global_hourly(),
+        }
+    }
+}
+
+fn default_sign_in_link_lifetime_seconds() -> i64 {
+    900
+}
+
+fn default_per_address_burst() -> u32 {
+    3
+}
+
+fn default_per_address_daily() -> u32 {
+    10
+}
+
+fn default_per_client_burst() -> u32 {
+    10
+}
+
+fn default_global_hourly() -> u32 {
+    100
+}
+
+impl ServerSettings {
+    /// The base URL to build a sign-in link on, without a trailing slash.
+    ///
+    /// Falls back to the bind address, which is only good enough when the link
+    /// is written to the log for a local operator to read.
+    pub fn sign_in_base_url(&self) -> String {
+        match self.public_base_url.as_deref().map(str::trim) {
+            Some(url) if !url.is_empty() => url.trim_end_matches('/').to_string(),
+            _ => format!("http://{}:{}", self.host, self.port),
+        }
+    }
+}
+
+/// Whether a configured public base URL is usable in a message sent to
+/// somebody else.
+///
+/// A bind address is not: the wildcard forms resolve to whatever interface the
+/// process happens to be listening on, and loopback means nothing to a reader
+/// on another machine.
+fn is_reachable_base_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.trim().split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "http" | "https") {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or("");
+    // An IPv6 literal is bracketed, so only a colon outside the brackets
+    // separates the port.
+    let host = match authority.strip_prefix('[') {
+        Some(inside) => inside.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    !matches!(
+        host,
+        "" | "::" | "0.0.0.0" | "*" | "localhost" | "127.0.0.1" | "::1"
+    )
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -706,6 +814,33 @@ pub struct LocalReviewSettings {
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
         Self::from_file("Settings")
+    }
+
+    /// Refuses a configuration that would mail sign-in links nobody can open.
+    ///
+    /// Without SMTP the link is written to the log for a local operator to
+    /// read, so the base URL is optional. With SMTP it is the only thing
+    /// standing between a maintainer and a dead link, and a deployment that
+    /// fails to start is far kinder than one that silently mails
+    /// http://:::8080/ at three in the morning.
+    pub fn validate_sign_in_delivery(&self) -> Result<(), String> {
+        if self.smtp.is_none() {
+            return Ok(());
+        }
+        match self.server.public_base_url.as_deref() {
+            Some(url) if is_reachable_base_url(url) => Ok(()),
+            Some(url) => Err(format!(
+                "server.public_base_url is {:?}, which names a bind address rather than a host a \
+                 recipient can reach. Set it to the URL the service is served at, for example \
+                 https://sashiko.dev",
+                url
+            )),
+            None => Err(
+                "server.public_base_url must be set when SMTP is configured, because sign-in \
+                 links are mailed and the bind address does not name a reachable host"
+                    .to_string(),
+            ),
+        }
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -1002,5 +1137,92 @@ mod tests {
             securty = ["typo@example.com"]
         "#;
         assert!(toml::from_str::<AclSettings>(toml).is_err());
+    }
+
+    #[test]
+    fn test_reachable_base_url_rejects_bind_addresses() {
+        for good in [
+            "https://sashiko.dev",
+            "https://sashiko.dev/",
+            "http://review.example.org:8080",
+            "https://[2001:db8::1]:8443",
+        ] {
+            assert!(is_reachable_base_url(good), "{} rejected", good);
+        }
+        // A bind address, a loopback address and a bare host are all things a
+        // recipient on another machine cannot open.
+        for bad in [
+            "http://::8080",
+            "http://[::]:8080",
+            "http://0.0.0.0:8080",
+            "https://localhost:8080",
+            "http://127.0.0.1:8080",
+            "sashiko.dev",
+            "ftp://sashiko.dev",
+            "",
+        ] {
+            assert!(!is_reachable_base_url(bad), "{} accepted", bad);
+        }
+    }
+
+    #[test]
+    fn test_sign_in_base_url_drops_the_trailing_slash() {
+        let mut server = ServerSettings {
+            host: "::".to_string(),
+            port: 8080,
+            public_base_url: Some("https://sashiko.dev/".to_string()),
+            read_only: false,
+            testing_mode: false,
+            jwt_secret: None,
+            acl: AclSettings::default(),
+            sign_in_link: SignInLinkSettings::default(),
+        };
+        assert_eq!(server.sign_in_base_url(), "https://sashiko.dev");
+
+        // With nothing configured the link is only ever logged, so a
+        // best-effort address is enough.
+        server.public_base_url = None;
+        assert_eq!(server.sign_in_base_url(), "http://:::8080");
+    }
+
+    #[test]
+    fn test_sign_in_link_defaults_are_the_documented_limits() {
+        let limits = SignInLinkSettings::default();
+        assert_eq!(limits.lifetime_seconds, 900);
+        assert_eq!(limits.per_address_burst, 3);
+        assert_eq!(limits.per_address_daily, 10);
+        assert_eq!(limits.per_client_burst, 10);
+        assert_eq!(limits.global_hourly, 100);
+
+        // Overriding one value must leave the rest at their defaults.
+        let limits: SignInLinkSettings = toml::from_str("lifetime_seconds = 60").unwrap();
+        assert_eq!(limits.lifetime_seconds, 60);
+        assert_eq!(limits.global_hourly, 100);
+    }
+
+    #[test]
+    fn test_startup_refuses_to_mail_links_nobody_can_open() {
+        let mut settings = Settings::new().unwrap();
+        // Shipped configuration has no SMTP, so the link is logged and the
+        // base URL is nobody's problem.
+        assert!(settings.smtp.is_none());
+        assert!(settings.validate_sign_in_delivery().is_ok());
+
+        settings.smtp = Some(SmtpSettings {
+            server: "smtp.example.org".to_string(),
+            port: 587,
+            username: None,
+            password: None,
+            sender_address: "sashiko@example.org".to_string(),
+            reply_to: None,
+            dry_run: true,
+        });
+        assert!(settings.validate_sign_in_delivery().is_err());
+
+        settings.server.public_base_url = Some("http://[::]:8080".to_string());
+        assert!(settings.validate_sign_in_delivery().is_err());
+
+        settings.server.public_base_url = Some("https://sashiko.dev".to_string());
+        assert!(settings.validate_sign_in_delivery().is_ok());
     }
 }

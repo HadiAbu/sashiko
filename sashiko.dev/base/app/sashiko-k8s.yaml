@@ -73,6 +73,10 @@ spec:
               value: "/mnt/local-ssd/worktrees"
             - name: SASHIKO__SERVER__PORT
               value: "8080"
+            # Sign-in links are mailed, so the service has to know the URL it
+            # is served at. Startup fails without this whenever SMTP is set.
+            - name: SASHIKO__SERVER__PUBLIC_BASE_URL
+              value: "https://sashiko.dev"
             - name: SASHIKO__PROJECT__DOMAIN
               value: "sashiko.dev"
             - name: SASHIKO__AI__MODEL

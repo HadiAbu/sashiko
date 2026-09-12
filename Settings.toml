@@ -142,6 +142,23 @@ prompt_caching = true
 [server]
 host = "::"
 port = 8080
+# The URL this service is reachable at from outside, with no trailing slash.
+# Required whenever [smtp] is configured, because sign-in links are mailed and
+# the bind address above does not name a host a recipient can open. The server
+# refuses to start if SMTP is on and this is unset or names a bind address.
+# public_base_url = "https://sashiko.dev"
+
+# Sign-in links. The defaults are shown; every value is optional.
+# [server.sign_in_link]
+# How long a mailed link stays usable, in seconds.
+# lifetime_seconds = 900
+# Links mailed to one address per quarter hour, and per day.
+# per_address_burst = 3
+# per_address_daily = 10
+# Requests accepted from one client address per quarter hour.
+# per_client_burst = 10
+# Total links mailed per hour, however the requests are distributed.
+# global_hourly = 100
 
 # Identity-based Capabilities: Defines what authenticated (JWT) entities can do.
 # If these lists are empty or the section is missing, nobody is allowed to perform any mutations (Fail-Closed secure default).

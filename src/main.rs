@@ -385,6 +385,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Selected stages via --stages flag: {:?}", stages);
     }
 
+    if let Err(reason) = settings.validate_sign_in_delivery() {
+        error!("Refusing to start: {}", reason);
+        return Err(reason.into());
+    }
+
     // Initialize Database
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
