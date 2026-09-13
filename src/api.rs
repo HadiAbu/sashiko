@@ -3930,9 +3930,8 @@ fn build_sign_in_link_email(
          Open this link within {minutes} minutes to continue:\n\n\
          {link}\
          {ip_line}\n\n\
-         The link works once and then stops working. If you did not ask to sign\n\
-         in, ignore this message. Nothing has changed and nobody has gained\n\
-         access.\n\n\
+         If you did not ask to sign in, ignore this message. Nothing has\n\
+         changed and nobody has gained access.\n\n\
          -- \n\
          Sashiko AI review · {base_url}"
     )
