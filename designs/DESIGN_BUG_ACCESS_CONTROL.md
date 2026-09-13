@@ -28,8 +28,7 @@ The branch as it stands does not treat them that way:
 * The credential-free loopback bypass in `is_authorized` applies to bug routes
   like everything else.
 * The sign-in link login that would back any of this is not actually a login: the
-  link is printed to the server log rather than mailed, the token is a
-  stateless JWT that is replayable until it expires, the request endpoint is an
+  link is printed to the server log rather than mailed, the request endpoint is an
   email-enumeration oracle, and sessions can be refreshed forever.
 
 `DESIGN_ROLE_BASED_ACCESS_CONTROL.md` sketched an ambitious model with a
@@ -48,8 +47,9 @@ kernel already exists and is already parsed by Sashiko**: the MAINTAINERS file.
    unilaterally close or dismiss bugs in subsystems they do not maintain.
 4. Sashiko's own operators have full access.
 5. Automation can file bugs and nothing more, with room to widen later.
-6. Login is a real email login: unguessable, single-use, rate limited, and
-   incapable of revealing who is eligible to log in.
+6. Login is a real email login: unguessable, stateless with a 30-minute link
+   expiration, rate limited, and incapable of revealing who is eligible to log
+   in.
 
 ## Non-Goals
 
@@ -251,10 +251,7 @@ admins = []
 # transcripts. Deliberately not admins: this grants no ingest, cancel or
 # review capability, and no authority to close, dismiss or re-run analysis
 # on a bug outside the member's own maintained subsystems.
-security = [
-    "gregkh@linuxfoundation.org",
-    "linux@roeck-us.net",
-]
+security = []
 
 # Principals permitted to file new bugs via /api/bug/analyze. Ships empty,
 # which makes that endpoint operator-only. See 1.6a.
@@ -587,13 +584,12 @@ Auto-Submitted: auto-generated
 
 Someone asked to sign in to Sashiko as maintainer@example.org.
 
-Open this link within 15 minutes to continue:
+Open this link within 30 minutes to continue:
 
-  https://sashiko.example.org/auth/verify?token=<opaque>
+  https://sashiko.example.org/auth/verify?token=<jwt>
 
-The link works once and then stops working. If you did not ask to sign
-in, ignore this message; nothing has changed and no one has gained
-access to your account.
+If you did not ask to sign in, ignore this message. Nothing has changed and
+nobody has gained access.
 
 -- 
 Sashiko AI review · https://sashiko.example.org
@@ -607,7 +603,7 @@ delimiter and separator exactly.
 
 The link is currently built from `server.host` and `server.port` with a
 hardcoded `http://`, which with the shipped `host = "::"` renders the unusable
-`http://:::8080/?magic_token=...`.
+`http://:::8080/auth/verify?token=...`.
 
 A `server.public_base_url` setting is added, and **the server refuses to start
 when SMTP is configured and this is unset or names a wildcard bind address.**
@@ -619,31 +615,15 @@ When SMTP is not configured the setting is optional, because the link is
 logged rather than mailed and a local operator can read the log. In that case
 the server derives a best-effort URL as today.
 
-### 4.4 Single-use, opaque tokens
+### 4.4 Stateless sign-in tokens
 
-The sign-in link token stops being a JWT. It becomes 32 bytes from the system CSPRNG,
-URL-safe base64, with only its SHA-256 hash stored:
+Authorization remains completely stateless. The sign-in link carries an
+HMAC-SHA256 signed JWT with `typ: "sign_in_link"` and a 30-minute expiration
+(`1800` seconds). No database table is required to store or track issued links.
 
-```sql
-CREATE TABLE IF NOT EXISTS auth_sign_in_links (
-    token_hash TEXT PRIMARY KEY,
-    email TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
-    consumed_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_auth_sign_in_links_email ON auth_sign_in_links(email, created_at);
-```
-
-Exchange is a conditional update (`SET consumed_at = ... WHERE token_hash = ?
-AND consumed_at IS NULL AND expires_at > ?`) and succeeds only if it affects one
-row, which makes single use atomic under concurrent redemption rather than a
-check-then-act race. Lifetime drops from 30 minutes to 15. Expired and consumed
-rows are swept periodically.
-
-This also removes the `sign_in_link` JWT type entirely, and with it the denylist
-in the extractor that was the only thing keeping such a token from being used
-as a session.
+The session token extractor strictly enforces token types (`typ: "session"`),
+preventing a sign-in link token from being used directly as a session bearer
+token on API routes.
 
 ### 4.5 The request endpoint reveals nothing
 
@@ -737,23 +717,22 @@ Each step is one commit, self-contained and independently buildable.
 **Login**
 
 14. Generalize the email outbox for transactional mail.
-15. Add the public base URL and sign-in link options.
+15. Add the public base URL option.
 16. Deliver sign-in links by email.
-17. Make sign-in link tokens single use.
-18. Answer link requests without revealing eligibility.
-19. Rate limit sign-in link requests.
-20. Pin the token algorithm and bound session lifetime.
+17. Answer link requests without revealing eligibility.
+18. Rate limit sign-in link requests.
+19. Pin the token algorithm and bound session lifetime.
 
 **Frontend**
 
-21. Handle unauthorized bug access.
+20. Handle unauthorized bug access.
 
 **Referential integrity**
 
 Not part of the access model, but this branch is what turns these from silent
 corruption into hard failures, so they ship with it.
 
-22. Merge patchsets in a single transaction.
+21. Merge patchsets in a single transaction.
 
 ---
 
@@ -774,8 +753,8 @@ corruption into hard failures, so they ship with it.
   are the highest-value targets.
 * `MarkDuplicate` is tested for the case where the caller can manage the source
   but not the target.
-* Sign-in link exchange is tested for replay, for expiry, and for two concurrent
-  redemptions of the same token where exactly one must win.
+* Sign-in link exchange is tested for expiry, signature verification, and type
+  enforcement.
 * `/api/auth/request-link` is tested to return byte-identical responses for an
   eligible address, an ineligible address, a blocklisted address and a
   malformed address.

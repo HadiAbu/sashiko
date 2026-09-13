@@ -41,7 +41,6 @@ pub struct AclSettings {
     pub blocklist: Vec<String>,
 }
 ```
-Supporting `alias = "blocklist"` allows configuration flexibility while retaining `blocklist` as the canonical field name.
 
 In `Settings.toml`:
 ```toml
@@ -59,7 +58,7 @@ blocklist = []
 ### 3. API & Authentication Flow Enforcement
 Enforcement spans all authentication and authorization touchpoints in `src/api.rs`:
 1. `is_authorized`: Checks if the authenticated user's email is blocklisted; if so, authorization is rejected.
-2. `request_link`: Disallows sending magic login links to blocklisted addresses (`403 Forbidden`).
+2. `request_link`: Disallows sending sign-in links to blocklisted addresses (`403 Forbidden`).
 3. `verify_link`: Disallows exchanging a sign-in link for a session token if the claims subject is blocklisted (`403 Forbidden`).
 4. `refresh_token`: Disallows issuing a new session token if the authenticated user is blocklisted (`403 Forbidden`).
 
@@ -67,7 +66,7 @@ Enforcement spans all authentication and authorization touchpoints in `src/api.r
 - Unit tests in `src/settings.rs`:
   - Verify `is_blocklisted` logic (empty list, positive match, negative match, case-insensitivity).
   - Verify `has_permission` denial when blocklisted for admin and all `Permission` variants.
-  - Verify deserialization of `Settings.toml` and alias support.
+  - Verify deserialization of `Settings.toml`.
 - API tests in `src/api.rs`:
   - Verify `request_link` rejection for blocklisted identity.
   - Verify `verify_link` rejection for blocklisted identity.
