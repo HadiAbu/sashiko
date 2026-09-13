@@ -7,6 +7,9 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
 
+const BUG_LEASE_TTL_SECONDS: i64 = 1800;
+const BUG_MAX_ATTEMPTS: i64 = 3;
+
 pub struct BugWorker {
     db: Arc<Database>,
     provider: Arc<dyn AiProvider>,
@@ -14,17 +17,10 @@ pub struct BugWorker {
     /// Identifies this worker in the lease it takes, so that a lease which
     /// never gets released can be traced back to a process.
     worker_id: String,
-    lease_ttl_seconds: i64,
-    max_attempts: i64,
 }
 
 impl BugWorker {
-    pub fn new(
-        db: Arc<Database>,
-        provider: Arc<dyn AiProvider>,
-        repo_path: String,
-        settings: &crate::settings::LinuxBugSettings,
-    ) -> Self {
+    pub fn new(db: Arc<Database>, provider: Arc<dyn AiProvider>, repo_path: String) -> Self {
         Self {
             db,
             provider,
@@ -34,15 +30,13 @@ impl BugWorker {
                 std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string()),
                 std::process::id()
             ),
-            lease_ttl_seconds: settings.lease_ttl_seconds,
-            max_attempts: settings.max_attempts,
         }
     }
 
     pub async fn run(&self) {
         info!(
             "Starting Bug Worker as {} (lease {}s, {} attempts max)...",
-            self.worker_id, self.lease_ttl_seconds, self.max_attempts
+            self.worker_id, BUG_LEASE_TTL_SECONDS, BUG_MAX_ATTEMPTS
         );
         if let Err(e) = self.db.recover_stale_running_bugs().await {
             error!(
@@ -53,7 +47,7 @@ impl BugWorker {
         loop {
             match self
                 .db
-                .claim_pending_bug(&self.worker_id, self.lease_ttl_seconds, self.max_attempts)
+                .claim_pending_bug(&self.worker_id, BUG_LEASE_TTL_SECONDS, BUG_MAX_ATTEMPTS)
                 .await
             {
                 Ok(Some(bug)) => {
@@ -139,7 +133,7 @@ impl BugWorker {
                 Ok(None) => {
                     // Nothing left to claim, so this is the cheapest moment to
                     // retire the bugs that have run out of attempts.
-                    if let Err(e) = self.db.abandon_exhausted_bugs(self.max_attempts).await {
+                    if let Err(e) = self.db.abandon_exhausted_bugs(BUG_MAX_ATTEMPTS).await {
                         error!("Failed to abandon exhausted bugs: {}", e);
                     }
                     sleep(Duration::from_secs(5)).await;

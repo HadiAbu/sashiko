@@ -146,19 +146,7 @@ port = 8080
 # Required whenever [smtp] is configured, because sign-in links are mailed and
 # the bind address above does not name a host a recipient can open. The server
 # refuses to start if SMTP is on and this is unset or names a bind address.
-# public_base_url = "https://sashiko.dev"
-
-# Sign-in links. The defaults are shown; every value is optional.
-# [server.sign_in_link]
-# How long a mailed link stays usable, in seconds.
-# lifetime_seconds = 900
-# Links mailed to one address per quarter hour, and per day.
-# per_address_burst = 3
-# per_address_daily = 10
-# Requests accepted from one client address per quarter hour.
-# per_client_burst = 10
-# Total links mailed per hour, however the requests are distributed.
-# global_hourly = 100
+# public_base_url = ""
 
 # Identity-based Capabilities: Defines what authenticated (JWT) entities can do.
 # If these lists are empty or the section is missing, nobody is allowed to perform any mutations (Fail-Closed secure default).
@@ -170,10 +158,7 @@ admins = []
 # AI transcripts. Deliberately not admins: this grants no ingest, cancel or
 # review capability, and no authority over bugs outside the member's own
 # maintained subsystems beyond commenting.
-security = [
-    "gregkh@linuxfoundation.org",
-    "linux@roeck-us.net",
-]
+security = []
 # Principals permitted to file new bugs over HTTP. Empty means only admins can.
 bug_reporters = []
 # Ingest limits users/bots to only submit new patches into the system (/api/submit).
@@ -201,13 +186,3 @@ worktree_dir = "review_trees"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
-
-[linux_bug]
-# How long a worker's claim on a bug stays valid. If the worker dies, the
-# bug becomes claimable again once this elapses. Set this comfortably
-# above the longest expected analysis, or a slow run will be reclaimed
-# and analysed a second time in parallel.
-lease_ttl_seconds = 1800
-# How many analysis attempts a bug gets before it is abandoned. Abandoned
-# bugs are never retried automatically.
-max_attempts = 3

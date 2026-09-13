@@ -3291,7 +3291,7 @@ mod tests {
                 .contains("https://sashiko.dev/auth/verify?token=")
         );
         assert!(email.body.contains("Requested from 198.51.100.24."));
-        assert!(email.body.contains("Open this link within 15 minutes"));
+        assert!(email.body.contains("Open this link within 30 minutes"));
         assert!(
             email
                 .body
@@ -3954,6 +3954,8 @@ fn is_sign_in_eligible(
             || maintainers.is_some_and(|m| m.subsystems_for_address(email).is_some()))
 }
 
+const SIGN_IN_LINK_LIFETIME_SECONDS: i64 = 1800;
+
 async fn request_link(
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: axum::http::HeaderMap,
@@ -3963,7 +3965,7 @@ async fn request_link(
     if let Some(secret) = resolve_jwt_secret(&state) {
         let payload: Option<RequestLinkRequest> = serde_json::from_slice(&body).ok();
         let email = payload.as_ref().map(|p| p.email.trim()).unwrap_or("");
-        let lifetime = state.settings.server.sign_in_link.lifetime_seconds;
+        let lifetime = SIGN_IN_LINK_LIFETIME_SECONDS;
 
         let client_ip = extract_client_ip(&addr, &headers);
         let client_ip_str = client_ip

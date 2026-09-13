@@ -549,7 +549,7 @@ pub struct ServerSettings {
     pub host: String,
     pub port: u16,
     /// The URL the service is reachable at from outside, without a trailing
-    /// slash, for example "https://sashiko.dev".
+    /// slash.
     ///
     /// The bind address cannot stand in for this: the shipped host is the
     /// wildcard "::", which renders a sign-in link nobody can open.
@@ -562,68 +562,6 @@ pub struct ServerSettings {
     pub jwt_secret: Option<String>,
     #[serde(default)]
     pub acl: AclSettings,
-    #[serde(default)]
-    pub sign_in_link: SignInLinkSettings,
-}
-
-/// Sign-in link lifetime and the limits on how often one can be asked for.
-///
-/// Every limit is a count over a window. They are keyed independently so that
-/// one noisy client cannot consume another person's allowance, and the global
-/// one caps total outbound sign-in mail however the requests are distributed.
-#[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-pub struct SignInLinkSettings {
-    /// How long a link stays usable. Short, because the link is a bearer
-    /// credential sitting in a mailbox.
-    #[serde(default = "default_sign_in_link_lifetime_seconds")]
-    pub lifetime_seconds: i64,
-    /// Links mailed to one address per quarter hour. Caps use of the endpoint
-    /// as a mail bomb against one person.
-    #[serde(default = "default_per_address_burst")]
-    pub per_address_burst: u32,
-    /// Links mailed to one address per day.
-    #[serde(default = "default_per_address_daily")]
-    pub per_address_daily: u32,
-    /// Requests accepted from one client address per quarter hour. Caps
-    /// enumeration sweeps.
-    #[serde(default = "default_per_client_burst")]
-    pub per_client_burst: u32,
-    /// Total links mailed per hour, regardless of who asked.
-    #[serde(default = "default_global_hourly")]
-    pub global_hourly: u32,
-}
-
-impl Default for SignInLinkSettings {
-    fn default() -> Self {
-        Self {
-            lifetime_seconds: default_sign_in_link_lifetime_seconds(),
-            per_address_burst: default_per_address_burst(),
-            per_address_daily: default_per_address_daily(),
-            per_client_burst: default_per_client_burst(),
-            global_hourly: default_global_hourly(),
-        }
-    }
-}
-
-fn default_sign_in_link_lifetime_seconds() -> i64 {
-    900
-}
-
-fn default_per_address_burst() -> u32 {
-    3
-}
-
-fn default_per_address_daily() -> u32 {
-    10
-}
-
-fn default_per_client_burst() -> u32 {
-    10
-}
-
-fn default_global_hourly() -> u32 {
-    100
 }
 
 impl ServerSettings {
@@ -744,39 +682,6 @@ fn default_email_policy_path() -> String {
     "email_policy.toml".to_string()
 }
 
-/// Tuning for the Linux bug analysis worker.
-#[derive(Debug, Deserialize, Clone)]
-#[serde(deny_unknown_fields)]
-#[allow(unused)]
-pub struct LinuxBugSettings {
-    /// How long a claimed bug stays claimed before another worker may take it
-    /// over. This must comfortably exceed the longest expected analysis, or a
-    /// slow run will be reclaimed and analysed twice.
-    #[serde(default = "default_bug_lease_ttl_seconds")]
-    pub lease_ttl_seconds: i64,
-    /// How many times a bug may be analysed before it is abandoned. Without a
-    /// cap, a bug that reliably crashes the worker is retried forever.
-    #[serde(default = "default_bug_max_attempts")]
-    pub max_attempts: i64,
-}
-
-impl Default for LinuxBugSettings {
-    fn default() -> Self {
-        Self {
-            lease_ttl_seconds: default_bug_lease_ttl_seconds(),
-            max_attempts: default_bug_max_attempts(),
-        }
-    }
-}
-
-fn default_bug_lease_ttl_seconds() -> i64 {
-    1800
-}
-
-fn default_bug_max_attempts() -> i64 {
-    3
-}
-
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -801,8 +706,6 @@ pub struct Settings {
     pub server: ServerSettings,
     pub git: GitSettings,
     pub review: ReviewSettings,
-    #[serde(default)]
-    pub linux_bug: LinuxBugSettings,
 }
 
 fn default_subsystems() -> SubsystemsSettings {
@@ -851,8 +754,7 @@ impl Settings {
             Some(url) if is_reachable_base_url(url) => Ok(()),
             Some(url) => Err(format!(
                 "server.public_base_url is {:?}, which names a bind address rather than a host a \
-                 recipient can reach. Set it to the URL the service is served at, for example \
-                 https://sashiko.dev",
+                 recipient can reach. Set it to the URL the service is served at",
                 url
             )),
             None => Err(
@@ -1192,8 +1094,8 @@ mod tests {
     #[test]
     fn test_reachable_base_url_rejects_bind_addresses() {
         for good in [
-            "https://sashiko.dev",
-            "https://sashiko.dev/",
+            "https://sashiko.example.org",
+            "https://sashiko.example.org/",
             "http://review.example.org:8080",
             "https://[2001:db8::1]:8443",
         ] {
@@ -1207,8 +1109,8 @@ mod tests {
             "http://0.0.0.0:8080",
             "https://localhost:8080",
             "http://127.0.0.1:8080",
-            "sashiko.dev",
-            "ftp://sashiko.dev",
+            "sashiko.example.org",
+            "ftp://sashiko.example.org",
             "",
         ] {
             assert!(!is_reachable_base_url(bad), "{} accepted", bad);
@@ -1220,34 +1122,18 @@ mod tests {
         let mut server = ServerSettings {
             host: "::".to_string(),
             port: 8080,
-            public_base_url: Some("https://sashiko.dev/".to_string()),
+            public_base_url: Some("https://sashiko.example.org/".to_string()),
             read_only: false,
             testing_mode: false,
             jwt_secret: None,
             acl: AclSettings::default(),
-            sign_in_link: SignInLinkSettings::default(),
         };
-        assert_eq!(server.sign_in_base_url(), "https://sashiko.dev");
+        assert_eq!(server.sign_in_base_url(), "https://sashiko.example.org");
 
         // With nothing configured the link is only ever logged, so a
         // best-effort address is enough.
         server.public_base_url = None;
         assert_eq!(server.sign_in_base_url(), "http://:::8080");
-    }
-
-    #[test]
-    fn test_sign_in_link_defaults_are_the_documented_limits() {
-        let limits = SignInLinkSettings::default();
-        assert_eq!(limits.lifetime_seconds, 900);
-        assert_eq!(limits.per_address_burst, 3);
-        assert_eq!(limits.per_address_daily, 10);
-        assert_eq!(limits.per_client_burst, 10);
-        assert_eq!(limits.global_hourly, 100);
-
-        // Overriding one value must leave the rest at their defaults.
-        let limits: SignInLinkSettings = toml::from_str("lifetime_seconds = 60").unwrap();
-        assert_eq!(limits.lifetime_seconds, 60);
-        assert_eq!(limits.global_hourly, 100);
     }
 
     #[test]
@@ -1272,7 +1158,7 @@ mod tests {
         settings.server.public_base_url = Some("http://[::]:8080".to_string());
         assert!(settings.validate_sign_in_delivery().is_err());
 
-        settings.server.public_base_url = Some("https://sashiko.dev".to_string());
+        settings.server.public_base_url = Some("https://sashiko.example.org".to_string());
         assert!(settings.validate_sign_in_delivery().is_ok());
     }
 }
