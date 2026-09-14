@@ -17,6 +17,7 @@ use chrono::{DateTime, Local, TimeZone, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Client;
 use sashiko::api::{PatchsetsResponse, SubmitRequest, SubmitResponse};
+use sashiko::auth::LocalToken;
 use sashiko::settings::Settings;
 use sashiko::utils::utf8_prefix;
 use serde_json::{Value, from_str};
@@ -243,7 +244,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let client = Client::new();
+    let client = build_client();
 
     if let Err(e) = run_command(cli.command, &client, &base_url, cli.format).await {
         print_colored(Color::Red, "Error: ");
@@ -266,6 +267,41 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Builds the HTTP client, presenting the local server's token when one is
+/// readable.
+///
+/// The token is attached as a default header rather than at each call site,
+/// because every mutating command needs it and the ones that forget only fail
+/// once a server stops trusting the loopback interface by itself.
+///
+/// A server elsewhere ignores the header, and a missing or stale file is not
+/// worth a word: the request may still be authorized for another reason, and
+/// the refusal that follows otherwise says so.
+fn build_client() -> Client {
+    let token = Settings::new()
+        .ok()
+        .and_then(|settings| LocalToken::read_from(&settings.local_token_path()).ok());
+
+    let Some(token) = token else {
+        return Client::new();
+    };
+
+    let Ok(mut value) =
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.secret()))
+    else {
+        return Client::new();
+    };
+    value.set_sensitive(true);
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, value);
+
+    Client::builder()
+        .default_headers(headers)
+        .build()
+        .unwrap_or_else(|_| Client::new())
 }
 
 async fn run_command(
