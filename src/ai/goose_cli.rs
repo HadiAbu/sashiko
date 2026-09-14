@@ -22,10 +22,11 @@
 //! goose is part of the Agentic AI Foundation (AAIF) at the Linux Foundation,
 //! as is Sashiko.
 //!
-//! Each request runs in a throwaway configuration directory whose `config.yaml`
-//! pins goose to chat mode, so goose never executes a tool of its own:
-//! Sashiko's ToolBox stays the only tool layer. The directory also keeps the
-//! user's own goose configuration and session history out of a review.
+//! Each request runs in a throwaway set of XDG directories whose
+//! `config.yaml` pins goose to chat mode, so goose never executes a tool of
+//! its own: Sashiko's ToolBox stays the only tool layer. The same directories
+//! keep the user's own goose configuration out of a review and take goose's
+//! session database and logs with them when the request ends.
 //!
 //! goose reports token usage in its `session/prompt` result, which is used
 //! verbatim when present. Note that goose prepends its own system prompt and
@@ -37,6 +38,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -74,32 +76,77 @@ fn build_args() -> Vec<String> {
     vec!["acp".to_string()]
 }
 
-/// Creates the throwaway configuration directory for one goose run. The
-/// returned TempDir must outlive the child process.
-fn create_isolated_config() -> Result<TempDir> {
-    let tmp = tempfile::tempdir()?;
-    let config_dir = tmp.path().join("goose");
-    std::fs::create_dir_all(&config_dir)?;
-    std::fs::write(config_dir.join("config.yaml"), CONFIG_YAML)?;
-    Ok(tmp)
+/// Throwaway XDG directories for one goose run.
+///
+/// goose keeps its configuration in `XDG_CONFIG_HOME`, its session database
+/// in `XDG_DATA_HOME` and its logs in `XDG_STATE_HOME`. All three are
+/// redirected here. Redirecting the configuration is what pins goose to chat
+/// mode and hides the user's own extensions; redirecting the other two keeps
+/// a review from recording a session and a log file per request in the
+/// user's home directory, and keeps concurrent reviews off a single session
+/// database.
+///
+/// The directories are removed when this value is dropped, so it has to
+/// outlive the child process.
+struct IsolatedHome {
+    tmp: TempDir,
+}
+
+impl IsolatedHome {
+    /// Lays out the directories and writes the configuration that pins goose
+    /// to chat mode.
+    fn create() -> Result<Self> {
+        let home = Self {
+            tmp: tempfile::tempdir()?,
+        };
+        let config_dir = home.config_home().join("goose");
+        std::fs::create_dir_all(&config_dir)?;
+        std::fs::create_dir_all(home.data_home())?;
+        std::fs::create_dir_all(home.state_home())?;
+        std::fs::write(config_dir.join("config.yaml"), CONFIG_YAML)?;
+        Ok(home)
+    }
+
+    fn config_home(&self) -> PathBuf {
+        self.tmp.path().join("config")
+    }
+
+    fn data_home(&self) -> PathBuf {
+        self.tmp.path().join("data")
+    }
+
+    fn state_home(&self) -> PathBuf {
+        self.tmp.path().join("state")
+    }
+
+    /// Working directory of the child, and the `cwd` of its session. goose
+    /// rejects a relative session cwd, and the child has no business outside
+    /// the throwaway directory.
+    fn root(&self) -> &Path {
+        self.tmp.path()
+    }
 }
 
 /// Environment for one goose run. The caller's entries land first, so they
 /// add to and override whatever goose would otherwise inherit from Sashiko,
 /// and the variables Sashiko derives from its own settings are pinned after
 /// them. A stray GOOSE_MODE or XDG_CONFIG_HOME in a configuration file
-/// therefore cannot hand goose back its own tools or the user's own
-/// configuration, and GOOSE_MODEL cannot drift away from the model the
-/// response cache is keyed on.
+/// therefore cannot hand goose back its own tools, its own session history
+/// or the user's own configuration, and GOOSE_MODEL cannot drift away from
+/// the model the response cache is keyed on.
 fn build_env(
     model: &str,
     goose_provider: &str,
     context_window_size: usize,
-    config_home: &str,
+    home: &IsolatedHome,
     extra: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
+    let path = |dir: PathBuf| dir.to_string_lossy().to_string();
+
     let mut env = extra.clone();
-    env.insert("XDG_CONFIG_HOME".to_string(), config_home.to_string());
+    env.insert("XDG_CONFIG_HOME".to_string(), path(home.config_home()));
+    env.insert("XDG_DATA_HOME".to_string(), path(home.data_home()));
+    env.insert("XDG_STATE_HOME".to_string(), path(home.state_home()));
     env.insert("GOOSE_PROVIDER".to_string(), goose_provider.to_string());
     env.insert("GOOSE_MODEL".to_string(), model.to_string());
     env.insert("GOOSE_MODE".to_string(), "chat".to_string());
@@ -131,23 +178,21 @@ fn usage_from_result(result: &Value) -> Option<AiUsage> {
 
 impl GooseCliProvider {
     async fn run_acp_prompt(&self, prompt: &str) -> Result<(String, Value)> {
-        let tmp = create_isolated_config()?;
-        let config_home = tmp.path().to_string_lossy().to_string();
+        let home = IsolatedHome::create()?;
 
         let process = AcpProcess {
             label: "goose acp".to_string(),
             binary: self.binary.clone(),
             args: build_args(),
-            working_dir: Some(tmp.path().to_path_buf()),
+            working_dir: Some(home.root().to_path_buf()),
             env: build_env(
                 &self.model,
                 &self.goose_provider,
                 self.context_window_size,
-                &config_home,
+                &home,
                 &self.env,
             ),
-            // goose rejects a relative session cwd.
-            session_cwd: config_home,
+            session_cwd: home.root().to_string_lossy().to_string(),
         };
 
         let prompt = process.run_prompt(prompt).await?;
@@ -251,47 +296,68 @@ mod tests {
     }
 
     #[test]
-    fn isolated_config_pins_chat_mode() {
-        let tmp = create_isolated_config().unwrap();
-        let config = std::fs::read_to_string(tmp.path().join("goose/config.yaml")).unwrap();
+    fn isolated_home_pins_chat_mode() {
+        let home = IsolatedHome::create().unwrap();
+        let config = std::fs::read_to_string(home.config_home().join("goose/config.yaml")).unwrap();
         assert!(config.contains("GOOSE_MODE: chat"));
         assert!(config.contains("extensions: {}"));
     }
 
     #[test]
-    fn env_pins_provider_model_and_config_home() {
-        let env = build_env("m1", "openai", 4096, "/tmp/cfg", &BTreeMap::new());
+    fn isolated_home_separates_config_data_and_state() {
+        let home = IsolatedHome::create().unwrap();
+        for dir in [home.config_home(), home.data_home(), home.state_home()] {
+            assert!(dir.is_dir());
+            assert!(dir.starts_with(home.root()));
+        }
+        assert_ne!(home.data_home(), home.config_home());
+        assert_ne!(home.state_home(), home.config_home());
+    }
+
+    #[test]
+    fn env_pins_provider_model_and_directories() {
+        let home = IsolatedHome::create().unwrap();
+        let env = build_env("m1", "openai", 4096, &home, &BTreeMap::new());
         assert_eq!(env.get("GOOSE_MODEL").unwrap(), "m1");
         assert_eq!(env.get("GOOSE_PROVIDER").unwrap(), "openai");
         assert_eq!(env.get("GOOSE_MODE").unwrap(), "chat");
         assert_eq!(env.get("GOOSE_CONTEXT_LIMIT").unwrap(), "4096");
-        assert_eq!(env.get("XDG_CONFIG_HOME").unwrap(), "/tmp/cfg");
+        for var in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+            let dir = PathBuf::from(env.get(var).unwrap());
+            assert!(dir.starts_with(home.root()), "{} escaped the home", var);
+        }
     }
 
     #[test]
     fn env_entries_reach_the_child() {
+        let home = IsolatedHome::create().unwrap();
         let mut extra = BTreeMap::new();
         extra.insert(
             "OPENAI_HOST".to_string(),
             "http://localhost:8000".to_string(),
         );
-        let env = build_env("m1", "openai", 4096, "/tmp/cfg", &extra);
+        let env = build_env("m1", "openai", 4096, &home, &extra);
         assert_eq!(env.get("OPENAI_HOST").unwrap(), "http://localhost:8000");
     }
 
     #[test]
     fn env_entries_cannot_unpin_the_isolation() {
+        let home = IsolatedHome::create().unwrap();
         let mut extra = BTreeMap::new();
         extra.insert("GOOSE_MODE".to_string(), "auto".to_string());
-        extra.insert(
-            "XDG_CONFIG_HOME".to_string(),
-            "/home/user/.config".to_string(),
-        );
         extra.insert("GOOSE_MODEL".to_string(), "some-other-model".to_string());
-        let env = build_env("m1", "openai", 4096, "/tmp/cfg", &extra);
+        for var in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+            extra.insert(var.to_string(), "/home/user/escaped".to_string());
+        }
+
+        let env = build_env("m1", "openai", 4096, &home, &extra);
+
         assert_eq!(env.get("GOOSE_MODE").unwrap(), "chat");
-        assert_eq!(env.get("XDG_CONFIG_HOME").unwrap(), "/tmp/cfg");
         assert_eq!(env.get("GOOSE_MODEL").unwrap(), "m1");
+        for var in ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+            let dir = PathBuf::from(env.get(var).unwrap());
+            assert!(dir.starts_with(home.root()), "{} escaped the home", var);
+        }
     }
 
     #[test]

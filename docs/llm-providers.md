@@ -252,8 +252,12 @@ cp docs/examples/Settings.goose-cli.toml Settings.toml
 - Each request gets a throwaway `XDG_CONFIG_HOME` whose `config.yaml` pins
   goose to chat mode, so goose never runs a tool of its own and Sashiko's
   tool protocol stays the only tool layer
-- The throwaway config also keeps the user's own goose configuration,
-  extensions and session history out of a review
+- The throwaway config also keeps the user's own goose configuration and
+  extensions out of a review
+- `XDG_DATA_HOME` and `XDG_STATE_HOME` are redirected alongside it, so the
+  session database and the logs goose writes per request are discarded with
+  the request instead of accumulating in the user's home directory, and
+  concurrent reviews never share one session database
 - Token usage is taken from goose's own `session/prompt` accounting rather
   than estimated
 
@@ -281,9 +285,10 @@ variables work too and the table overrides them. Keep real API keys in
 the environment rather than in the settings file.
 
 The table cannot override the variables that make goose a completion
-backend. `GOOSE_MODE`, `XDG_CONFIG_HOME` and the model and provider taken
-from `[ai]` are pinned after it, so a stray entry cannot hand goose back its
-own tools or the user's own configuration.
+backend. `GOOSE_MODE`, the three XDG directories and the model and provider
+taken from `[ai]` are pinned after it, so a stray entry cannot hand goose
+back its own tools, its own session history or the user's own
+configuration.
 
 goose prepends its own system prompt and platform tool schemas to every
 request, which costs roughly 5k tokens before Sashiko's prompt is even
