@@ -389,14 +389,12 @@ impl Worker {
                         stage_name,
                         turn,
                         max_turns,
-                    } => {
-                        if is_counted_stage(stage_name) {
-                            progress_cb(WorkerProgressEvent::StageTurn {
-                                stage: stage_name.to_string(),
-                                turn,
-                                max_turns,
-                            });
-                        }
+                    } if is_counted_stage(stage_name) => {
+                        progress_cb(WorkerProgressEvent::StageTurn {
+                            stage: stage_name.to_string(),
+                            turn,
+                            max_turns,
+                        });
                     }
                     _ => {}
                 }
