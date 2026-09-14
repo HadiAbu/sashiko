@@ -1054,7 +1054,6 @@ Example Output:
         })
         .reduce(|state, out: VerificationOutput| {
             let mut new_findings = Vec::new();
-            state.concerns.clear();
             for finding in out.findings {
                 let is_preexisting = finding
                     .get("preexisting")
@@ -1426,5 +1425,41 @@ mod tests {
             ),
             "the custom prompt closes the system prompt"
         );
+    }
+
+    #[test]
+    fn test_verification_stage_preserves_preexisting_concerns() {
+        let stage = verification_stage(20, 0.0);
+        let mut state = LinuxPatchReviewState {
+            concerns: vec![json!({
+                "type": "Pre-existing Race",
+                "description": "Old race condition",
+                "preexisting": true,
+            })],
+            ..Default::default()
+        };
+
+        let output = VerificationOutput {
+            findings: vec![
+                json!({
+                    "problem": "new regression",
+                    "severity": "High",
+                    "preexisting": false,
+                }),
+                json!({
+                    "problem": "another pre-existing",
+                    "severity": "Medium",
+                    "severity_explanation": "Old leak",
+                    "preexisting": true,
+                }),
+            ],
+        };
+
+        (stage.reducer)(&mut state, output);
+
+        assert_eq!(state.concerns.len(), 2);
+        assert_eq!(state.concerns[0]["description"], "Old race condition");
+        assert_eq!(state.concerns[1]["description"], "another pre-existing");
+        assert_eq!(state.findings.len(), 2);
     }
 }

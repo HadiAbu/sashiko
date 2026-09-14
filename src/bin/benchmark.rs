@@ -508,6 +508,20 @@ async fn process_entry(
         }
     }
 
+    if let Ok(bugs) = db.list_bugs_for_review(review_id).await {
+        for (bug, _) in bugs {
+            findings_text.push_str(&format!(
+                "- [Severity {}] {}\n",
+                bug.severity().as_str(),
+                bug.problem()
+            ));
+            if let Some(e) = bug.severity_explanation() {
+                findings_text.push_str(&format!("  Explanation: {}\n", e));
+            }
+            findings_count += 1;
+        }
+    }
+
     if findings_count == 0 {
         findings_text.push_str("(No structured findings recorded in DB)\n");
     }
