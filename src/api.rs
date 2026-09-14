@@ -1872,19 +1872,18 @@ async fn forge_webhook(
     // traffic arrives from loopback — the signature check cannot be
     // bypassed by source IP.
     //
-    // When no secret is configured, fall back to localhost-only or the
-    // explicit --enable-unsafe-all-submit flag. Note: this is insecure
-    // behind a reverse proxy; operators MUST configure webhook_secret
-    // for proxied deployments.
-    if !has_secret {
-        let is_loopback = addr.ip().to_canonical().is_loopback();
-        if !is_loopback && !state.allow_all_submit {
-            info!(
-                "Refused {} webhook from {}: configure webhook_secret or use --enable-unsafe-all-submit",
-                provider, addr
-            );
-            return Err(StatusCode::FORBIDDEN);
-        }
+    // Without a secret there is nothing to verify, so the only callers left
+    // are ones that can prove they share this machine by presenting the local
+    // token, plus the explicit --enable-unsafe-all-submit flag. A forge cannot
+    // do either, which is the point: an endpoint a forge can reach
+    // unauthenticated is an endpoint anyone can reach, and arriving on
+    // loopback never distinguished the two behind a reverse proxy.
+    if !has_secret && !presents_local_token(&headers, &state) && !state.allow_all_submit {
+        info!(
+            "Refused {} webhook from {}: configure webhook_secret or use --enable-unsafe-all-submit",
+            provider, addr
+        );
+        return Err(StatusCode::FORBIDDEN);
     }
 
     let forge = state.forge_registry.get(&provider).ok_or_else(|| {
