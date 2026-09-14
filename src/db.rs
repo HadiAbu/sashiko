@@ -3251,6 +3251,14 @@ impl Database {
         Ok(results)
     }
 
+    /// Records that a review surfaced a bug.
+    ///
+    /// A review that already discovered this bug keeps that credit. Two
+    /// candidates raised by one review can be folded together, and the fold
+    /// links the surviving bug back to the very same review as a rediscovery.
+    /// Replacing the row outright would let that second link overwrite the
+    /// first and leave a genuinely new bug looking like nobody found it, so
+    /// the flag only ever moves from false to true.
     pub async fn link_review_to_bug(
         &self,
         review_id: i64,
@@ -3259,8 +3267,11 @@ impl Database {
     ) -> Result<()> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
-                 VALUES (?, ?, ?)",
+                "INSERT INTO bug_reviews (review_id, bug_id, is_newly_discovered)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(review_id, bug_id) DO UPDATE
+                    SET is_newly_discovered =
+                        MAX(is_newly_discovered, excluded.is_newly_discovered)",
                 libsql::params![review_id, bug_id, if is_newly_discovered { 1 } else { 0 }],
             )
             .await?;
@@ -13224,6 +13235,93 @@ mod tests {
             !claimed.contains(&dup_id),
             "a folded bug must never be handed to a worker"
         );
+    }
+
+    /// One review can raise two candidates that later turn out to be the same
+    /// defect. Folding one into the other links the survivor back to that same
+    /// review as a rediscovery, which must not erase the fact that the review
+    /// discovered it in the first place.
+    #[tokio::test]
+    async fn test_link_review_to_bug_never_downgrades_discovery() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-two-symptoms").await;
+        // reviews.patchset_id is a foreign key, so the parent must exist.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, status) VALUES (1, 'test series', 'Reviewed')",
+                (),
+            )
+            .await
+            .unwrap();
+        let review_id = db
+            .conn
+            .query(
+                "INSERT INTO reviews (patchset_id, status) VALUES (1, 'Reviewed') RETURNING id",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+
+        // The review discovers the bug, then rediscovers it by folding a
+        // sibling candidate into it.
+        db.link_review_to_bug(review_id, bug_id, true)
+            .await
+            .unwrap();
+        db.link_review_to_bug(review_id, bug_id, false)
+            .await
+            .unwrap();
+
+        let flag: i64 = db
+            .conn
+            .query(
+                "SELECT is_newly_discovered FROM bug_reviews WHERE review_id = ? AND bug_id = ?",
+                libsql::params![review_id, bug_id],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(flag, 1, "a rediscovery must not erase the discovery");
+
+        // The reverse order must still end up crediting the discovery.
+        let other_id = create_pending_bug(&db, "linux-two-symptoms-b").await;
+        db.link_review_to_bug(review_id, other_id, false)
+            .await
+            .unwrap();
+        db.link_review_to_bug(review_id, other_id, true)
+            .await
+            .unwrap();
+        let flag: i64 = db
+            .conn
+            .query(
+                "SELECT is_newly_discovered FROM bug_reviews WHERE review_id = ? AND bug_id = ?",
+                libsql::params![review_id, other_id],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(flag, 1);
     }
 
     /// Assignment writes both columns together, because the schema requires
