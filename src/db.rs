@@ -3351,8 +3351,13 @@ impl Database {
         )
         .await?;
 
+        // is_newly_discovered is written explicitly. A migrated link records a
+        // review that rediscovered an existing bug, so omitting the column and
+        // taking the schema default of 1 would report every fold as a fresh
+        // discovery on the canonical bug.
         tx.execute(
-            "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id) SELECT review_id, ?1 FROM bug_reviews WHERE bug_id = ?2",
+            "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
+             SELECT review_id, ?1, 0 FROM bug_reviews WHERE bug_id = ?2",
             libsql::params![params.canonical_id, params.ephemeral_id],
         )
         .await?;
