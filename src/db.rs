@@ -2779,19 +2779,30 @@ impl Database {
     ) -> Result<()> {
         let tx = self.conn.transaction().await?;
         tx.execute("UPDATE bugs SET audit_author = ?, audit_tool = ?, audit_model = ?, updated_at = ? WHERE id = ?", libsql::params![self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), chrono::Utc::now().timestamp(), id]).await?;
-        let mut rows = tx
-            .query(
-                "SELECT subsystem FROM bug_subsystems WHERE bug_id = ?",
-                libsql::params![id],
-            )
-            .await?;
         let wanted: std::collections::BTreeMap<&str, SubsystemSource> = subsystems
             .iter()
             .map(|s| (s.name.trim(), s.source))
             .filter(|(name, _)| !name.is_empty())
             .collect();
-        while let Some(row) = rows.next().await? {
-            let sub: String = row.get(0)?;
+
+        // The read is drained and the cursor dropped before any write, because
+        // libsql refuses to commit a transaction that still has a statement in
+        // progress, and deleting while iterating leaves the cursor open.
+        let existing: Vec<String> = {
+            let mut rows = tx
+                .query(
+                    "SELECT subsystem FROM bug_subsystems WHERE bug_id = ?",
+                    libsql::params![id],
+                )
+                .await?;
+            let mut found = Vec::new();
+            while let Some(row) = rows.next().await? {
+                found.push(row.get::<String>(0)?);
+            }
+            found
+        };
+
+        for sub in existing {
             if !wanted.contains_key(sub.as_str()) {
                 tx.execute(
                     "DELETE FROM bug_subsystems WHERE bug_id = ? AND subsystem = ?",
@@ -3263,22 +3274,32 @@ impl Database {
         let now = chrono::Utc::now().timestamp();
         let tx = self.conn.transaction().await?;
 
-        let mut target = tx
-            .query(
-                "SELECT id FROM bugs WHERE id = ? AND duplicate_of_id IS NULL",
-                libsql::params![params.canonical_id],
-            )
-            .await?;
-        if params.ephemeral_id == params.canonical_id || target.next().await?.is_none() {
+        // Both probes are scoped so their cursors close before the writes
+        // below. libsql refuses to commit a transaction that still has a
+        // statement in progress, and these handles would otherwise stay alive
+        // until the end of the function.
+        let canonical_exists = {
+            let mut target = tx
+                .query(
+                    "SELECT id FROM bugs WHERE id = ? AND duplicate_of_id IS NULL",
+                    libsql::params![params.canonical_id],
+                )
+                .await?;
+            target.next().await?.is_some()
+        };
+        if params.ephemeral_id == params.canonical_id || !canonical_exists {
             bail!("Choose an existing canonical bug, distinct from this bug");
         }
-        let mut source = tx
-            .query(
-                "SELECT id FROM bugs WHERE id = ?",
-                libsql::params![params.ephemeral_id],
-            )
-            .await?;
-        if source.next().await?.is_none() {
+        let source_exists = {
+            let mut source = tx
+                .query(
+                    "SELECT id FROM bugs WHERE id = ?",
+                    libsql::params![params.ephemeral_id],
+                )
+                .await?;
+            source.next().await?.is_some()
+        };
+        if !source_exists {
             bail!("Bug not found");
         }
 
