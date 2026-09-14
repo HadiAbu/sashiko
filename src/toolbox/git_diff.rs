@@ -14,6 +14,7 @@
 
 use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
+use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -94,9 +95,9 @@ impl LlmTool<SashikoToolContext> for GitDiffTool {
             }
         }
 
-        let output = cmd.output().await?;
+        let output = capped_output(&mut cmd).await?;
 
-        if !output.status.success() {
+        if !output.is_usable() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(anyhow!("git diff failed: {}", stderr));
         }

@@ -19,6 +19,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+pub mod command;
 pub mod framework;
 pub mod utils;
 

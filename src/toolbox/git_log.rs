@@ -14,6 +14,7 @@
 
 use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
+use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -71,8 +72,8 @@ impl LlmTool<SashikoToolContext> for GitLogTool {
             .args(["log", "-n", &limit_str, range])
             .kill_on_drop(true);
 
-        let output = cmd.output().await?;
-        if !output.status.success() {
+        let output = capped_output(&mut cmd).await?;
+        if !output.is_usable() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Ok(json!({ "error": format!("git log failed: {}", stderr) }));
         }

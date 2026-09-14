@@ -14,6 +14,7 @@
 
 use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
+use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
@@ -150,8 +151,8 @@ impl GitReadFilesTool {
         cmd.current_dir(&context.worktree_path)
             .args(["show", &format!("{}:{}", revision, path_str)]);
 
-        let output = cmd.output().await?;
-        if !output.status.success() {
+        let output = capped_output(&mut cmd).await?;
+        if !output.is_usable() {
             return Err(anyhow!(
                 "git show failed to read file {} at {}: {}",
                 path_str,

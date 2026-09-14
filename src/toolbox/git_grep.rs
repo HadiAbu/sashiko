@@ -14,6 +14,7 @@
 
 use crate::ai::truncator::Truncator;
 use crate::toolbox::SashikoToolContext;
+use crate::toolbox::command::capped_output;
 use crate::toolbox::framework::LlmTool;
 use crate::toolbox::utils::format_git_grep_output;
 use anyhow::{Result, anyhow};
@@ -112,8 +113,8 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             }
         }
 
-        let output = cmd.output().await?;
-        if !output.status.success() {
+        let output = capped_output(&mut cmd).await?;
+        if !output.is_usable() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
                 return Ok(json!({
