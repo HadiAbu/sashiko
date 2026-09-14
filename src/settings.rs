@@ -16,6 +16,12 @@ use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// The name of the file holding the server's local operator token.
+///
+/// The leading dot keeps it out of a casual listing of the state directory,
+/// which is where an operator would otherwise be tempted to copy it from.
+pub const LOCAL_TOKEN_FILE_NAME: &str = ".sashiko-local-token";
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
@@ -827,6 +833,33 @@ impl Settings {
         PathBuf::from(".config/sashiko.toml")
     }
 
+    /// The file the server writes its local operator token to.
+    ///
+    /// The path is derived rather than configured so that a local tool finds
+    /// the token without being told where to look. The database is the one
+    /// thing every participant already agrees on: a client that reads a
+    /// different Settings.toml than the server would talk to a different
+    /// database too, and is by definition not local to it.
+    ///
+    /// A remote database names no directory, so the token falls back to the
+    /// working directory, which is where the configuration was read from.
+    pub fn local_token_path(&self) -> PathBuf {
+        let url = self.database.url.trim();
+        let dir = if url.contains("://") {
+            Path::new("")
+        } else {
+            Path::new(url).parent().unwrap_or(Path::new(""))
+        };
+
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+
+        dir.join(LOCAL_TOKEN_FILE_NAME)
+    }
+
     pub fn local_review() -> Result<Self, ConfigError> {
         Self::from_file(Self::local_review_path())
     }
@@ -1200,5 +1233,30 @@ mod tests {
 
         settings.server.public_base_url = Some("https://sashiko.example.org".to_string());
         assert!(settings.validate_sign_in_delivery().is_ok());
+    }
+
+    #[test]
+    fn test_local_token_path_follows_the_database() {
+        let mut settings = Settings::new().unwrap();
+
+        settings.database.url = "sashiko.db".to_string();
+        assert_eq!(
+            settings.local_token_path(),
+            Path::new(".").join(LOCAL_TOKEN_FILE_NAME)
+        );
+
+        settings.database.url = "/var/lib/sashiko/sashiko.db".to_string();
+        assert_eq!(
+            settings.local_token_path(),
+            Path::new("/var/lib/sashiko").join(LOCAL_TOKEN_FILE_NAME)
+        );
+
+        // A remote database names no directory to share, so the token sits
+        // where the configuration was read from instead.
+        settings.database.url = "libsql://sashiko.example.turso.io".to_string();
+        assert_eq!(
+            settings.local_token_path(),
+            Path::new(".").join(LOCAL_TOKEN_FILE_NAME)
+        );
     }
 }
