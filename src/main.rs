@@ -505,6 +505,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 mr_url: None,
                                 mr_title: None,
                                 mr_number: None,
+                                receipt: None,
                             })
                             .await
                         {
@@ -581,6 +582,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 mr_url,
                                 mr_title,
                                 mr_number,
+                                receipt: None,
                             })
                             .await
                         {
@@ -649,6 +651,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             mr_url: None,
                                             mr_title: None,
                                             mr_number: None,
+                                            receipt: None,
                                         })
                                         .await
                                     {
@@ -670,6 +673,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         content,
                         raw,
                         baseline,
+                        mut receipt,
                     } => {
                         // Standard raw parsing logic
                         let bytes = match raw {
@@ -689,7 +693,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(cutoff) = cutoff_timestamp
                                     && metadata.date < cutoff
                                 {
-                                    // info!("Skipping fetched article {} (date {} < cutoff {})", article_id, metadata.date, cutoff);
+                                    // Dropping this article is a decision, not
+                                    // a failure, so the mark may move past it.
+                                    if let Some(receipt) = receipt.as_mut() {
+                                        receipt.settle();
+                                    }
                                     return;
                                 }
 
@@ -707,6 +715,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         mr_url: None,
                                         mr_title: None,
                                         mr_number: None,
+                                        receipt,
                                     })
                                     .await
                                 {
@@ -714,9 +723,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             Ok(Err(e)) => {
-                                info!("Parse error for {}: {}", article_id, e);
+                                // Parsing the same bytes again would fail the
+                                // same way, so holding the mark back would
+                                // wedge the group on this one article.
+                                if let Some(receipt) = receipt.as_mut() {
+                                    receipt.settle();
+                                }
+                                warn!("Dropping unparseable article {}: {}", article_id, e);
                             }
                             Err(e) => {
+                                // A parser panic is just as repeatable as a
+                                // parse error, so the article is dropped for
+                                // the same reason.
+                                if let Some(receipt) = receipt.as_mut() {
+                                    receipt.settle();
+                                }
                                 error!("Join error in parser: {}", e);
                             }
                         }
@@ -747,9 +768,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            for article in buffer.drain(..) {
+            for mut article in buffer.drain(..) {
+                let mut receipt = article.receipt.take();
                 match process_parsed_article(&worker_db, article, &policy, &mapping).await {
-                    ProcessStatus::Ingested => total_ingested += 1,
+                    ProcessStatus::Ingested => {
+                        // The article is on disk, so the fetch loop may finally
+                        // move its mark past it.
+                        if let Some(receipt) = receipt.as_mut() {
+                            receipt.settle();
+                        }
+                        total_ingested += 1;
+                    }
+                    // The receipt is dropped unsettled, which reports the
+                    // article as lost and keeps the mark below it.
                     ProcessStatus::Error => total_errors += 1,
                 }
                 total_processed += 1;
@@ -1795,6 +1826,9 @@ async fn process_parsed_article(
         mr_url,
         mr_title,
         mr_number,
+        // The caller settles the receipt, because only it knows whether the
+        // whole batch made it through.
+        receipt: _,
     } = article;
 
     let root_msg_id = resolve_root_msg_id(source, &article_id);

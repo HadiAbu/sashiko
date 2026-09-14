@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::db::Database;
-use crate::events::Event;
+use crate::events::{Event, IngestTracker};
 use crate::nntp::NntpClient;
 use crate::settings::Settings;
 use anyhow::{Result, anyhow};
@@ -32,6 +32,9 @@ pub struct Ingestor {
     sender: Sender<Event>,
     download: Option<usize>,
     nntp_enabled: bool,
+    /// Follows handed-off articles so the high-water mark can trail behind
+    /// what is actually stored rather than what was merely queued.
+    tracker: IngestTracker,
 }
 
 impl Ingestor {
@@ -48,7 +51,35 @@ impl Ingestor {
             sender,
             download,
             nntp_enabled,
+            tracker: IngestTracker::new(),
         }
+    }
+
+    /// Moves the high-water mark up to whatever the pipeline confirms it
+    /// stored, and returns where it ended up.
+    ///
+    /// Waiting for the pipeline to go quiet is what makes the mark meaningful:
+    /// until then an article is only in memory, and a mark that has already
+    /// passed it means nothing will ever fetch it again.
+    async fn commit_article_mark(
+        &self,
+        group: &str,
+        committed: u64,
+        handed_off_up_to: u64,
+    ) -> Result<u64> {
+        self.tracker.wait_until_quiet().await;
+        // Article numbers are per group while the tracker is shared, so the
+        // already committed mark is the floor: everything at or below it is
+        // known stored and a loss recorded elsewhere must not undo that.
+        let safe = self.tracker.take_safe_mark(handed_off_up_to).max(committed);
+        if safe < handed_off_up_to {
+            warn!(
+                "Group {}: holding the high-water mark at {} instead of {} because articles above it were not stored",
+                group, safe, handed_off_up_to
+            );
+        }
+        self.db.update_last_article_num(group, safe).await?;
+        Ok(safe)
     }
 
     async fn get_tracked_groups(&self) -> Result<Vec<(String, String)>> {
@@ -391,6 +422,14 @@ impl Ingestor {
                 }
             }
 
+            // The mark stays where it is until the articles behind it are
+            // stored. It is committed in batches because each commit has to
+            // wait for the pipeline to drain, and a crash mid-batch only costs
+            // a refetch of that batch.
+            const MARK_COMMIT_BATCH: u64 = 100;
+            let mut committed = current;
+            let mut handed_off = current;
+
             // Fetch ALL pending messages
             while current < info.high {
                 let next_id = current + 1;
@@ -404,10 +443,16 @@ impl Ingestor {
                                 content: lines,
                                 raw: None,
                                 baseline: None,
+                                receipt: Some(self.tracker.issue(next_id)),
                             })
                             .await?;
-                        self.db.update_last_article_num(group_name, next_id).await?;
+                        handed_off = next_id;
                         current = next_id;
+                        if handed_off.saturating_sub(committed) >= MARK_COMMIT_BATCH {
+                            committed = self
+                                .commit_article_mark(group_name, committed, handed_off)
+                                .await?;
+                        }
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -421,7 +466,10 @@ impl Ingestor {
                                 break;
                             } else {
                                 warn!("Article {} missing (423) below tip, skipping", next_id);
-                                self.db.update_last_article_num(group_name, next_id).await?;
+                                // Nothing was handed downstream, so there is
+                                // nothing to confirm: the article does not
+                                // exist and never will.
+                                handed_off = next_id;
                                 current = next_id;
                             }
                         } else {
@@ -438,6 +486,11 @@ impl Ingestor {
                         }
                     }
                 }
+            }
+
+            if handed_off > committed {
+                self.commit_article_mark(group_name, committed, handed_off)
+                    .await?;
             }
         }
 
@@ -551,6 +604,9 @@ impl Ingestor {
                         content: Vec::new(),
                         raw: Some(content),
                         baseline: None,
+                        // The archive keeps the blob, so a crash here costs
+                        // nothing more than reading it again.
+                        receipt: None,
                     })
                     .await?;
 
