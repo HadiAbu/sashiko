@@ -1745,9 +1745,8 @@ async fn run_review_tool_with_cmd(
         &settings.review.worktree_dir,
         "--ai-provider",
         match settings.ai.provider.as_str() {
-            "claude" | "stdio-claude" | "claude-cli" | "codex-cli" | "copilot-cli" | "kiro-cli" => {
-                "stdio-claude"
-            }
+            "claude" | "stdio-claude" | "claude-cli" | "codex-cli" | "copilot-cli" | "kiro-cli"
+            | "goose" | "goose-cli" => "stdio-claude",
             _ => "stdio-gemini",
         },
     ]);
