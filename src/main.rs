@@ -817,16 +817,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Warn when the loopback bypass is on, because it is only safe on a host
-    // that no reverse proxy forwards to.
-    if settings.server.trust_loopback {
-        warn!(
-            "server.trust_loopback is enabled: any caller on the loopback interface \
-             may ingest, review and cancel without authenticating. A reverse proxy \
-             forwarding to this address would extend that to the whole internet."
-        );
-    }
-
     // Start Ingestor (feeds raw_tx)
     let ingestor_handle = if !(settings.forge.enabled && settings.forge.disable_nntp) {
         let ingestor = Ingestor::new(

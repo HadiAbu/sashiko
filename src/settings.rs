@@ -431,19 +431,19 @@ pub enum Permission {
 }
 
 impl Permission {
-    /// Whether a credential-free request from a loopback address may exercise
-    /// this capability.
+    /// Whether a caller holding the server's local token may exercise this
+    /// capability without presenting an identity.
     ///
-    /// The bypass exists so a developer running the server locally can drive it
-    /// without configuring a JWT secret, and it is tolerable only where the
-    /// blast radius is that local instance. Authority over a Linux kernel bug
-    /// is deliberately not a Permission: it is resolved per bug by
-    /// BugPrincipal, which never reaches this path, so no amount of local
-    /// access opens the bug database.
+    /// The token exists so a developer running the server can drive it without
+    /// configuring a JWT secret, and it is tolerable only where the blast
+    /// radius is that local instance. Authority over a Linux kernel bug is
+    /// deliberately not a Permission: it is resolved per bug by BugPrincipal,
+    /// which never reaches this path, so no amount of local access opens the
+    /// bug database.
     ///
     /// The match is exhaustive rather than defaulted so that a capability
-    /// added later is not bypassable until someone writes it down here.
-    pub fn allows_loopback_bypass(self) -> bool {
+    /// added later is not reachable until someone writes it down here.
+    pub fn granted_by_local_token(self) -> bool {
         match self {
             Permission::Ingest => true,
             Permission::Cancel => true,
@@ -575,21 +575,6 @@ pub struct ServerSettings {
     /// developer machine with no real users.
     #[serde(default)]
     pub log_sign_in_links: bool,
-    /// Grants unauthenticated ingest, review and cancel to callers arriving on
-    /// the loopback interface.
-    ///
-    /// This has to be opted into, because the interface on its own proves
-    /// nothing. The deployed topology binds loopback and puts a reverse proxy
-    /// in front of it, so a request from the public internet also arrives from
-    /// loopback. Whether a proxy is present cannot be inferred either: a proxy
-    /// only forwards the usual markers when it is configured to, and nginx
-    /// forwards none of them unless told, so a missing header is
-    /// indistinguishable from a genuinely local caller.
-    ///
-    /// Leaving this off is therefore the only safe default. Turn it on for a
-    /// workstation that is not behind a proxy.
-    #[serde(default)]
-    pub trust_loopback: bool,
 
     #[serde(default)]
     pub acl: AclSettings,
@@ -1185,7 +1170,6 @@ mod tests {
             testing_mode: false,
             jwt_secret: None,
             log_sign_in_links: false,
-            trust_loopback: false,
             acl: AclSettings::default(),
         };
         assert_eq!(server.sign_in_base_url(), "https://sashiko.example.org");

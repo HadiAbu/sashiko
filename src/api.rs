@@ -523,6 +523,9 @@ fn generate_synthetic_id(prefix: &str) -> String {
 
 async fn submit_patch(
     auth: crate::auth::OptionalAuthUser,
+    // Logged on a refusal to give an operator something to grep for. It is
+    // deliberately not passed to is_authorized: where a request comes from
+    // decides nothing.
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
@@ -533,13 +536,12 @@ async fn submit_patch(
     }
 
     if !is_authorized(
-        &addr,
         &state,
         &headers,
         auth.0.as_ref(),
         crate::settings::Permission::Ingest,
     ) {
-        info!("Refused patch submission from non-localhost: {}", addr);
+        info!("Refused unauthorized patch submission from {}", addr);
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -1680,7 +1682,6 @@ async fn stats_tools(
 
 async fn rerun_patchset(
     auth: crate::auth::OptionalAuthUser,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
@@ -1693,7 +1694,6 @@ async fn rerun_patchset(
     }
 
     if !is_authorized(
-        &addr,
         &state,
         &headers,
         auth.0.as_ref(),
@@ -1723,7 +1723,6 @@ async fn rerun_patchset(
 
 async fn cancel_patchset(
     auth: crate::auth::OptionalAuthUser,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<CancelQuery>,
@@ -1736,7 +1735,6 @@ async fn cancel_patchset(
     }
 
     if !is_authorized(
-        &addr,
         &state,
         &headers,
         auth.0.as_ref(),
@@ -1778,7 +1776,6 @@ async fn cancel_patchset(
 
 async fn rerun_patch(
     auth: crate::auth::OptionalAuthUser,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<RerunPatchQuery>,
@@ -1791,7 +1788,6 @@ async fn rerun_patch(
     }
 
     if !is_authorized(
-        &addr,
         &state,
         &headers,
         auth.0.as_ref(),
@@ -1827,11 +1823,10 @@ async fn health_check() -> StatusCode {
 
 async fn get_config(
     auth: crate::auth::OptionalAuthUser,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let is_auth = |perm| is_authorized(&addr, &state, &headers, auth.0.as_ref(), perm);
+    let is_auth = |perm| is_authorized(&state, &headers, auth.0.as_ref(), perm);
     let can_review = !state.read_only && is_auth(crate::settings::Permission::Review);
     let can_cancel = !state.read_only && is_auth(crate::settings::Permission::Cancel);
     let can_ingest = !state.read_only && is_auth(crate::settings::Permission::Ingest);
@@ -2404,7 +2399,6 @@ mod tests {
         // switched off, so only the token can be what admits it.
         let mut settings = crate::settings::Settings::new().unwrap();
         settings.server.testing_mode = false;
-        settings.server.trust_loopback = false;
         settings.server.acl = crate::settings::AclSettings::default();
         let settings = Arc::new(settings);
 
@@ -2697,13 +2691,14 @@ mod tests {
         settings.server.acl.security = vec!["security@example.org".to_string()];
         settings.server.acl.admins = vec!["operator@example.org".to_string()];
         settings.server.acl.blocklist = Vec::new();
-        // The capability assertions below exercise the loopback bypass, which
-        // no longer applies unless the deployment vouches for the topology.
-        settings.server.trust_loopback = true;
 
         let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+
+        // The capability assertions further down turn on this, since an
+        // identity in the security list holds no capability of its own.
+        let local_token = crate::auth::LocalToken::generate().unwrap();
 
         let app = build_router(
             settings.clone(),
@@ -2712,6 +2707,7 @@ mod tests {
             fetch_tx,
             ServerOptions {
                 dry_run: true,
+                local_token: Some(local_token.clone()),
                 ..Default::default()
             },
         );
@@ -3084,25 +3080,30 @@ mod tests {
         // Test 6: get_config reports capabilities, and a remote unauthenticated
         // action is denied with a clear message. Bug authority is deliberately
         // absent from that report, since it is per bug rather than global.
-        let cfg_loopback: serde_json::Value = get(format!("http://{}/api/config", addr))
+        //
+        // The security list holds no capability of its own, so an identity
+        // alone reports none, however local the caller is.
+        let cfg_identity: serde_json::Value = get(format!("http://{}/api/config", addr))
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        assert_eq!(cfg_loopback["permissions"]["review"], true);
-        assert!(cfg_loopback["permissions"]["action"].is_null());
+        assert_eq!(cfg_identity["permissions"]["review"], false);
+        assert!(cfg_identity["permissions"]["action"].is_null());
 
-        let cfg_remote: serde_json::Value = client
+        // Presenting the token the server published is what grants them.
+        let cfg_local: serde_json::Value = reqwest::Client::new()
             .get(format!("http://{}/api/config", addr))
-            .header("x-forwarded-for", "203.0.113.1")
+            .bearer_auth(local_token.secret())
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        assert_eq!(cfg_remote["permissions"]["review"], false);
+        assert_eq!(cfg_local["permissions"]["review"], true);
+        assert!(cfg_local["permissions"]["action"].is_null());
 
         let remote_denied = reqwest::Client::new()
             .post(format!("http://{}/api/bug/action?id={}", addr, bug_id))
@@ -3295,7 +3296,6 @@ mod tests {
         // 8. Test is_authorized directly:
         let mut proxy_headers = axum::http::HeaderMap::new();
         proxy_headers.insert("x-forwarded-for", "203.0.113.195".parse().unwrap());
-        let dummy_addr = "127.0.0.1:12345".parse().unwrap();
         let state_arc = Arc::new(AppState {
             settings: settings.clone(),
             db: db.clone(),
@@ -3320,7 +3320,6 @@ mod tests {
 
         let blocked_user = crate::auth::AuthUser::new("blocked@example.com");
         assert!(!is_authorized(
-            &dummy_addr,
             &state_arc,
             &proxy_headers,
             Some(&blocked_user),
@@ -3329,7 +3328,6 @@ mod tests {
 
         let empty_headers = axum::http::HeaderMap::new();
         assert!(!is_authorized(
-            &dummy_addr,
             &state_arc,
             &empty_headers,
             Some(&blocked_user),
@@ -3338,7 +3336,6 @@ mod tests {
 
         let allowed_user = crate::auth::AuthUser::new("reviewer@example.com");
         assert!(is_authorized(
-            &dummy_addr,
             &state_arc,
             &proxy_headers,
             Some(&allowed_user),
@@ -3717,14 +3714,12 @@ mod tests {
 
         let blocked = crate::auth::AuthUser::new("blocked@example.org");
         let operator = crate::auth::AuthUser::new("operator@example.org");
-        let addr = "127.0.0.1:12345".parse().unwrap();
         let headers = axum::http::HeaderMap::new();
 
         for (testing_mode, allow_all_submit) in [(true, false), (false, true), (true, true)] {
             let state = state_with(testing_mode, allow_all_submit);
             assert!(
                 !is_authorized(
-                    &addr,
                     &state,
                     &headers,
                     Some(&blocked),
@@ -3736,7 +3731,6 @@ mod tests {
             );
             assert!(
                 is_authorized(
-                    &addr,
                     &state,
                     &headers,
                     Some(&operator),
@@ -3748,7 +3742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_loopback_grants_nothing_until_the_topology_is_vouched_for() {
+    async fn test_loopback_grants_nothing_without_the_token() {
         let db_settings = crate::settings::DatabaseSettings {
             url: ":memory:".to_string(),
             token: String::new(),
@@ -3756,9 +3750,8 @@ mod tests {
         let db = Arc::new(Database::new(&db_settings).await.unwrap());
         db.migrate().await.unwrap();
 
-        let state_with = |trust_loopback: bool| {
+        let state_with = |local_token: Option<crate::auth::LocalToken>| {
             let mut settings = crate::settings::Settings::new().unwrap();
-            settings.server.trust_loopback = trust_loopback;
             settings.server.testing_mode = false;
             let (event_tx, _event_rx) = mpsc::channel(10);
             let (fetch_tx, _fetch_rx) = mpsc::channel(10);
@@ -3772,7 +3765,7 @@ mod tests {
                 allow_all_submit: false,
                 smtp_enabled: false,
                 dry_run: true,
-                local_token: None,
+                local_token,
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
                 stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3785,47 +3778,62 @@ mod tests {
             })
         };
 
-        let addr = "127.0.0.1:12345".parse().unwrap();
+        let token = crate::auth::LocalToken::generate().unwrap();
         let bare = axum::http::HeaderMap::new();
 
+        let mut presented = axum::http::HeaderMap::new();
+        presented.insert(
+            "authorization",
+            format!("Bearer {}", token.secret()).parse().unwrap(),
+        );
+
         // The dangerous shape: a reverse proxy that forwards no markers makes
-        // every remote request look exactly like this one. Refusing by default
-        // is what stops a proxy nobody configured from publishing the bypass.
+        // every remote request look exactly like a local one, so arriving on
+        // loopback buys nothing at all.
         assert!(
             !is_authorized(
-                &addr,
-                &state_with(false),
+                &state_with(None),
                 &bare,
                 None,
                 crate::settings::Permission::Review
             ),
-            "loopback granted review without the deployment vouching for it"
+            "a request was authorized for its source address"
+        );
+
+        // Holding the token is the whole of the claim, so failing to present
+        // one the server did publish is no different.
+        assert!(
+            !is_authorized(
+                &state_with(Some(token.clone())),
+                &bare,
+                None,
+                crate::settings::Permission::Review
+            ),
+            "a caller that presented nothing was admitted"
         );
 
         assert!(
             is_authorized(
-                &addr,
-                &state_with(true),
-                &bare,
+                &state_with(Some(token.clone())),
+                &presented,
                 None,
                 crate::settings::Permission::Review
             ),
-            "an opted-in deployment lost its loopback bypass"
+            "the token was refused"
         );
 
-        // Where a marker does appear it proves the caller is remote, so it
-        // still overrides the opt-in.
-        let mut forwarded = axum::http::HeaderMap::new();
+        // Proxy markers used to veto the old bypass. They are irrelevant now:
+        // what the caller can present does not change with the route it took.
+        let mut forwarded = presented.clone();
         forwarded.insert("x-forwarded-for", "203.0.113.195".parse().unwrap());
         assert!(
-            !is_authorized(
-                &addr,
-                &state_with(true),
+            is_authorized(
+                &state_with(Some(token)),
                 &forwarded,
                 None,
                 crate::settings::Permission::Review
             ),
-            "a forwarded request was treated as local"
+            "a header a caller controls changed the answer"
         );
     }
 
@@ -4185,8 +4193,13 @@ F:	net/
     }
 }
 
+/// Whether the caller may exercise a capability.
+///
+/// The request's source address is deliberately not an input. A reverse proxy
+/// terminates in front of the service and forwards from loopback, so the
+/// address distinguishes nothing: a caller is trusted for what it can present,
+/// not for where it appears to come from.
 pub fn is_authorized(
-    addr: &std::net::SocketAddr,
     state: &std::sync::Arc<AppState>,
     headers: &axum::http::HeaderMap,
     auth: Option<&crate::auth::AuthUser>,
@@ -4194,9 +4207,9 @@ pub fn is_authorized(
 ) -> bool {
     // The blocklist is a revocation, so it outranks every bypass below it. It
     // can only match an address the caller actually presented; a blocklisted
-    // person who omits their token and calls from loopback is covered by the
-    // loopback bypass's trust assumption instead, and that bypass does not
-    // reach bug routes.
+    // person who omits their credential and presents the local token instead
+    // has proved only that they share the server's machine, which grants no
+    // authority over a bug.
     if auth.is_some_and(|user| state.settings.server.acl.is_blocklisted(&user.email)) {
         return false;
     }
@@ -4208,28 +4221,12 @@ pub fn is_authorized(
     }
 
     // A caller holding this process's token has read a file only the server's
-    // own user can read, which is a stronger claim than the loopback bypass
-    // below makes and does not depend on the topology in front of us. It is
-    // gated on the same capabilities, so it reaches no further than that
-    // bypass would; bug routes resolve their own principal and never call
-    // here.
-    if presents_local_token(headers, state) && perm.allows_loopback_bypass() {
+    // own user can read. Nothing else about where the request came from is
+    // consulted: the source address cannot distinguish a local caller from an
+    // internet one a reverse proxy forwarded, so it is not evidence of
+    // anything. Bug routes resolve their own principal and never call here.
+    if presents_local_token(headers, state) && perm.granted_by_local_token() {
         return true;
-    }
-    if state.settings.server.trust_loopback
-        && addr.ip().to_canonical().is_loopback()
-        && perm.allows_loopback_bypass()
-    {
-        // A forwarded request also reaches us from loopback, so these markers
-        // still veto the bypass where they appear. They cannot be relied on to
-        // appear at all, which is why the operator has to vouch for the
-        // topology above rather than leaving it to be guessed here.
-        let forwarded = headers.contains_key("x-forwarded-for")
-            || headers.contains_key("x-real-ip")
-            || headers.contains_key("forwarded");
-        if !forwarded {
-            return true;
-        }
     }
 
     if let Some(user) = auth {

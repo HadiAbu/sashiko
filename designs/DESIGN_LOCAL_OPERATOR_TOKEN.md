@@ -137,8 +137,8 @@ Residual risks, accepted:
 
 - **Document `trust_loopback = true`.** One line of configuration, but it
   restores exactly the property that was deliberately removed, and it is
-  unsafe on the deployed topology. Rejected as the primary answer; the setting
-  stays, documented in `Settings.toml`, for operators who know their topology.
+  unsafe on the deployed topology. Rejected, and the setting was removed
+  outright once the token covered every local caller: see below.
 - **Have the benchmark mint a JWT from `server.jwt_secret`.** Works on a machine
   that already configures a secret and an admin, which is not zero configuration
   and does not help a fresh checkout. It also teaches a local tool to forge
@@ -173,3 +173,28 @@ Each step is a separate commit.
   and confirm the entries ingest.
 - Manual: with the token file removed, confirm the benchmark aborts in phase 1
   with the 403 and the explanation rather than hanging in phase 2.
+
+## Follow-on: the loopback distinction was removed entirely
+
+With every local tool presenting the token, nothing was left that needed the
+source address, so the address stopped being consulted at all:
+
+- `server.trust_loopback` and its branch in `is_authorized` are gone, along with
+  the `x-forwarded-for` / `x-real-ip` / `forwarded` veto that partially
+  compensated for the bypass being topology-blind. `is_authorized` no longer
+  takes the peer address.
+- `Permission::allows_loopback_bypass` became `granted_by_local_token`. It still
+  matches exhaustively, so a capability added later is unreachable by the token
+  until someone decides it should be.
+- The forge webhook's secretless fallback accepted anything from loopback, which
+  behind a reverse proxy meant anything at all. It now requires the token, the
+  webhook signature, or the explicit unsafe flag.
+
+The caller that loses out is one on the same machine that cannot read the token
+file: a different local user, or a container sharing the network namespace.
+Neither should ever have been trusted, and the loopback bypass could not tell
+either of them apart from the internet.
+
+`--enable-unsafe-all-submit` stays. It is an explicit statement by an operator
+rather than an inference about the network, which is the distinction this whole
+change turns on.
