@@ -2601,7 +2601,8 @@ impl Database {
                        WHERE attempt_count < ?4
                          AND lifecycle_status != 'duplicate'
                          AND (pipeline_state IN ('pending', 'failed')
-                              OR (pipeline_state = 'running' AND lease_expires_at < ?3))
+                              OR (pipeline_state = 'running'
+                                  AND (lease_expires_at IS NULL OR lease_expires_at < ?3)))
                        ORDER BY created_at ASC
                        LIMIT 1
                   )
@@ -2649,7 +2650,8 @@ impl Database {
                         audit_model = NULL
                   WHERE attempt_count >= ?2
                     AND (pipeline_state IN ('pending', 'failed')
-                         OR (pipeline_state = 'running' AND lease_expires_at < ?1))",
+                         OR (pipeline_state = 'running'
+                             AND (lease_expires_at IS NULL OR lease_expires_at < ?1)))",
                 libsql::params![now, max_attempts],
             )
             .await?;
@@ -2662,7 +2664,7 @@ impl Database {
         Ok(count as usize)
     }
 
-    /// Requeues bugs whose lease expired because the worker holding it died.
+    /// Requeues bugs that are marked running but hold no valid lease.
     ///
     /// Only the pipeline state is touched. Triage state is owned by humans and
     /// must survive a crash untouched.
@@ -2670,6 +2672,12 @@ impl Database {
     /// Claiming already reclaims expired leases on its own, so this exists to
     /// make the requeue visible in the bug list rather than leaving a dead
     /// worker's bugs displayed as running until someone happens to claim them.
+    ///
+    /// A missing lease counts as reclaimable alongside an expired one. Claiming
+    /// sets the state and the lease in one statement, so a running bug without
+    /// a lease is always the residue of a release that skipped the state, and
+    /// matching only on `lease_expires_at < now` would silently skip it forever
+    /// because a NULL comparison is never true.
     pub async fn recover_stale_running_bugs(&self) -> Result<usize> {
         let now = chrono::Utc::now().timestamp();
         let count = self
@@ -2683,7 +2691,8 @@ impl Database {
                         audit_author = 'system',
                         audit_tool = 'sashiko:linux_bug',
                         audit_model = NULL
-                  WHERE pipeline_state = 'running' AND lease_expires_at < ?1",
+                  WHERE pipeline_state = 'running'
+                    AND (lease_expires_at IS NULL OR lease_expires_at < ?1)",
                 libsql::params![now],
             )
             .await?;
@@ -13091,6 +13100,67 @@ mod tests {
             .get(0)
             .unwrap();
         assert_eq!(running_without_lease, 0);
+    }
+
+    /// A lease that is absent rather than expired must still be reclaimable.
+    /// NULL never satisfies `lease_expires_at < now`, so a predicate written
+    /// only against expiry leaves such a row running for good.
+    #[tokio::test]
+    async fn test_recovery_reclaims_running_bug_with_no_lease() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-leaseless").await;
+        db.claim_pending_bug("worker-a", 3600, 10)
+            .await
+            .unwrap()
+            .expect("should claim bug");
+
+        // Drop the lease but leave the pipeline running, which is what a
+        // release that forgets the state leaves behind.
+        db.release_bug_lease(bug_id).await.unwrap();
+        let stranded = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(stranded.pipeline_state, BugPipelineState::Running);
+        // The lease is not projected onto the read model, so read the column.
+        let lease: Option<i64> = db
+            .conn
+            .query(
+                "SELECT lease_expires_at FROM bugs WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert!(lease.is_none());
+
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 1);
+        let recovered = db.get_bug(bug_id).await.unwrap().unwrap();
+        assert_eq!(recovered.pipeline_state, BugPipelineState::Pending);
+
+        // Claiming must reach the same row even without the sweep above.
+        db.release_bug_lease(bug_id).await.unwrap();
+        db.conn
+            .execute(
+                "UPDATE bugs SET pipeline_state = 'running' WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await
+            .unwrap();
+        let reclaimed = db
+            .claim_pending_bug("worker-b", 3600, 10)
+            .await
+            .unwrap()
+            .expect("a running bug with no lease must be claimable");
+        assert_eq!(reclaimed.id, bug_id);
     }
 
     /// A folded bug is a tombstone. Re-analysing it would spend the budget to
