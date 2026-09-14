@@ -123,6 +123,16 @@ pub struct MailingListsSettings {
     pub track: Vec<String>,
 }
 
+/// Reads a list written either as a TOML array or as one comma separated
+/// string.
+///
+/// The second form exists for the environment, which has no arrays: a
+/// deployment that sets a list through SASHIKO__* would otherwise fail to
+/// start with "invalid type: string, expected a sequence", and its only
+/// recourse would be to bake the value into Settings.toml.
+///
+/// Empty entries are dropped, so a trailing comma and an empty variable both
+/// mean what they look like rather than naming a list with a blank member.
 fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -456,28 +466,33 @@ impl Permission {
 /// By default (if omitted), all vectors are safely initialized empty (Fail-Closed).
 /// Users must explicitly be added to the necessary capability lists to perform mutations.
 /// The `blocklist` explicitly denies all capabilities, overriding any grants.
+///
+/// Every list reads a comma separated string as well as an array, because who
+/// holds a capability is deployment state rather than a property of the
+/// program: an image ships one Settings.toml and each deployment has to be
+/// able to name its own operators through the environment.
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct AclSettings {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub admins: Vec<String>,
     /// The kernel security list. Reads and comments on every bug, and reads
     /// the raw analysis transcripts, without gaining any of the capabilities
     /// below.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub security: Vec<String>,
     /// Principals allowed to file a bug over HTTP. Empty means only operators
     /// can, which is the shipped configuration.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub bug_reporters: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub ingest: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub cancel: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub review: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub blocklist: Vec<String>,
 }
 
@@ -1242,5 +1257,30 @@ mod tests {
             settings.local_token_path(),
             Path::new(".").join(LOCAL_TOKEN_FILE_NAME)
         );
+    }
+
+    /// An environment variable is always a string, so a list spelled that way
+    /// has to mean the same thing as the array a file writes.
+    #[test]
+    fn test_acl_lists_read_a_string_as_well_as_an_array() {
+        let from_env: AclSettings = serde_json::from_str(
+            r#"{"admins": "first@example.org, second@example.org", "security": ""}"#,
+        )
+        .unwrap();
+        assert_eq!(from_env.admins, ["first@example.org", "second@example.org"]);
+        assert!(
+            from_env.security.is_empty(),
+            "an empty variable grants nothing"
+        );
+
+        let from_file: AclSettings =
+            serde_json::from_str(r#"{"admins": ["first@example.org"]}"#).unwrap();
+        assert_eq!(from_file.admins, ["first@example.org"]);
+
+        // An omitted list stays fail-closed rather than becoming a list with
+        // one blank member that matches a caller presenting no address.
+        let omitted: AclSettings = serde_json::from_str("{}").unwrap();
+        assert!(omitted.admins.is_empty());
+        assert!(!omitted.is_admin(""));
     }
 }
