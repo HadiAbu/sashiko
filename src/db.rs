@@ -25,6 +25,14 @@ pub struct Database {
     bug_actor: String,
     bug_tool: String,
     bug_model: Option<String>,
+    bug_claim: Option<BugAnalysisClaim>,
+}
+
+/// Ownership of one analysis attempt, separate from its audit attribution.
+#[derive(Clone)]
+struct BugAnalysisClaim {
+    bug_id: i64,
+    owner: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1005,6 +1013,7 @@ impl Database {
             bug_actor: author.into(),
             bug_tool: tool.into(),
             bug_model: model,
+            bug_claim: self.bug_claim.clone(),
         }
     }
 
@@ -1015,7 +1024,53 @@ impl Database {
             bug_actor: self.bug_actor.clone(),
             bug_tool: self.bug_tool.clone(),
             bug_model: self.bug_model.clone(),
+            bug_claim: self.bug_claim.clone(),
         }
+    }
+
+    /// Binds analysis writes to the exact attempt that claimed this bug.
+    pub fn with_bug_claim(&self, bug_id: i64, owner: &str) -> Self {
+        let mut scoped = self.with_connection(self.conn.clone());
+        scoped.bug_claim = Some(BugAnalysisClaim {
+            bug_id,
+            owner: owner.into(),
+        });
+        scoped
+    }
+
+    /// Checks ownership under the same write lock as the ensuing mutation.
+    async fn begin_bug_write(&self, bug_id: i64) -> Result<libsql::Transaction> {
+        if self
+            .bug_claim
+            .as_ref()
+            .is_some_and(|claim| claim.bug_id != bug_id)
+        {
+            bail!("Analysis claim belongs to a different bug");
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+        if let Some(claim) = &self.bug_claim {
+            let held = {
+                let mut rows = tx
+                    .query(
+                        "SELECT 1 FROM bugs WHERE id = ? AND locked_by = ?
+                     AND lease_expires_at >= ? AND pipeline_state IN ('running', 'succeeded')",
+                        libsql::params![
+                            claim.bug_id,
+                            claim.owner.as_str(),
+                            chrono::Utc::now().timestamp()
+                        ],
+                    )
+                    .await?;
+                rows.next().await?.is_some()
+            };
+            if !held {
+                bail!("Bug analysis lease is no longer held");
+            }
+        }
+        Ok(tx)
     }
 
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
@@ -1298,6 +1353,7 @@ impl Database {
             bug_actor: "system".into(),
             bug_tool: "sashiko".into(),
             bug_model: None,
+            bug_claim: None,
         })
     }
 
@@ -1791,6 +1847,23 @@ impl Database {
     }
 
     pub async fn add_bug_enrichment(
+        &self,
+        bug_id: i64,
+        enrichment: &NewBugEnrichment,
+    ) -> Result<i64> {
+        if self.bug_claim.is_none() {
+            return self.insert_bug_enrichment(bug_id, enrichment).await;
+        }
+        let tx = self.begin_bug_write(bug_id).await?;
+        let id = self
+            .with_connection((*tx).clone())
+            .insert_bug_enrichment(bug_id, enrichment)
+            .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn insert_bug_enrichment(
         &self,
         bug_id: i64,
         enrichment: &NewBugEnrichment,
@@ -2644,12 +2717,13 @@ impl Database {
     /// The pipeline state is left alone: whoever completed the run has already
     /// recorded the outcome, and overwriting it here would race with them.
     pub async fn release_bug_lease(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute(
-                "UPDATE bugs SET locked_by = NULL, lease_expires_at = NULL WHERE id = ?",
-                libsql::params![id],
-            )
-            .await?;
+        let tx = self.begin_bug_write(id).await?;
+        tx.execute(
+            "UPDATE bugs SET locked_by = NULL, lease_expires_at = NULL WHERE id = ?",
+            libsql::params![id],
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2676,8 +2750,9 @@ impl Database {
                     SET lease_expires_at = ?1
                   WHERE id = ?2
                     AND locked_by = ?3
-                    AND pipeline_state = 'running'",
-                libsql::params![now + lease_ttl_seconds, id, worker_id],
+                    AND pipeline_state IN ('running', 'succeeded')
+                    AND lease_expires_at >= ?4",
+                libsql::params![now + lease_ttl_seconds, id, worker_id, now],
             )
             .await?;
         Ok(updated > 0)
@@ -2789,13 +2864,14 @@ impl Database {
     /// whether the underlying defect is real.
     pub async fn fail_bug_analysis(&self, id: i64, error: &str) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        self.conn
+        let tx = self.begin_bug_write(id).await?;
+        let changed = tx
             .execute(
                 "UPDATE bugs
                  SET pipeline_state = ?, last_error = ?, locked_by = NULL,
                      lease_expires_at = NULL, updated_at = ?,
                      audit_author = ?, audit_tool = ?, audit_model = ?
-                 WHERE id = ?",
+                 WHERE id = ? AND (? = 0 OR pipeline_state = 'running')",
                 libsql::params![
                     BugPipelineState::Failed.as_str(),
                     error,
@@ -2804,9 +2880,14 @@ impl Database {
                     self.bug_tool.as_str(),
                     self.bug_model.clone(),
                     id,
+                    self.bug_claim.is_some() as i64,
                 ],
             )
             .await?;
+        if self.bug_claim.is_some() && changed == 0 {
+            bail!("A completed analysis cannot be marked failed");
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2895,7 +2976,7 @@ impl Database {
         id: i64,
         params: UpdateBugOutcomeParams<'_>,
     ) -> Result<()> {
-        let tx = self.conn.transaction().await?;
+        let tx = self.begin_bug_write(id).await?;
         self.with_connection((*tx).clone())
             .write_bug_outcome(id, params)
             .await?;
@@ -2945,7 +3026,7 @@ impl Database {
                 "locations": params.locations,
                 "source_files": params.source_files,
             });
-            self.add_bug_enrichment(
+            self.insert_bug_enrichment(
                 id,
                 &NewBugEnrichment {
                     kind: "verification".to_string(),
@@ -2960,7 +3041,7 @@ impl Database {
         }
 
         if let Some(intro) = params.introduced_in_commit {
-            self.add_bug_enrichment(
+            self.insert_bug_enrichment(
                 id,
                 &NewBugEnrichment {
                     kind: "origin_discovery".to_string(),
@@ -2977,7 +3058,7 @@ impl Database {
         }
 
         if params.severity != Severity::Unknown {
-            self.add_bug_enrichment(
+            self.insert_bug_enrichment(
                 id,
                 &NewBugEnrichment {
                     kind: "severity_calibration".to_string(),
@@ -2998,7 +3079,7 @@ impl Database {
         }
 
         if !params.inline_review.is_empty() || params.logs.is_some() {
-            self.add_bug_enrichment(
+            self.insert_bug_enrichment(
                 id,
                 &NewBugEnrichment {
                     kind: if params.inline_review.is_empty() {
@@ -3356,6 +3437,25 @@ impl Database {
         bug_id: i64,
         is_newly_discovered: bool,
     ) -> Result<()> {
+        let Some(claim) = &self.bug_claim else {
+            return self
+                .insert_bug_review(review_id, bug_id, is_newly_discovered)
+                .await;
+        };
+        let tx = self.begin_bug_write(claim.bug_id).await?;
+        self.with_connection((*tx).clone())
+            .insert_bug_review(review_id, bug_id, is_newly_discovered)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn insert_bug_review(
+        &self,
+        review_id: i64,
+        bug_id: i64,
+        is_newly_discovered: bool,
+    ) -> Result<()> {
         self.conn
             .execute(
                 "INSERT INTO bug_reviews (review_id, bug_id, is_newly_discovered)
@@ -3375,7 +3475,7 @@ impl Database {
     /// Returns false when automatic deduplication preserves existing triage.
     pub async fn mark_bug_as_duplicate(&self, params: MarkDuplicateBugParams<'_>) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
-        let tx = self.conn.transaction().await?;
+        let tx = self.begin_bug_write(params.ephemeral_id).await?;
 
         // Both probes are scoped so their cursors close before the writes
         // below. libsql refuses to commit a transaction that still has a
@@ -3424,11 +3524,15 @@ impl Database {
         // still owed once the finding lives on the canonical bug.
         tx.execute(
             "UPDATE bugs SET lifecycle_status = 'duplicate', duplicate_of_id = ?,
-                    pipeline_state = 'succeeded', locked_by = NULL, lease_expires_at = NULL,
+                    pipeline_state = 'succeeded',
+                    locked_by = CASE WHEN ? THEN locked_by ELSE NULL END,
+                    lease_expires_at = CASE WHEN ? THEN lease_expires_at ELSE NULL END,
                     updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ?
               WHERE id = ?",
             libsql::params![
                 params.canonical_id,
+                self.bug_claim.is_some() as i64,
+                self.bug_claim.is_some() as i64,
                 now,
                 self.bug_actor.as_str(),
                 self.bug_tool.as_str(),
@@ -13565,6 +13669,230 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn stale_analysis_cannot_write_or_clear_a_replacement_lease() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let settings = crate::settings::DatabaseSettings {
+            url: directory
+                .path()
+                .join("lease.db")
+                .to_string_lossy()
+                .into_owned(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await?;
+        db.migrate().await?;
+        let replacement_db = Database::new(&settings).await?;
+        let id = create_pending_bug(&db, "linux-lease-source").await;
+        let canonical = create_pending_bug(&db, "linux-lease-target").await;
+        db.set_bug_pipeline_state(canonical, BugPipelineState::Succeeded)
+            .await?;
+        db.conn
+            .execute_batch(
+                "INSERT INTO patchsets (id) VALUES (1);
+            INSERT INTO reviews (id, patchset_id) VALUES (1, 1);",
+            )
+            .await?;
+        // Two different attempts in one process must not share an owner value.
+        let first = "host:123:first-attempt";
+        let second = "host:123:second-attempt";
+        assert_eq!(db.claim_pending_bug(first, 300, 3).await?.unwrap().id, id);
+        let stale = db
+            .with_bug_claim(id, first)
+            .with_bug_actor("reporter", "analysis", None);
+        stale
+            .add_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "analysis".into(),
+                    content: Some("first stage".into()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(
+            stale
+                .add_bug_enrichment(canonical, &NewBugEnrichment::default())
+                .await
+                .is_err()
+        );
+        db.conn
+            .execute("UPDATE bugs SET lease_expires_at = 1 WHERE id = ?", [id])
+            .await?;
+        // Expiration alone is sufficient to revoke writes and renewal.
+        assert!(
+            stale
+                .update_bug_outcome(id, UpdateBugOutcomeParams::default())
+                .await
+                .is_err()
+        );
+        assert!(!db.renew_bug_lease(id, first, 300).await?);
+        assert_eq!(
+            replacement_db
+                .claim_pending_bug(second, 300, 3)
+                .await?
+                .unwrap()
+                .id,
+            id
+        );
+        let before = serde_json::to_value(replacement_db.get_bug(id).await?.unwrap())?;
+        for handle in [
+            stale.with_bug_actor("new actor", "new tool", Some("model".into())),
+            stale,
+        ] {
+            assert!(
+                handle
+                    .add_bug_enrichment(
+                        id,
+                        &NewBugEnrichment {
+                            kind: "report".into(),
+                            content: Some("stale report".into()),
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                handle
+                    .update_bug_outcome(
+                        id,
+                        UpdateBugOutcomeParams {
+                            lifecycle_status: BugLifecycleStatus::Open,
+                            problem: Some("stale title"),
+                            inline_review: "stale report",
+                            ..Default::default()
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                handle
+                    .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                        ephemeral_id: id,
+                        canonical_id: canonical,
+                        ..Default::default()
+                    })
+                    .await
+                    .is_err()
+            );
+            assert!(
+                handle
+                    .link_review_to_bug(1, canonical, false)
+                    .await
+                    .is_err()
+            );
+            assert!(handle.fail_bug_analysis(id, "stale failure").await.is_err());
+            assert!(handle.release_bug_lease(id).await.is_err());
+        }
+        assert_eq!(
+            serde_json::to_value(replacement_db.get_bug(id).await?.unwrap())?,
+            before
+        );
+        assert!(replacement_db.list_bugs_for_review(1).await?.is_empty());
+        assert!(replacement_db.renew_bug_lease(id, second, 300).await?);
+
+        let owner = replacement_db.with_bug_claim(id, second);
+        owner
+            .add_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "analysis".into(),
+                    content: Some("replacement stage".into()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        owner
+            .update_bug_outcome(
+                id,
+                UpdateBugOutcomeParams {
+                    lifecycle_status: BugLifecycleStatus::Open,
+                    inline_review: "replacement report",
+                    ..Default::default()
+                },
+            )
+            .await?;
+        owner.link_review_to_bug(1, id, true).await?;
+        assert!(replacement_db.renew_bug_lease(id, second, 300).await?);
+        assert!(
+            owner
+                .fail_bug_analysis(id, "error after commit")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            replacement_db.get_bug(id).await?.unwrap().pipeline_state,
+            BugPipelineState::Succeeded
+        );
+        owner.release_bug_lease(id).await?;
+        assert!(!replacement_db.renew_bug_lease(id, second, 300).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn automatic_duplicate_keeps_its_claim_until_linking_finishes() -> Result<()> {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+        let id = create_pending_bug(&db, "linux-owned-duplicate").await;
+        let canonical = create_pending_bug(&db, "linux-owned-canonical").await;
+        db.set_bug_pipeline_state(canonical, BugPipelineState::Succeeded)
+            .await?;
+        db.conn
+            .execute_batch(
+                "INSERT INTO patchsets (id) VALUES (1);
+            INSERT INTO reviews (id, patchset_id) VALUES (1, 1);",
+            )
+            .await?;
+        db.claim_pending_bug("attempt", 300, 3).await?;
+        let owner = db.with_bug_claim(id, "attempt");
+        assert!(
+            owner
+                .mark_bug_as_duplicate(MarkDuplicateBugParams {
+                    preserve_triage: true,
+                    ephemeral_id: id,
+                    canonical_id: canonical,
+                    ..Default::default()
+                })
+                .await?
+        );
+        assert!(db.renew_bug_lease(id, "attempt", 300).await?);
+        owner.link_review_to_bug(1, canonical, false).await?;
+        owner.release_bug_lease(id).await?;
+        assert_eq!(db.list_bugs_for_review(1).await?[0].0.id, canonical);
+        assert!(!db.renew_bug_lease(id, "attempt", 300).await?);
+
+        let human_fold = create_pending_bug(&db, "linux-human-duplicate").await;
+        db.claim_pending_bug("another-attempt", 300, 3).await?;
+        let cancelled = db.with_bug_claim(human_fold, "another-attempt");
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: human_fold,
+            canonical_id: canonical,
+            ..Default::default()
+        })
+        .await?;
+        assert!(
+            !db.renew_bug_lease(human_fold, "another-attempt", 300)
+                .await?
+        );
+        assert!(
+            cancelled
+                .fail_bug_analysis(human_fold, "cancelled")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            db.get_bug(human_fold).await?.unwrap().pipeline_state,
+            BugPipelineState::Succeeded
+        );
+        Ok(())
+    }
+
     /// The lease is short and the worker renews it while it works. Renewal has
     /// to hold off other workers for as long as the analysis genuinely runs,
     /// and has to refuse once the claim belongs to somebody else.
@@ -13583,10 +13911,10 @@ mod tests {
             .unwrap()
             .expect("should claim bug");
 
-        // Simulate the analysis outliving the original lease.
+        // Renew a live lease before it expires.
         db.conn
             .execute(
-                "UPDATE bugs SET lease_expires_at = 1 WHERE id = ?",
+                "UPDATE bugs SET lease_expires_at = unixepoch() + 10 WHERE id = ?",
                 libsql::params![bug_id],
             )
             .await

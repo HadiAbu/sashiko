@@ -19,19 +19,51 @@ const BUG_LEASE_TTL_SECONDS: i64 = 300;
 const BUG_LEASE_RENEW_INTERVAL_SECONDS: u64 = 60;
 const BUG_MAX_ATTEMPTS: i64 = 3;
 
-/// Stops a background task once this guard goes out of scope.
-///
-/// Dropping a bare JoinHandle detaches the task instead of stopping it, so an
-/// analysis that unwinds would leave its heartbeat renewing the lease of work
-/// nobody is doing. That row would stay claimed forever, beyond the reach of
-/// every recovery query. Aborting from Drop covers the unwinding path as well
-/// as the ordinary one.
-struct AbortOnDrop(tokio::task::AbortHandle);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
+/// Drops whichever future remains when analysis finishes or ownership is lost.
+async fn run_while_leased<T>(
+    analysis: impl std::future::Future<Output = T>,
+    lease: impl std::future::Future<Output = ()>,
+) -> Option<T> {
+    tokio::select! {
+        result = analysis => Some(result),
+        () = lease => None,
     }
+}
+
+/// Retries transient renewal errors only within the last confirmed lease.
+async fn maintain_lease(
+    db: &Database,
+    bug_id: i64,
+    owner: &str,
+    mut deadline: tokio::time::Instant,
+) {
+    loop {
+        let renewal = tokio::time::timeout_at(deadline, async {
+            sleep(Duration::from_secs(BUG_LEASE_RENEW_INTERVAL_SECONDS)).await;
+            let started = tokio::time::Instant::now();
+            (
+                started,
+                db.renew_bug_lease(bug_id, owner, BUG_LEASE_TTL_SECONDS)
+                    .await,
+            )
+        })
+        .await;
+        match renewal {
+            Ok((started, Ok(true))) => deadline = lease_deadline(started),
+            Ok((_, Ok(false))) | Err(_) => return,
+            Ok((_, Err(e))) => error!("Failed to renew the lease on bug {}: {}", bug_id, e),
+        }
+    }
+}
+
+fn lease_deadline(started: tokio::time::Instant) -> tokio::time::Instant {
+    // SQLite expiry is measured in whole seconds. Stop conservatively before
+    // the stored expiry even when the claim starts near a second boundary.
+    started + Duration::from_secs((BUG_LEASE_TTL_SECONDS - 1) as u64)
+}
+
+fn new_claim_id(worker_id: &str) -> String {
+    format!("{}:{:032x}", worker_id, fastrand::u128(..))
 }
 
 pub struct BugWorker {
@@ -72,70 +104,25 @@ impl BugWorker {
             );
         }
         loop {
+            let claim_id = new_claim_id(&self.worker_id);
+            let claim_started = tokio::time::Instant::now();
             match self
                 .db
-                .claim_pending_bug(&self.worker_id, BUG_LEASE_TTL_SECONDS, BUG_MAX_ATTEMPTS)
+                .claim_pending_bug(&claim_id, BUG_LEASE_TTL_SECONDS, BUG_MAX_ATTEMPTS)
                 .await
             {
                 Ok(Some(bug)) => {
                     let provider = self.provider.clone();
                     let db = self.db.clone();
                     let repo_path = self.repo_path.clone();
-                    let worker_id = self.worker_id.clone();
+
                     tokio::spawn(async move {
                         let actor = if !bug.reporter.is_empty() {
                             bug.reporter.as_str()
                         } else {
                             "sashiko"
                         };
-                        // A short lease only survives while something keeps
-                        // pushing it forward. Renewing for as long as the
-                        // analysis runs is what stops a pipeline that outlives
-                        // the lease from being claimed and run a second time.
-                        let heartbeat_db = db.clone();
-                        let heartbeat_worker = worker_id.clone();
-                        let heartbeat_bug = bug.id;
-                        let heartbeat = AbortOnDrop(
-                            tokio::spawn(async move {
-                                let mut ticker = tokio::time::interval(Duration::from_secs(
-                                    BUG_LEASE_RENEW_INTERVAL_SECONDS,
-                                ));
-                                // Interval fires once immediately; the claim is
-                                // already fresh, so that tick is spent here.
-                                ticker.tick().await;
-                                loop {
-                                    ticker.tick().await;
-                                    match heartbeat_db
-                                        .renew_bug_lease(
-                                            heartbeat_bug,
-                                            &heartbeat_worker,
-                                            BUG_LEASE_TTL_SECONDS,
-                                        )
-                                        .await
-                                    {
-                                        Ok(true) => {}
-                                        Ok(false) => {
-                                            warn!(
-                                                "Lease on bug {} is no longer held by {}; \
-                                                 stopping renewal",
-                                                heartbeat_bug, heartbeat_worker
-                                            );
-                                            break;
-                                        }
-                                        // A single failed renewal is survivable
-                                        // because the lease outlasts several
-                                        // intervals, so keep trying.
-                                        Err(e) => error!(
-                                            "Failed to renew the lease on bug {}: {}",
-                                            heartbeat_bug, e
-                                        ),
-                                    }
-                                }
-                            })
-                            .abort_handle(),
-                        );
-
-                        let db = db.with_bug_actor(
+                        let db = db.with_bug_claim(bug.id, &claim_id).with_bug_actor(
                             actor,
                             "sashiko:linux_bug",
                             Some(provider.get_capabilities().model_name),
@@ -179,21 +166,25 @@ impl BugWorker {
                         }
                         let tools = Some(Arc::new(tb));
 
-                        let analysis = crate::workflows::linux_bug::process_issue_worker(
-                            provider.as_ref(),
-                            tools,
-                            &db,
-                            &bug,
-                            input,
-                            Some("bug_worker"),
+                        let analysis = run_while_leased(
+                            crate::workflows::linux_bug::process_issue_worker(
+                                provider.as_ref(),
+                                tools,
+                                &db,
+                                &bug,
+                                input,
+                                Some("bug_worker"),
+                            ),
+                            maintain_lease(&db, bug.id, &claim_id, lease_deadline(claim_started)),
                         )
                         .await;
-
-                        // Renewal stops before the claim is settled. A renewal
-                        // still in flight is harmless because it matches on
-                        // locked_by, which both paths below clear, so it can
-                        // only be a no-op once they have run.
-                        drop(heartbeat);
+                        let Some(analysis) = analysis else {
+                            warn!(
+                                "Cancelled analysis of bug {} after losing its lease",
+                                bug.id
+                            );
+                            return;
+                        };
 
                         match analysis {
                             Ok(outcome) => {
@@ -208,7 +199,12 @@ impl BugWorker {
                             Err(e) => {
                                 error!("Failed to process bug {}: {}", bug.id, e);
                                 let error_msg = format!("Error during async processing: {}", e);
-                                let _ = db.fail_bug_analysis(bug.id, &error_msg).await;
+                                if let Err(e) = db.fail_bug_analysis(bug.id, &error_msg).await {
+                                    warn!(
+                                        "Could not settle failed analysis of bug {}: {}",
+                                        bug.id, e
+                                    );
+                                }
                             }
                         }
                     });
@@ -233,38 +229,79 @@ impl BugWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// An unwinding scope only drops its locals, so this is the case a bare
-    /// JoinHandle used to miss: the renewal outlived the work it was covering.
+    struct Dropped(Arc<AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
     #[tokio::test]
-    async fn guard_stops_its_task_when_the_scope_unwinds() {
-        let ticks = Arc::new(AtomicUsize::new(0));
-        let task_ticks = ticks.clone();
+    async fn losing_a_lease_drops_the_analysis() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(dropped.clone());
+        let result = run_while_leased(
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+            },
+            async {},
+        )
+        .await;
+        assert!(result.is_none());
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
-        let unwound = std::panic::AssertUnwindSafe(async move {
-            let _guard = AbortOnDrop(
-                tokio::spawn(async move {
-                    loop {
-                        task_ticks.fetch_add(1, Ordering::SeqCst);
-                        sleep(Duration::from_millis(1)).await;
-                    }
-                })
-                .abort_handle(),
-            );
-            sleep(Duration::from_millis(20)).await;
-            panic!("the analysis failed");
-        });
+    #[tokio::test]
+    async fn completion_and_unwinding_drop_renewal() {
+        for panic in [false, true] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let guard = Dropped(dropped.clone());
+            let result = std::panic::AssertUnwindSafe(run_while_leased(
+                async {
+                    assert!(!panic, "analysis unwound");
+                    42
+                },
+                async move {
+                    let _guard = guard;
+                    std::future::pending::<()>().await;
+                },
+            ));
+            let result = futures::FutureExt::catch_unwind(result).await;
+            if panic {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), Some(42));
+            }
+            assert!(dropped.load(Ordering::SeqCst));
+        }
+    }
 
-        assert!(futures::FutureExt::catch_unwind(unwound).await.is_err());
+    #[tokio::test]
+    async fn renewal_stops_at_the_last_confirmed_deadline() {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        // No schema is needed: expiry must stop the renewal before its next
+        // database request, rather than waiting another renewal interval.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            maintain_lease(&db, 1, "owner", tokio::time::Instant::now()),
+        )
+        .await
+        .unwrap();
+    }
 
-        let after_unwind = ticks.load(Ordering::SeqCst);
-        assert!(after_unwind > 0, "the task never got to run");
-        sleep(Duration::from_millis(30)).await;
-        assert_eq!(
-            after_unwind,
-            ticks.load(Ordering::SeqCst),
-            "the task kept running after its guard was dropped"
-        );
+    #[test]
+    fn attempts_from_one_process_have_distinct_claim_ids() {
+        let first = new_claim_id("host:123");
+        let second = new_claim_id("host:123");
+        assert!(first.starts_with("host:123:"));
+        assert_ne!(first, second);
     }
 }
