@@ -853,20 +853,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_db = db.clone();
     let api_tx = raw_tx.clone();
     let api_fetch_tx = fetch_tx.clone();
-    let allow_all_submit = cli.enable_unsafe_all_submit;
-    let smtp_enabled = settings.smtp.is_some();
-    let dry_run = settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false);
+    let server_options = sashiko::api::ServerOptions {
+        allow_all_submit: cli.enable_unsafe_all_submit,
+        smtp_enabled: settings.smtp.is_some(),
+        dry_run: settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false),
+    };
     let api_handle = tokio::spawn(async move {
-        if let Err(e) = sashiko::api::run_server(
-            api_settings,
-            api_db,
-            api_tx,
-            api_fetch_tx,
-            allow_all_submit,
-            smtp_enabled,
-            dry_run,
-        )
-        .await
+        if let Err(e) =
+            sashiko::api::run_server(api_settings, api_db, api_tx, api_fetch_tx, server_options)
+                .await
         {
             error!("Web API fatal error: {}", e);
         }

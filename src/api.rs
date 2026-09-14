@@ -213,6 +213,21 @@ impl SignInLinkRateLimiter {
     }
 }
 
+/// What the router needs to know about the process it runs in.
+///
+/// These are facts about this invocation rather than configuration, which is
+/// why they arrive separately from Settings. They are grouped because passing
+/// them positionally made three consecutive bools that no call site could be
+/// read against.
+#[derive(Default, Clone)]
+pub struct ServerOptions {
+    /// Accepts mutations from any address without authentication. Unsafe, and
+    /// only set by an explicit command line flag.
+    pub allow_all_submit: bool,
+    pub smtp_enabled: bool,
+    pub dry_run: bool,
+}
+
 pub struct AppState {
     pub settings: Arc<crate::settings::Settings>,
     pub db: Arc<Database>,
@@ -387,9 +402,7 @@ pub fn build_router(
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
     fetch_sender: mpsc::Sender<FetchRequest>,
-    allow_all_submit: bool,
-    smtp_enabled: bool,
-    dry_run: bool,
+    options: ServerOptions,
 ) -> Router {
     let forge_registry = Arc::new(crate::forge::ForgeRegistry::new());
     let read_only = settings.server.read_only;
@@ -401,9 +414,9 @@ pub fn build_router(
         fetch_sender,
         read_only,
         forge_registry,
-        allow_all_submit,
-        smtp_enabled,
-        dry_run,
+        allow_all_submit: options.allow_all_submit,
+        smtp_enabled: options.smtp_enabled,
+        dry_run: options.dry_run,
         sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
         stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -465,19 +478,9 @@ pub async fn run_server(
     db: Arc<Database>,
     sender: mpsc::Sender<Event>,
     fetch_sender: mpsc::Sender<FetchRequest>,
-    allow_all_submit: bool,
-    smtp_enabled: bool,
-    dry_run: bool,
+    options: ServerOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let app = build_router(
-        settings.clone(),
-        db,
-        sender,
-        fetch_sender,
-        allow_all_submit,
-        smtp_enabled,
-        dry_run,
-    );
+    let app = build_router(settings.clone(), db, sender, fetch_sender, options);
 
     let bind_addr = format!("{}:{}", settings.server.host, settings.server.port);
     let addrs: Vec<SocketAddr> = bind_addr
@@ -2463,9 +2466,7 @@ mod tests {
             db.clone(),
             event_tx,
             fetch_tx,
-            false,
-            false,
-            false,
+            ServerOptions::default(),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2603,9 +2604,10 @@ mod tests {
             db.clone(),
             event_tx,
             fetch_tx,
-            false,
-            false,
-            true,
+            ServerOptions {
+                dry_run: true,
+                ..Default::default()
+            },
         );
 
         let token = crate::auth::create_token(
@@ -3039,9 +3041,10 @@ mod tests {
             db.clone(),
             event_tx.clone(),
             fetch_tx.clone(),
-            false,
-            false,
-            true,
+            ServerOptions {
+                dry_run: true,
+                ..Default::default()
+            },
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3267,9 +3270,10 @@ mod tests {
             db.clone(),
             event_tx,
             fetch_tx,
-            false,
-            true,
-            false,
+            ServerOptions {
+                smtp_enabled: true,
+                ..Default::default()
+            },
         );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3359,9 +3363,10 @@ mod tests {
             db.clone(),
             event_tx,
             fetch_tx,
-            false,
-            true,
-            false,
+            ServerOptions {
+                smtp_enabled: true,
+                ..Default::default()
+            },
         );
 
         tokio::spawn(async move {
@@ -3516,9 +3521,10 @@ mod tests {
             db.clone(),
             event_tx,
             fetch_tx,
-            false,
-            true,
-            false,
+            ServerOptions {
+                smtp_enabled: true,
+                ..Default::default()
+            },
         );
 
         tokio::spawn(async move {
@@ -3881,9 +3887,10 @@ mod tests {
             db.clone(),
             event_tx,
             fetch_tx,
-            false,
-            false,
-            true,
+            ServerOptions {
+                dry_run: true,
+                ..Default::default()
+            },
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
