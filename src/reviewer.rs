@@ -1395,6 +1395,7 @@ impl Reviewer {
                                             patchset_id: Some(patchset_id),
                                             patch_id: Some(patch_id),
                                             baseline_sha: Some(baseline_ref.to_string()),
+                                            review_id: Some(review_id),
                                         };
                                         let repo_path = std::path::PathBuf::from(
                                             &ctx.settings.git.repository_path,
@@ -1438,7 +1439,7 @@ impl Reviewer {
                                             "sashiko:linux_patch_review",
                                             Some(ctx.provider.get_capabilities().model_name),
                                         );
-                                        match crate::workflows::linux_bug::process_issue(
+                                        if let Err(e) = crate::workflows::linux_bug::process_issue(
                                             ctx.provider.as_ref(),
                                             toolbox,
                                             &discovery_db,
@@ -1447,40 +1448,10 @@ impl Reviewer {
                                         )
                                         .await
                                         {
-                                            Ok(outcome) => match outcome {
-                                                crate::workflows::linux_bug::BugOutcome::NewlyDiscovered {
-                                                    bug,
-                                                } => {
-                                                    let _ = ctx
-                                                        .db
-                                                        .link_review_to_bug(
-                                                            review_id, bug.id, true,
-                                                        )
-                                                        .await;
-                                                }
-                                                crate::workflows::linux_bug::BugOutcome::Duplicate {
-                                                    existing_bug,
-                                                    ..
-                                                } => {
-                                                    let _ = ctx
-                                                        .db
-                                                        .link_review_to_bug(
-                                                            review_id,
-                                                            existing_bug.id,
-                                                            false,
-                                                        )
-                                                        .await;
-                                                }
-                                                crate::workflows::linux_bug::BugOutcome::Discarded {
-                                                    ..
-                                                } => {}
-                                            },
-                                            Err(e) => {
-                                                warn!(
-                                                    "Failed to process candidate pre-existing bug: {}",
-                                                    e
-                                                );
-                                            }
+                                            warn!(
+                                                "Failed to queue candidate pre-existing bug: {}",
+                                                e
+                                            );
                                         }
                                     }
                                 }

@@ -95,6 +95,7 @@ impl BugWorker {
                             patchset_id: bug.discovered_in_patchset_id,
                             patch_id: bug.discovered_in_patch_id,
                             baseline_sha: bug.discovered_in_commit.clone(),
+                            review_id: None,
                         });
 
                         let mut tb = ToolBox::new(std::path::PathBuf::from(&repo_path), None);

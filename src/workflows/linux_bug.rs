@@ -122,6 +122,8 @@ pub struct BugInput {
     pub patchset_id: Option<i64>,
     pub patch_id: Option<i64>,
     pub baseline_sha: Option<String>,
+    #[serde(default)]
+    pub review_id: Option<i64>,
 }
 
 /// The result of processing a candidate Linux kernel bug through the pipeline.
@@ -2037,6 +2039,9 @@ pub async fn process_issue_worker(
                     tokens_cached: None,
                 })
                 .await?;
+                if let Some(r_id) = input.review_id {
+                    db.link_review_to_bug(r_id, existing.id, false).await?;
+                }
                 (
                     true,
                     Some(BugOutcome::Duplicate {
@@ -2157,6 +2162,9 @@ pub async fn process_issue_worker(
     .await?;
 
     let saved_bug = db.get_bug(bug_row.id).await?.expect("Saved bug must exist");
+    if let Some(r_id) = input.review_id {
+        db.link_review_to_bug(r_id, saved_bug.id, true).await?;
+    }
     info!(
         "Successfully registered newly verified Linux kernel bug #{} ({})",
         bug_row.id, bug_row.bugid
@@ -2212,6 +2220,7 @@ mod tests {
             patchset_id: None,
             patch_id: None,
             baseline_sha: None,
+            review_id: None,
         };
 
         let mock_provider = MockAiProvider {
@@ -2273,6 +2282,20 @@ mod tests {
 
         let provider = QueuedMockAiProvider::new(vec![normalize_json, verify_json]);
 
+        let thread_id = db.create_thread("t1", "subj", 100).await.unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "m1", "subj", "auth", 100, 1, 0, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let rev_id = db
+            .create_review(ps_id, None, "gemini", "mock", None, None)
+            .await
+            .unwrap();
+
         let input = BugInput {
             problem: "NULL deref in net/core/dev.c".to_string(),
             reasoning: "ptr might be null".to_string(),
@@ -2283,6 +2306,7 @@ mod tests {
             patchset_id: None,
             patch_id: None,
             baseline_sha: None,
+            review_id: Some(rev_id),
         };
 
         let outcome = process_issue(&provider, None, &db, input.clone(), None)
@@ -2304,6 +2328,12 @@ mod tests {
             }
             _ => panic!("Expected Discarded outcome, got {:?}", final_outcome),
         }
+
+        let linked = db.list_bugs_for_review(rev_id).await.unwrap();
+        assert!(
+            linked.is_empty(),
+            "Discarded bug must NOT be linked to review"
+        );
 
         let bug = db.get_bug(1).await.unwrap().unwrap();
         assert_eq!(
@@ -2664,6 +2694,7 @@ mod tests {
             patchset_id: None,
             patch_id: None,
             baseline_sha: None,
+            review_id: None,
         };
         let BugOutcome::NewlyDiscovered { bug } =
             process_issue(&provider, None, &db, input.clone(), None)
@@ -2748,6 +2779,7 @@ mod tests {
             patchset_id: None,
             patch_id: None,
             baseline_sha: None,
+            review_id: None,
         };
         let no_files: Vec<String> = Vec::new();
         let subsystem_names: Vec<String> =
@@ -2980,6 +3012,11 @@ mod tests {
             report_text,
         ]);
 
+        let rev_id = db
+            .create_review(ps_id, None, "gemini", "mock", None, None)
+            .await
+            .unwrap();
+
         let input = BugInput {
             problem: "Buffer overflow in e1000 rx handler".to_string(),
             reasoning: "Size not checked against MTU".to_string(),
@@ -2992,11 +3029,19 @@ mod tests {
             patchset_id: Some(ps_id),
             patch_id: None,
             baseline_sha: None,
+            review_id: Some(rev_id),
         };
 
         let outcome = process_issue(&provider, None, &db, input.clone(), None)
             .await
             .unwrap();
+
+        // While pending, the bug must NOT be linked to the review yet (Invariant 2).
+        let pre_linked = db.list_bugs_for_review(rev_id).await.unwrap();
+        assert!(
+            pre_linked.is_empty(),
+            "Pending bug must NOT be linked to review yet"
+        );
 
         let final_outcome = match outcome {
             BugOutcome::NewlyDiscovered { ref bug } => {
@@ -3008,7 +3053,7 @@ mod tests {
         };
 
         match final_outcome {
-            BugOutcome::NewlyDiscovered { bug } => {
+            BugOutcome::NewlyDiscovered { ref bug } => {
                 assert_eq!(
                     bug.problem(),
                     "e1000: buffer overflow in e1000_clean_rx_irq()"
@@ -3026,6 +3071,11 @@ mod tests {
                 assert!(bug.fixed_in_commit().is_none());
                 assert!(!bug.enrichments.is_empty(), "Enrichments must be populated");
                 assert!(bug.raw_input().is_some(), "Raw input must be preserved");
+
+                let linked = db.list_bugs_for_review(rev_id).await.unwrap();
+                assert_eq!(linked.len(), 1);
+                assert_eq!(linked[0].0.id, bug.id);
+                assert!(linked[0].1, "Should be marked is_newly_discovered");
             }
             _ => panic!("Expected NewlyDiscovered outcome, got {:?}", outcome),
         }
@@ -3111,6 +3161,20 @@ mod tests {
         // Normalization, Verification, Dedup (and enrichment stages 4-6 are skipped!)
         let provider = QueuedMockAiProvider::new(vec![normalize_json, verify_json, dedup_json]);
 
+        let thread_id = db.create_thread("t1", "subj", 100).await.unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "m1", "subj", "auth", 100, 1, 0, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let rev_id = db
+            .create_review(ps_id, None, "gemini", "mock", None, None)
+            .await
+            .unwrap();
+
         let input = BugInput {
             problem: "Buffer overflow in e1000 rx handler".to_string(),
             reasoning: "Size not checked against MTU".to_string(),
@@ -3123,11 +3187,19 @@ mod tests {
             patchset_id: None,
             patch_id: None,
             baseline_sha: None,
+            review_id: Some(rev_id),
         };
 
         let outcome = process_issue(&provider, None, &db, input.clone(), None)
             .await
             .unwrap();
+
+        // While pending, the bug must NOT be linked to the review yet (Invariant 2).
+        let pre_linked = db.list_bugs_for_review(rev_id).await.unwrap();
+        assert!(
+            pre_linked.is_empty(),
+            "Pending bug must NOT be linked to review yet"
+        );
 
         let final_outcome = match outcome {
             BugOutcome::NewlyDiscovered { ref bug } => {
@@ -3148,6 +3220,14 @@ mod tests {
                 assert_eq!(existing_bug.bugid, "linux-existing1");
                 assert_eq!(reasoning, "Exact match with known bug #1 in e1000 driver");
                 assert!(logs.is_some());
+
+                let linked = db.list_bugs_for_review(rev_id).await.unwrap();
+                assert_eq!(linked.len(), 1);
+                assert_eq!(linked[0].0.id, existing_id);
+                assert!(
+                    !linked[0].1,
+                    "Duplicate bug must NOT be marked is_newly_discovered"
+                );
             }
             _ => panic!("Expected Duplicate outcome, got {:?}", final_outcome),
         }
