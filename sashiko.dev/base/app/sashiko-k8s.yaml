@@ -60,6 +60,36 @@ spec:
               memory: "115Gi"
           ports:
             - containerPort: 8080
+          # /health is served by the API with no dependencies, so it answers
+          # whenever the async runtime can still accept a connection. A tool
+          # that monopolises a runtime worker stops that from happening while
+          # the process stays alive, which reads as Running to Kubernetes and
+          # as a 502 to every caller. These probes turn that state into a
+          # restart.
+          #
+          # Startup is allowed ten minutes because a schema migration on the
+          # production database runs before the listener opens.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           env:
             - name: SASHIKO_LOG_PLAIN
               value: "true"
