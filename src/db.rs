@@ -2630,6 +2630,36 @@ impl Database {
         Ok(())
     }
 
+    /// Extends the lease on a bug this worker is still analysing.
+    ///
+    /// Returns false when the claim is gone, which means another worker has
+    /// already taken the bug over. The caller cannot win that race back, so it
+    /// should stop rather than keep spending on work that will be discarded.
+    ///
+    /// The worker is matched on purpose: renewing by id alone would let a
+    /// worker whose lease already lapsed steal the row back from whoever
+    /// legitimately claimed it next.
+    pub async fn renew_bug_lease(
+        &self,
+        id: i64,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE bugs
+                    SET lease_expires_at = ?1
+                  WHERE id = ?2
+                    AND locked_by = ?3
+                    AND pipeline_state = 'running'",
+                libsql::params![now + lease_ttl_seconds, id, worker_id],
+            )
+            .await?;
+        Ok(updated > 0)
+    }
+
     /// Moves bugs that have used up their attempts into the dead letter state.
     ///
     /// Abandoned bugs are never claimed again. Requeueing one is a deliberate
@@ -13234,6 +13264,68 @@ mod tests {
         assert!(
             !claimed.contains(&dup_id),
             "a folded bug must never be handed to a worker"
+        );
+    }
+
+    /// The lease is short and the worker renews it while it works. Renewal has
+    /// to hold off other workers for as long as the analysis genuinely runs,
+    /// and has to refuse once the claim belongs to somebody else.
+    #[tokio::test]
+    async fn test_renew_bug_lease_holds_and_detects_takeover() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let bug_id = create_pending_bug(&db, "linux-long-running").await;
+        db.claim_pending_bug("worker-a", 300, 10)
+            .await
+            .unwrap()
+            .expect("should claim bug");
+
+        // Simulate the analysis outliving the original lease.
+        db.conn
+            .execute(
+                "UPDATE bugs SET lease_expires_at = 1 WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            db.renew_bug_lease(bug_id, "worker-a", 300).await.unwrap(),
+            "the holder must be able to push its own lease forward"
+        );
+
+        // Having renewed, the bug is protected from both recovery paths.
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 0);
+        assert!(
+            db.claim_pending_bug("worker-b", 300, 10)
+                .await
+                .unwrap()
+                .is_none(),
+            "a renewed lease must keep other workers out"
+        );
+
+        // Once the lease really lapses another worker takes over, and the
+        // original holder must not be able to take it back.
+        db.conn
+            .execute(
+                "UPDATE bugs SET lease_expires_at = 1 WHERE id = ?",
+                libsql::params![bug_id],
+            )
+            .await
+            .unwrap();
+        let stolen = db
+            .claim_pending_bug("worker-b", 300, 10)
+            .await
+            .unwrap()
+            .expect("an expired lease is reclaimable");
+        assert_eq!(stolen.id, bug_id);
+        assert!(
+            !db.renew_bug_lease(bug_id, "worker-a", 300).await.unwrap(),
+            "a worker that lost the claim must not renew it"
         );
     }
 

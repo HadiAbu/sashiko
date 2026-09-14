@@ -5,9 +5,18 @@ use crate::workflows::linux_bug::BugInput;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
-const BUG_LEASE_TTL_SECONDS: i64 = 1800;
+/// How long a claim stays valid without being renewed.
+///
+/// This is deliberately far shorter than an analysis takes. The worker renews
+/// the lease while it works, so the value only has to outlast a renewal
+/// interval, and a worker that dies is noticed in minutes rather than after a
+/// whole pipeline's worth of time.
+const BUG_LEASE_TTL_SECONDS: i64 = 300;
+/// How often a running analysis pushes its lease forward. Comfortably shorter
+/// than the lease so that one failed renewal does not forfeit the claim.
+const BUG_LEASE_RENEW_INTERVAL_SECONDS: u64 = 60;
 const BUG_MAX_ATTEMPTS: i64 = 3;
 
 pub struct BugWorker {
@@ -35,8 +44,11 @@ impl BugWorker {
 
     pub async fn run(&self) {
         info!(
-            "Starting Bug Worker as {} (lease {}s, {} attempts max)...",
-            self.worker_id, BUG_LEASE_TTL_SECONDS, BUG_MAX_ATTEMPTS
+            "Starting Bug Worker as {} (lease {}s renewed every {}s, {} attempts max)...",
+            self.worker_id,
+            BUG_LEASE_TTL_SECONDS,
+            BUG_LEASE_RENEW_INTERVAL_SECONDS,
+            BUG_MAX_ATTEMPTS
         );
         if let Err(e) = self.db.recover_stale_running_bugs().await {
             error!(
@@ -54,12 +66,57 @@ impl BugWorker {
                     let provider = self.provider.clone();
                     let db = self.db.clone();
                     let repo_path = self.repo_path.clone();
+                    let worker_id = self.worker_id.clone();
                     tokio::spawn(async move {
                         let actor = if !bug.reporter.is_empty() {
                             bug.reporter.as_str()
                         } else {
                             "sashiko"
                         };
+                        // A short lease only survives while something keeps
+                        // pushing it forward. Renewing for as long as the
+                        // analysis runs is what stops a pipeline that outlives
+                        // the lease from being claimed and run a second time.
+                        let heartbeat_db = db.clone();
+                        let heartbeat_worker = worker_id.clone();
+                        let heartbeat_bug = bug.id;
+                        let heartbeat = tokio::spawn(async move {
+                            let mut ticker = tokio::time::interval(Duration::from_secs(
+                                BUG_LEASE_RENEW_INTERVAL_SECONDS,
+                            ));
+                            // Interval fires once immediately; the claim is
+                            // already fresh, so that tick is spent here.
+                            ticker.tick().await;
+                            loop {
+                                ticker.tick().await;
+                                match heartbeat_db
+                                    .renew_bug_lease(
+                                        heartbeat_bug,
+                                        &heartbeat_worker,
+                                        BUG_LEASE_TTL_SECONDS,
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        warn!(
+                                            "Lease on bug {} is no longer held by {}; \
+                                             stopping renewal",
+                                            heartbeat_bug, heartbeat_worker
+                                        );
+                                        break;
+                                    }
+                                    // A single failed renewal is survivable
+                                    // because the lease outlasts several
+                                    // intervals, so keep trying.
+                                    Err(e) => error!(
+                                        "Failed to renew the lease on bug {}: {}",
+                                        heartbeat_bug, e
+                                    ),
+                                }
+                            }
+                        });
+
                         let db = db.with_bug_actor(
                             actor,
                             "sashiko:linux_bug",
@@ -104,7 +161,7 @@ impl BugWorker {
                         }
                         let tools = Some(Arc::new(tb));
 
-                        match crate::workflows::linux_bug::process_issue_worker(
+                        let analysis = crate::workflows::linux_bug::process_issue_worker(
                             provider.as_ref(),
                             tools,
                             &db,
@@ -112,8 +169,15 @@ impl BugWorker {
                             input,
                             Some("bug_worker"),
                         )
-                        .await
-                        {
+                        .await;
+
+                        // Renewal stops before the claim is settled. A renewal
+                        // still in flight is harmless because it matches on
+                        // locked_by, which both paths below clear, so it can
+                        // only be a no-op once they have run.
+                        heartbeat.abort();
+
+                        match analysis {
                             Ok(outcome) => {
                                 info!("Successfully processed raw bug {}: {}", bug.id, outcome);
                                 // The workflow records the outcome; this only
