@@ -2099,6 +2099,30 @@
             fetchConfig().then(router);
         });
 
+        // Values that come from mail headers, model output or MAINTAINERS are
+        // carried in data attributes and read back here, rather than being
+        // pasted into an inline handler. HTML-escaping is not enough in that
+        // position: the parser decodes &#039; back to a quote before the
+        // attribute is compiled as JS, so an apostrophe in a Message-ID would
+        // close the string literal and run whatever follows it.
+        document.addEventListener('click', (e) => {
+            const btn = e.target.closest('.copy-btn[data-copy]');
+            if (!btn) return;
+            // Rows behind these buttons navigate on click. Capturing at the
+            // document is the only point guaranteed to run before a handler
+            // bound on the row itself, so the stop has to happen here.
+            e.stopPropagation();
+            e.preventDefault();
+            copyToClipboard(btn.dataset.copy);
+        }, true);
+
+        document.addEventListener('change', (e) => {
+            const box = e.target.closest('input[type="checkbox"][data-subsystem]');
+            if (!box) return;
+            toggleSubsystemSelection(box.dataset.subsystem, box.checked);
+        });
+
+
         // =====================================================================
         // DATA FETCHING
         // =====================================================================
@@ -2986,7 +3010,7 @@
                             <td>${escapeHtml(p.subject) || '(no subject)'}</td>
                             <td style="line-height:1.2;">${authorHtml}</td>
                             <td style="line-height:1.2;">${dateHtml}</td>
-                            <td><button class="copy-btn" onclick="event.stopPropagation(); copyToClipboard('${escapeHtml(p.message_id)}')">📋</button></td>
+                            <td><button class="copy-btn" data-copy="${escapeHtml(p.message_id)}">📋</button></td>
                         `;
                     }
                     if (tbody) {
@@ -3122,7 +3146,7 @@
                     const bugCount = s.open_bugs || s.count || 0;
                     return `
                         <label class="subsystem-item" onclick="event.stopPropagation()">
-                            <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleSubsystemSelection('${escapeHtml(s.name)}', this.checked)">
+                            <input type="checkbox" ${isChecked ? 'checked' : ''} data-subsystem="${escapeHtml(s.name)}">
                             <span class="subsystem-item-name" title="${escapeHtml(s.name)}">${escapeHtml(s.name)}</span>
                             <span class="subsystem-item-count">(${bugCount})</span>
                         </label>
@@ -4003,7 +4027,7 @@
                     <div><span class="label">To:</span> ${escapeHtml(formatAuthorList(data.to))}</div>
                     <div><span class="label">Cc:</span> ${escapeHtml(formatAuthorList(data.cc))}</div>
                     <div><span class="label">Date:</span> ${date}</div>
-                    <div><span class="label">ID:</span> ${escapeHtml(data.message_id)} <button class="copy-btn" onclick="copyToClipboard('${escapeHtml(data.message_id)}')">Copy</button></div>
+                    <div><span class="label">ID:</span> ${escapeHtml(data.message_id)} <button class="copy-btn" data-copy="${escapeHtml(data.message_id)}">Copy</button></div>
                 </div>
                 
                 ${threadHtml ? `<div class="section"><h2>Thread</h2>${threadHtml}</div>` : ''}
@@ -4496,7 +4520,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 </div>` : ''}
 
                 <div class="section">
-                    <div class="kv"><div class="label">Bug ID:</div><div><code>${escapeHtml(bugid)}</code> <button class="copy-btn" onclick="copyToClipboard('${escapeHtml(bugid)}')">Copy</button></div></div>
+                    <div class="kv"><div class="label">Bug ID:</div><div><code>${escapeHtml(bugid)}</code> <button class="copy-btn" data-copy="${escapeHtml(bugid)}">Copy</button></div></div>
                     <div class="kv"><div class="label">Severity:</div><div><span class="tag" style="border:1px solid ${sevColor}; color:${sevColor}; font-weight:bold; background:transparent;">${escapeHtml(severity)}</span></div></div>
                     <div class="kv"><div class="label">Status:</div><div><span class="status-badge ${status.cls}">${status.label}</span></div></div>
                     <div class="kv"><div class="label">Assignee:</div><div>${data.assignee ? `${escapeHtml(data.assignee)}${data.assigned_at ? ` <span class="text-muted-sm">since ${formatDate(data.assigned_at, true)}</span>` : ''}` : '<span class="text-muted-sm">Unassigned</span>'}</div></div>
