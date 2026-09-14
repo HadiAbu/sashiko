@@ -148,6 +148,19 @@ port = 8080
 # refuses to start if SMTP is on and this is unset or names a bind address.
 # public_base_url = ""
 
+# Grants unauthenticated ingest, review and cancel to callers on the loopback
+# interface. Off by default: the deployed topology puts a reverse proxy in
+# front of a loopback bind, so a request from the public internet also arrives
+# from loopback, and a proxy forwards the usual markers only when configured
+# to. Turn it on only for a workstation that nothing proxies to.
+#
+# Local tooling does not need it. The server writes a random token to
+# .sashiko-local-token beside the database on every start, readable only by the
+# user it runs as, and sashiko-cli and the benchmark present that token
+# automatically. Reading a file owned by the server's user is a claim a proxied
+# caller cannot make, which is why it is trusted where the interface is not.
+# trust_loopback = false
+
 # Identity-based Capabilities: Defines what authenticated (JWT) entities can do.
 # If these lists are empty or the section is missing, nobody is allowed to perform any mutations (Fail-Closed secure default).
 # Do NOT list arbitrary users here.

@@ -853,10 +853,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_db = db.clone();
     let api_tx = raw_tx.clone();
     let api_fetch_tx = fetch_tx.clone();
+    let local_token_path = settings.local_token_path();
+    let local_token = publish_local_token(&local_token_path);
     let server_options = sashiko::api::ServerOptions {
         allow_all_submit: cli.enable_unsafe_all_submit,
         smtp_enabled: settings.smtp.is_some(),
         dry_run: settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false),
+        local_token,
     };
     let api_handle = tokio::spawn(async move {
         if let Err(e) =
@@ -1049,8 +1052,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     reviewer_handle.abort();
     metrics_handle.abort();
 
+    // A token from a dead server authenticates nothing, since the next one
+    // draws a new secret, but leaving the file behind invites a local tool to
+    // present a credential nobody honours and puzzle over the refusal.
+    if let Err(e) = std::fs::remove_file(&local_token_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            "Failed to remove the local token at {}: {}",
+            local_token_path.display(),
+            e
+        );
+    }
+
     info!("Shutdown complete.");
     std::process::exit(0);
+}
+
+/// Publishes the credential local tooling presents to this process.
+///
+/// A failure is a warning rather than a fatal error: a read-only state
+/// directory is a legitimate deployment, and the server remains fully usable
+/// through sign-in links. Only the convenience of local tooling is lost, so it
+/// says so plainly rather than refusing to start.
+fn publish_local_token(path: &Path) -> Option<sashiko::auth::LocalToken> {
+    let token = match sashiko::auth::LocalToken::generate() {
+        Ok(token) => token,
+        Err(e) => {
+            warn!("Failed to generate the local token: {}", e);
+            return None;
+        }
+    };
+
+    match token.write_to(path) {
+        Ok(()) => {
+            // The path is logged and the secret is not, because the log is read
+            // by more people and processes than the file is.
+            info!("Local tooling may authenticate with {}", path.display());
+            Some(token)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to write the local token to {}: {}. Local tools will have to \
+                 authenticate like any other caller.",
+                path.display(),
+                e
+            );
+            None
+        }
+    }
 }
 
 fn handle_init_command(
