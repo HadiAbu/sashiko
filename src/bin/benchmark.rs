@@ -130,8 +130,9 @@ async fn main() -> Result<()> {
 
         // The server writes this on every start, so a benchmark run on the
         // same machine authenticates without being configured. Its absence is
-        // not an error here: the server may be trusting loopback instead, and
-        // an unauthenticated submission would then be accepted anyway.
+        // not fatal here: a server started with --enable-unsafe-all-submit
+        // accepts the submissions anyway, and the refusal below reports the
+        // missing credential far more precisely than a guess would.
         let local_token_path = settings.local_token_path();
         let local_token = match LocalToken::read_from(&local_token_path) {
             Ok(token) => Some(token),

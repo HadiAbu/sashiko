@@ -2,9 +2,9 @@
 //!
 //! Authority over a bug comes from three independent sources, composed by
 //! taking the strongest: the capability lists in the configuration, the
-//! MAINTAINERS file, and, for operators, the loopback bypass handled at the
-//! HTTP edge. This module owns the first two and the composition; it does not
-//! know about HTTP.
+//! MAINTAINERS file, and, for operators, the local token handled at the HTTP
+//! edge. This module owns the first two and the composition; it does not know
+//! about HTTP.
 
 use crate::maintainers::MaintainersIndex;
 use crate::settings::AclSettings;
@@ -280,7 +280,7 @@ impl BugPrincipal {
 ///
 /// Being fallible is the point: a bug route cannot reach bug data without
 /// naming this extractor in its signature, so forgetting the check does not
-/// compile into an open route. The loopback bypass in `is_authorized` is
+/// compile into an open route. The local token accepted by `is_authorized` is
 /// deliberately not consulted here.
 impl FromRequestParts<Arc<crate::api::AppState>> for BugPrincipal {
     type Rejection = (StatusCode, &'static str);

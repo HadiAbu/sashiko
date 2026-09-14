@@ -25,8 +25,8 @@ The branch as it stands does not treat them that way:
 * `/api/bug/analyze`, the only route that creates a bug, is gated on
   `Permission::Review`, conflating "may re-run a patch review" with "may file a
   kernel vulnerability report".
-* The credential-free loopback bypass in `is_authorized` applies to bug routes
-  like everything else.
+* The operator bypass in `is_authorized`, which admits a caller that presents no
+  session at all, applies to bug routes like everything else.
 * The sign-in link login that would back any of this is not actually a login: the
   link is printed to the server log rather than mailed, the request endpoint is an
   email-enumeration oracle, and sessions can be refreshed forever.
@@ -72,7 +72,7 @@ kernel already exists and is already parsed by Sashiko**: the MAINTAINERS file.
 | :--- | :--- | :--- |
 | Configured capability lists | `[server.acl]` in `Settings.toml` | Global roles: operator, security list, bug reporter |
 | MAINTAINERS-derived scope | `third_party/linux/MAINTAINERS`, parsed at startup | Management authority over specific subsystems |
-| Loopback bypass | Request source address | Everything **except** bug routes |
+| Local operator token | `.sashiko-local-token`, readable only by the user the server runs as | Everything **except** bug routes |
 
 A principal's effective authority is the union of what each source grants. This
 matters for the concrete case that motivated it: Greg Kroah-Hartman sits on the
@@ -347,8 +347,8 @@ plainly:
   the kernel already operates under, but it is a real one.
 * Authority is keyed on an email address with no proof of control beyond
   receiving one message at it. Mail interception equals subsystem authority.
-* The loopback bypass means anyone with local access to the machine has
-  operator authority over non-bug routes.
+* The local operator token means anyone who can read the server's files — the
+  user it runs as, and root — has operator authority over non-bug routes.
 
 ---
 
@@ -504,17 +504,20 @@ invisible one leaks the target's existence.
 * Error bodies carry no backend detail. The existing leak of raw error strings
   at the analyze endpoint is fixed as part of this.
 
-### 3.4 Bug routes are excluded from the loopback bypass
+### 3.4 Bug routes are excluded from the operator bypass
 
-`is_authorized` grants access to any credential-free request from a loopback
-address without a proxy header. That is deliberate for local operation and it
-stays, but it must not apply to bugs.
+`is_authorized` grants access to a request that carries no session but presents
+the local operator token, a file only the user the server runs as can read.
+That is deliberate for local operation and it stays, but it must not apply to
+bugs: reading a file off the server's disk says nothing about which subsystems
+a person maintains, which is the only question a bug route asks.
 
 The bypass is scoped by making it a property of the *capability* rather than of
-the request: `Permission::Ingest`, `Cancel`, `Review` and `Action` remain
-bypassable; the new bug capabilities are not, and `BugPrincipal` never consults
-`is_authorized` at all. Expressing it this way means a future capability is
-non-bypassable unless someone explicitly opts it in.
+the request: `Permission::granted_by_local_token` answers yes for `Ingest`,
+`Cancel` and `Review`; the new bug capabilities are not reachable that way, and
+`BugPrincipal` never consults `is_authorized` at all. The predicate matches
+exhaustively, so a capability added later is unreachable by the token until
+someone decides it should be.
 
 Verified impact: neither `sashiko-cli` nor `benchmark` calls any bug route, and
 `local_review` drops pre-existing bugs rather than submitting them, so nothing
@@ -529,10 +532,11 @@ a blocklisted address is denied unconditionally, before any bypass. Comparison
 gains a `trim()` alongside the existing ASCII-case-insensitive match, on both
 the configured entries and the incoming address.
 
-This does not, and cannot, stop a blocklisted person who simply omits their
-token and calls from localhost; with no address presented there is nothing to
-match. That residual case is the loopback bypass's documented trust assumption,
-and it does not reach bug routes.
+This does not, and cannot, stop a blocklisted person who drops their session and
+presents the local token instead; with no address presented there is nothing to
+match. That residual case is the token's documented trust assumption — whoever
+can read the server's files is already trusted with the machine — and it does
+not reach bug routes.
 
 The blocklist is also re-evaluated on session refresh, which it already is, and
 on every request, which follows from resolving the principal per request rather
@@ -709,7 +713,7 @@ Each step is one commit, self-contained and independently buildable.
 7. Restrict bug reads to authorized principals.
 8. Withhold raw analysis transcripts from scoped maintainers.
 9. Scope bug mutations to maintainer subsystems.
-10. Exclude bug endpoints from the loopback bypass.
+10. Exclude bug endpoints from the operator bypass.
 11. Require the create capability to submit bugs.
 12. Evaluate the blocklist ahead of every bypass.
 13. Drop the unused global action capability.

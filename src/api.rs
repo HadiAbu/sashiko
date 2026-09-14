@@ -4032,9 +4032,8 @@ mod tests {
             req.send()
         };
 
-        // The request comes from loopback with no credentials, which is exactly
-        // the shape the loopback bypass admits elsewhere. Bug routes do not
-        // honour it.
+        // No credentials at all. Bug routes answer 401 rather than falling back
+        // to anything the transport might suggest.
         let anonymous = get(format!("/api/bug?id={}", bug_id), None).await.unwrap();
         assert_eq!(anonymous.status(), 401);
 
