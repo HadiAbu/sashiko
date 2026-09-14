@@ -1324,6 +1324,51 @@ impl Database {
             tx.commit().await?;
         }
 
+        // Transition legacy linux_bug* tables from intermediate branch states if present.
+        let has_legacy_linux_bugs = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'linux_bugs'",
+                    (),
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+        if has_legacy_linux_bugs {
+            info!("Dropping legacy linux_bug* tables and applying bugs schema...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS linux_bug_vectors;
+                 DROP TABLE IF EXISTS linux_bug_reviews;
+                 DROP TABLE IF EXISTS linux_bug_subsystems;
+                 DROP TABLE IF EXISTS linux_bug_enrichments;
+                 DROP TABLE IF EXISTS linux_bugs;",
+            )
+            .await?;
+            tx.execute_batch(include_str!("migrations/002_bugs.sql"))
+                .await?;
+            tx.commit().await?;
+        }
+
+        let has_bugs = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bugs'",
+                    (),
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+        if !has_bugs {
+            info!("Applying database migration (bugs)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/002_bugs.sql"))
+                .await?;
+            tx.commit().await?;
+        }
+
         info!("Database schema is up to date at version 3.");
         Ok(())
     }
