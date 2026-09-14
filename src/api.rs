@@ -226,6 +226,11 @@ pub struct ServerOptions {
     pub allow_all_submit: bool,
     pub smtp_enabled: bool,
     pub dry_run: bool,
+    /// The credential this process published for local tooling to present.
+    ///
+    /// Absent when the token could not be written, in which case local tools
+    /// authenticate the same way anyone else does.
+    pub local_token: Option<crate::auth::LocalToken>,
 }
 
 pub struct AppState {
@@ -238,6 +243,7 @@ pub struct AppState {
     pub allow_all_submit: bool,
     pub smtp_enabled: bool,
     pub dry_run: bool,
+    pub local_token: Option<crate::auth::LocalToken>,
     pub sign_in_link_rate_limiter: SignInLinkRateLimiter,
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     stats_reviews_cache: AsyncCache<serde_json::Value>,
@@ -417,6 +423,7 @@ pub fn build_router(
         allow_all_submit: options.allow_all_submit,
         smtp_enabled: options.smtp_enabled,
         dry_run: options.dry_run,
+        local_token: options.local_token,
         sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
         stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -2385,6 +2392,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_local_token_authorizes_ingest_but_grants_no_identity() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        // Everything that could authorize the request for another reason is
+        // switched off, so only the token can be what admits it.
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        settings.server.trust_loopback = false;
+        settings.server.acl = crate::settings::AclSettings::default();
+        let settings = Arc::new(settings);
+
+        let local_token = crate::auth::LocalToken::generate().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            settings,
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            ServerOptions {
+                local_token: Some(local_token.clone()),
+                ..Default::default()
+            },
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let submit = format!("http://{}/api/submit", addr);
+        let payload = serde_json::json!({
+            "type": "remote",
+            "sha": "1234567890abcdef1234567890abcdef12345678",
+            "repo": "https://example.org/linux.git",
+        });
+
+        let anonymous = client
+            .post(&submit)
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(anonymous, 403, "loopback alone must not ingest");
+
+        let wrong = client
+            .post(&submit)
+            .bearer_auth("0".repeat(64))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            wrong, 403,
+            "a token this server did not write must not ingest"
+        );
+
+        let accepted = client
+            .post(&submit)
+            .bearer_auth(local_token.secret())
+            .json(&payload)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(accepted.is_success(), "token was refused: {}", accepted);
+
+        // The token is an authority, not an identity, so it cannot act on a
+        // bug however local its holder is.
+        let bug_action = client
+            .post(format!("http://{}/api/bug/action?bugid=linux-1", addr))
+            .bearer_auth(local_token.secret())
+            .json(&serde_json::json!({"action": {"kind": "close"}}))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert!(
+            !bug_action.is_success(),
+            "token reached a bug route: {}",
+            bug_action
+        );
+    }
+
+    #[tokio::test]
     async fn test_bug_input_endpoint_serves_per_bug_payload() {
         let db_settings = crate::settings::DatabaseSettings {
             url: ":memory:".to_string(),
@@ -3200,6 +3306,7 @@ mod tests {
             allow_all_submit: false,
             smtp_enabled: false,
             dry_run: true,
+            local_token: None,
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
             stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3595,6 +3702,7 @@ mod tests {
                 allow_all_submit,
                 smtp_enabled: false,
                 dry_run: true,
+                local_token: None,
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
                 stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3664,6 +3772,7 @@ mod tests {
                 allow_all_submit: false,
                 smtp_enabled: false,
                 dry_run: true,
+                local_token: None,
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
                 stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3790,6 +3899,7 @@ mod tests {
             patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+            local_token: None,
         });
         let index = crate::maintainers::MaintainersIndex::from_reader(
             b"Maintainers List\n================\n\nSECTION A\nM:\tAlice <a@example.org>\nF:\ta/\n\nSECTION B\nM:\tBob <b@example.org>\nF:\tb/\n".as_slice()
@@ -4096,6 +4206,16 @@ pub fn is_authorized(
     if state.allow_all_submit {
         return true;
     }
+
+    // A caller holding this process's token has read a file only the server's
+    // own user can read, which is a stronger claim than the loopback bypass
+    // below makes and does not depend on the topology in front of us. It is
+    // gated on the same capabilities, so it reaches no further than that
+    // bypass would; bug routes resolve their own principal and never call
+    // here.
+    if presents_local_token(headers, state) && perm.allows_loopback_bypass() {
+        return true;
+    }
     if state.settings.server.trust_loopback
         && addr.ip().to_canonical().is_loopback()
         && perm.allows_loopback_bypass()
@@ -4117,6 +4237,23 @@ pub fn is_authorized(
     }
 
     false
+}
+
+/// Whether the request carries the local operator token this process wrote.
+///
+/// The token shares the Authorization header with session JWTs, which is safe
+/// because the two cannot be confused: a JWT never has the shape of a token,
+/// and a token never carries the signature a JWT is accepted on.
+fn presents_local_token(headers: &axum::http::HeaderMap, state: &std::sync::Arc<AppState>) -> bool {
+    let Some(token) = state.local_token.as_ref() else {
+        return false;
+    };
+
+    headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|presented| token.matches(presented.trim()))
 }
 
 fn resolve_jwt_secret(state: &AppState) -> Option<String> {
