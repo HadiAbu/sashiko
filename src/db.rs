@@ -1008,6 +1008,16 @@ impl Database {
         }
     }
 
+    /// Keeps attribution attached to writes performed inside a transaction.
+    fn with_connection(&self, conn: libsql::Connection) -> Self {
+        Self {
+            conn,
+            bug_actor: self.bug_actor.clone(),
+            bug_tool: self.bug_tool.clone(),
+            bug_model: self.bug_model.clone(),
+        }
+    }
+
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
         let mut rows = self
             .conn
@@ -1679,12 +1689,7 @@ impl Database {
         enrichment: Option<&NewBugEnrichment>,
     ) -> Result<i64> {
         let tx = self.conn.transaction().await?;
-        let scoped = Self {
-            conn: (*tx).clone(),
-            bug_actor: self.bug_actor.clone(),
-            bug_tool: self.bug_tool.clone(),
-            bug_model: self.bug_model.clone(),
-        };
+        let scoped = self.with_connection((*tx).clone());
         let id = scoped.insert_bug(bug).await?;
         if let Some(enrichment) = enrichment {
             scoped.add_bug_enrichment(id, enrichment).await?;
@@ -2826,7 +2831,19 @@ impl Database {
         subsystems: &[AttributedSubsystem],
     ) -> Result<()> {
         let tx = self.conn.transaction().await?;
-        tx.execute("UPDATE bugs SET audit_author = ?, audit_tool = ?, audit_model = ?, updated_at = ? WHERE id = ?", libsql::params![self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), chrono::Utc::now().timestamp(), id]).await?;
+        self.with_connection((*tx).clone())
+            .replace_bug_subsystems(id, subsystems)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn replace_bug_subsystems(
+        &self,
+        id: i64,
+        subsystems: &[AttributedSubsystem],
+    ) -> Result<()> {
+        self.conn.execute("UPDATE bugs SET audit_author = ?, audit_tool = ?, audit_model = ?, updated_at = ? WHERE id = ?", libsql::params![self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), chrono::Utc::now().timestamp(), id]).await?;
         let wanted: std::collections::BTreeMap<&str, SubsystemSource> = subsystems
             .iter()
             .map(|s| (s.name.trim(), s.source))
@@ -2837,7 +2854,8 @@ impl Database {
         // libsql refuses to commit a transaction that still has a statement in
         // progress, and deleting while iterating leaves the cursor open.
         let existing: Vec<String> = {
-            let mut rows = tx
+            let mut rows = self
+                .conn
                 .query(
                     "SELECT subsystem FROM bug_subsystems WHERE bug_id = ?",
                     libsql::params![id],
@@ -2852,35 +2870,46 @@ impl Database {
 
         for sub in existing {
             if !wanted.contains_key(sub.as_str()) {
-                tx.execute(
-                    "DELETE FROM bug_subsystems WHERE bug_id = ? AND subsystem = ?",
-                    libsql::params![id, sub],
-                )
-                .await?;
+                self.conn
+                    .execute(
+                        "DELETE FROM bug_subsystems WHERE bug_id = ? AND subsystem = ?",
+                        libsql::params![id, sub],
+                    )
+                    .await?;
             }
         }
         for (name, source) in wanted {
-            tx.execute(
-                UPSERT_BUG_SUBSYSTEM_SQL,
-                libsql::params![id, name, source.as_str()],
-            )
-            .await?;
+            self.conn
+                .execute(
+                    UPSERT_BUG_SUBSYSTEM_SQL,
+                    libsql::params![id, name, source.as_str()],
+                )
+                .await?;
         }
-        tx.commit().await?;
         Ok(())
     }
 
+    /// Commits the verdict, report, projections and successful state together.
     pub async fn update_bug_outcome(
         &self,
         id: i64,
         params: UpdateBugOutcomeParams<'_>,
     ) -> Result<()> {
+        let tx = self.conn.transaction().await?;
+        self.with_connection((*tx).clone())
+            .write_bug_outcome(id, params)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn write_bug_outcome(&self, id: i64, params: UpdateBugOutcomeParams<'_>) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         if let Some(title) = params.problem {
             self.update_bug_title(id, title).await?;
         }
         if let Some(subsystems) = params.subsystems {
-            self.update_bug_subsystems(id, subsystems).await?;
+            self.replace_bug_subsystems(id, subsystems).await?;
         }
         if let Some(vector) = params.vector_json {
             self.update_bug_vector(id, vector).await?;
@@ -2902,10 +2931,6 @@ impl Database {
                 ],
             )
             .await?;
-        // Producing an outcome at all means the analysis ran to completion.
-        self.set_bug_pipeline_state(id, BugPipelineState::Succeeded)
-            .await?;
-
         if params.verified_on_sha.is_some() || params.locations.is_some() {
             let is_valid = params.lifecycle_status != BugLifecycleStatus::Dismissed;
             let refutation = if !is_valid {
@@ -2998,6 +3023,9 @@ impl Database {
             .await?;
         }
 
+        // Success and every outcome record become visible together at commit.
+        self.set_bug_pipeline_state(id, BugPipelineState::Succeeded)
+            .await?;
         Ok(())
     }
 
@@ -13369,6 +13397,88 @@ mod tests {
             !claimed.contains(&dup_id),
             "a folded bug must never be handed to a worker"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_outcome_write_rolls_back_every_result_and_remains_recoverable() {
+        let db = Database::new(&crate::settings::DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let id = create_pending_bug(&db, "linux-atomic-result").await;
+        db.claim_pending_bug("worker", 300, 3).await.unwrap();
+        let before = serde_json::to_value(db.get_bug(id).await.unwrap().unwrap()).unwrap();
+        // Fail late, after title, subsystem, vector, verification and severity
+        // writes would already have happened in the former implementation.
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_report BEFORE INSERT ON bug_enrichments
+            WHEN NEW.kind = 'report' BEGIN SELECT RAISE(ABORT, 'report write failed'); END;",
+            )
+            .await
+            .unwrap();
+        let subsystems = vec![AttributedSubsystem::from_maintainers("NEW SECTION")];
+        let params = || UpdateBugOutcomeParams {
+            lifecycle_status: BugLifecycleStatus::Open,
+            problem: Some("new title"),
+            subsystems: Some(&subsystems),
+            vector_json: Some("{}"),
+            severity: Severity::High,
+            verified_on_sha: Some("abc123"),
+            introduced_in_commit: Some("def456"),
+            inline_review: "complete report",
+            ..Default::default()
+        };
+        assert!(db.update_bug_outcome(id, params()).await.is_err());
+        let after = serde_json::to_value(db.get_bug(id).await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            after, before,
+            "a failed result left partial writes or audit records"
+        );
+        let mut vectors = db
+            .conn
+            .query("SELECT count(*) FROM bug_vectors", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            vectors
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            0
+        );
+        drop(vectors);
+        // A process dying before its failure handler runs still leaves a
+        // recoverable running row, rather than an incomplete successful result.
+        db.conn
+            .execute("UPDATE bugs SET lease_expires_at = 1", ())
+            .await
+            .unwrap();
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 1);
+        assert!(
+            db.claim_pending_bug("replacement", 300, 3)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        db.conn
+            .execute_batch("DROP TRIGGER fail_report;")
+            .await
+            .unwrap();
+        db.update_bug_outcome(id, params()).await.unwrap();
+        let saved = db.get_bug(id).await.unwrap().unwrap();
+        assert_eq!(saved.pipeline_state, BugPipelineState::Succeeded);
+        assert_eq!(saved.lifecycle_status, BugLifecycleStatus::Open);
+        assert_eq!(saved.title, "new title");
+        assert_eq!(saved.inline_review(), "complete report");
+        assert_eq!(saved.severity(), Severity::High);
+        assert_eq!(saved.subsystems, vec!["NEW SECTION"]);
     }
 
     #[tokio::test]
