@@ -2571,6 +2571,9 @@ impl Database {
     /// attempt failed, and those whose lease has expired because the worker
     /// holding it died. Bugs that have exhausted `max_attempts` are skipped;
     /// [`Self::abandon_exhausted_bugs`] moves them to the dead letter state.
+    /// Bugs already folded into a canonical bug are skipped too: their finding
+    /// lives on the canonical row, so analysing them again would spend the
+    /// budget to rediscover something that is already recorded.
     ///
     /// `worker_id` identifies the holder so that a stuck lease can be traced
     /// back to a process.
@@ -2596,6 +2599,7 @@ impl Database {
                   WHERE id = (
                       SELECT id FROM bugs
                        WHERE attempt_count < ?4
+                         AND lifecycle_status != 'duplicate'
                          AND (pipeline_state IN ('pending', 'failed')
                               OR (pipeline_state = 'running' AND lease_expires_at < ?3))
                        ORDER BY created_at ASC
@@ -3269,9 +3273,29 @@ impl Database {
             bail!("Bug not found");
         }
 
+        // Folding a bug into a canonical one ends its pipeline, so the
+        // analysis state is retired in the same statement as the triage state.
+        // Leaving it behind strands the row: the dedup stage returns before the
+        // workflow records an outcome, and the caller then drops the lease, so
+        // the bug would keep a 'running' state that no worker can reclaim
+        // because every recovery query matches on an expired lease.
+        //
+        // 'succeeded' rather than 'abandoned' because reaching a duplicate is a
+        // completed triage result, not a dead letter, and no analysis work is
+        // still owed once the finding lives on the canonical bug.
         tx.execute(
-            "UPDATE bugs SET lifecycle_status = 'duplicate', duplicate_of_id = ?, updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ? WHERE id = ?",
-            libsql::params![params.canonical_id, now, self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), params.ephemeral_id],
+            "UPDATE bugs SET lifecycle_status = 'duplicate', duplicate_of_id = ?,
+                    pipeline_state = 'succeeded', locked_by = NULL, lease_expires_at = NULL,
+                    updated_at = ?, audit_author = ?, audit_tool = ?, audit_model = ?
+              WHERE id = ?",
+            libsql::params![
+                params.canonical_id,
+                now,
+                self.bug_actor.as_str(),
+                self.bug_tool.as_str(),
+                self.bug_model.clone(),
+                params.ephemeral_id
+            ],
         )
         .await?;
 
@@ -13001,6 +13025,109 @@ mod tests {
             .expect("should re-claim recovered bug");
         assert_eq!(claimed_again.id, bug_id);
         assert_eq!(claimed_again.pipeline_state, BugPipelineState::Running);
+    }
+
+    /// The dedup stage folds a bug while it is still claimed, and the caller
+    /// then only drops the lease. Unless the fold itself retires the pipeline,
+    /// the row keeps a 'running' state with no lease, which no recovery query
+    /// can match, and the bug is stranded for good.
+    #[tokio::test]
+    async fn test_mark_duplicate_retires_running_pipeline() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let canonical_id = create_pending_bug(&db, "linux-canonical").await;
+        let dup_id = create_pending_bug(&db, "linux-folded").await;
+
+        // Reproduce the worker's sequence: claim the bug, fold it, release.
+        // Claim ordering between two bugs created in the same second is not
+        // guaranteed, so drain the queue rather than assuming which comes back.
+        let mut claimed_dup = false;
+        while let Some(bug) = db.claim_pending_bug("worker-a", 3600, 10).await.unwrap() {
+            if bug.id == dup_id {
+                assert_eq!(bug.pipeline_state, BugPipelineState::Running);
+                claimed_dup = true;
+            }
+        }
+        assert!(claimed_dup, "the bug being folded must have been claimed");
+
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: dup_id,
+            canonical_id,
+            reasoning: "Same root cause",
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        db.release_bug_lease(dup_id).await.unwrap();
+
+        let folded = db.get_bug(dup_id).await.unwrap().unwrap();
+        assert_eq!(folded.lifecycle_status, BugLifecycleStatus::Duplicate);
+        assert_eq!(
+            folded.pipeline_state,
+            BugPipelineState::Succeeded,
+            "a folded bug owes no further analysis"
+        );
+
+        // The decisive check: nothing is left for recovery to find, and the row
+        // is not silently waiting on a lease that will never expire.
+        assert_eq!(db.recover_stale_running_bugs().await.unwrap(), 0);
+        let running_without_lease: i64 = db
+            .conn
+            .query(
+                "SELECT count(*) FROM bugs WHERE pipeline_state = 'running' AND lease_expires_at IS NULL",
+                (),
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(running_without_lease, 0);
+    }
+
+    /// A folded bug is a tombstone. Re-analysing it would spend the budget to
+    /// rediscover a finding that already lives on the canonical bug.
+    #[tokio::test]
+    async fn test_claim_skips_folded_bugs() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let canonical_id = create_pending_bug(&db, "linux-tombstone-canonical").await;
+        let dup_id = create_pending_bug(&db, "linux-tombstone-dup").await;
+        db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+            ephemeral_id: dup_id,
+            canonical_id,
+            reasoning: "Same root cause",
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // Drain everything the worker would ever be offered.
+        let mut claimed = Vec::new();
+        while let Some(bug) = db.claim_pending_bug("worker-a", 3600, 10).await.unwrap() {
+            claimed.push(bug.id);
+        }
+        assert!(
+            claimed.contains(&canonical_id),
+            "the canonical bug still needs analysis"
+        );
+        assert!(
+            !claimed.contains(&dup_id),
+            "a folded bug must never be handed to a worker"
+        );
     }
 
     /// Assignment writes both columns together, because the schema requires
