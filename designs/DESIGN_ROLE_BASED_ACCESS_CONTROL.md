@@ -175,6 +175,32 @@ from the `typ: "session"` token it is exchanged for. It lives for 30 minutes and
 is redeemed at `GET /api/auth/verify`, which returns a 24 hour session that can
 be refreshed up to a 30 day cap measured from the original `iat`.
 
+#### Accepted risk: links are replayable within their lifetime
+
+Redemption is **deliberately not single-use**. There is no `jti` store, no
+consumed marker, and no binding between the link and the browser that requested
+it. Anyone holding the link can redeem it repeatedly for the whole 30 minutes,
+and each redemption yields an independent session.
+
+This is a conscious trade, not an oversight:
+
+- Single-use redemption requires server-side state, which is exactly what the
+  stateless authorization design set out to avoid. A `jti` table reintroduces a
+  write on every sign-in and a reaper for expired entries.
+- Mail clients and security scanners routinely prefetch links, so a strict
+  single-use rule breaks sign-in for a real fraction of users: the scanner burns
+  the link and the human gets an error.
+- The exposure is bounded by the 30 minute lifetime, and the link is only ever
+  mailed to an address that already passed the eligibility check.
+
+The residual risk is that anyone who observes a link inside that window obtains
+a session. That is why the link is kept out of every channel the service
+controls, which is the subject of the next section.
+
+Revisit this decision if sign-in ever grants access to embargoed material
+directly, rather than to an identity whose capabilities are re-evaluated on
+every request.
+
 #### Links are withheld from the log by default
 
 The link is a bearer credential, so it must not be written anywhere that is read
