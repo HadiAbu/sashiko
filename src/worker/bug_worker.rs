@@ -19,6 +19,21 @@ const BUG_LEASE_TTL_SECONDS: i64 = 300;
 const BUG_LEASE_RENEW_INTERVAL_SECONDS: u64 = 60;
 const BUG_MAX_ATTEMPTS: i64 = 3;
 
+/// Stops a background task once this guard goes out of scope.
+///
+/// Dropping a bare JoinHandle detaches the task instead of stopping it, so an
+/// analysis that unwinds would leave its heartbeat renewing the lease of work
+/// nobody is doing. That row would stay claimed forever, beyond the reach of
+/// every recovery query. Aborting from Drop covers the unwinding path as well
+/// as the ordinary one.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct BugWorker {
     db: Arc<Database>,
     provider: Arc<dyn AiProvider>,
@@ -80,42 +95,45 @@ impl BugWorker {
                         let heartbeat_db = db.clone();
                         let heartbeat_worker = worker_id.clone();
                         let heartbeat_bug = bug.id;
-                        let heartbeat = tokio::spawn(async move {
-                            let mut ticker = tokio::time::interval(Duration::from_secs(
-                                BUG_LEASE_RENEW_INTERVAL_SECONDS,
-                            ));
-                            // Interval fires once immediately; the claim is
-                            // already fresh, so that tick is spent here.
-                            ticker.tick().await;
-                            loop {
+                        let heartbeat = AbortOnDrop(
+                            tokio::spawn(async move {
+                                let mut ticker = tokio::time::interval(Duration::from_secs(
+                                    BUG_LEASE_RENEW_INTERVAL_SECONDS,
+                                ));
+                                // Interval fires once immediately; the claim is
+                                // already fresh, so that tick is spent here.
                                 ticker.tick().await;
-                                match heartbeat_db
-                                    .renew_bug_lease(
-                                        heartbeat_bug,
-                                        &heartbeat_worker,
-                                        BUG_LEASE_TTL_SECONDS,
-                                    )
-                                    .await
-                                {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        warn!(
-                                            "Lease on bug {} is no longer held by {}; \
-                                             stopping renewal",
-                                            heartbeat_bug, heartbeat_worker
-                                        );
-                                        break;
+                                loop {
+                                    ticker.tick().await;
+                                    match heartbeat_db
+                                        .renew_bug_lease(
+                                            heartbeat_bug,
+                                            &heartbeat_worker,
+                                            BUG_LEASE_TTL_SECONDS,
+                                        )
+                                        .await
+                                    {
+                                        Ok(true) => {}
+                                        Ok(false) => {
+                                            warn!(
+                                                "Lease on bug {} is no longer held by {}; \
+                                                 stopping renewal",
+                                                heartbeat_bug, heartbeat_worker
+                                            );
+                                            break;
+                                        }
+                                        // A single failed renewal is survivable
+                                        // because the lease outlasts several
+                                        // intervals, so keep trying.
+                                        Err(e) => error!(
+                                            "Failed to renew the lease on bug {}: {}",
+                                            heartbeat_bug, e
+                                        ),
                                     }
-                                    // A single failed renewal is survivable
-                                    // because the lease outlasts several
-                                    // intervals, so keep trying.
-                                    Err(e) => error!(
-                                        "Failed to renew the lease on bug {}: {}",
-                                        heartbeat_bug, e
-                                    ),
                                 }
-                            }
-                        });
+                            })
+                            .abort_handle(),
+                        );
 
                         let db = db.with_bug_actor(
                             actor,
@@ -175,7 +193,7 @@ impl BugWorker {
                         // still in flight is harmless because it matches on
                         // locked_by, which both paths below clear, so it can
                         // only be a no-op once they have run.
-                        heartbeat.abort();
+                        drop(heartbeat);
 
                         match analysis {
                             Ok(outcome) => {
@@ -209,5 +227,44 @@ impl BugWorker {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// An unwinding scope only drops its locals, so this is the case a bare
+    /// JoinHandle used to miss: the renewal outlived the work it was covering.
+    #[tokio::test]
+    async fn guard_stops_its_task_when_the_scope_unwinds() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let task_ticks = ticks.clone();
+
+        let unwound = std::panic::AssertUnwindSafe(async move {
+            let _guard = AbortOnDrop(
+                tokio::spawn(async move {
+                    loop {
+                        task_ticks.fetch_add(1, Ordering::SeqCst);
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .abort_handle(),
+            );
+            sleep(Duration::from_millis(20)).await;
+            panic!("the analysis failed");
+        });
+
+        assert!(futures::FutureExt::catch_unwind(unwound).await.is_err());
+
+        let after_unwind = ticks.load(Ordering::SeqCst);
+        assert!(after_unwind > 0, "the task never got to run");
+        sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            after_unwind,
+            ticks.load(Ordering::SeqCst),
+            "the task kept running after its guard was dropped"
+        );
     }
 }
