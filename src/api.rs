@@ -2578,6 +2578,10 @@ mod tests {
         settings.server.acl.security = vec!["security@example.org".to_string()];
         settings.server.acl.admins = vec!["operator@example.org".to_string()];
         settings.server.acl.blocklist = Vec::new();
+        // The capability assertions below exercise the loopback bypass, which
+        // no longer applies unless the deployment vouches for the topology.
+        settings.server.trust_loopback = true;
+
         let settings = Arc::new(settings);
         let (event_tx, _event_rx) = mpsc::channel(10);
         let (fetch_tx, _fetch_rx) = mpsc::channel(10);
@@ -3617,6 +3621,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_loopback_grants_nothing_until_the_topology_is_vouched_for() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+
+        let state_with = |trust_loopback: bool| {
+            let mut settings = crate::settings::Settings::new().unwrap();
+            settings.server.trust_loopback = trust_loopback;
+            settings.server.testing_mode = false;
+            let (event_tx, _event_rx) = mpsc::channel(10);
+            let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+            Arc::new(AppState {
+                settings: Arc::new(settings),
+                db: db.clone(),
+                sender: event_tx,
+                fetch_sender: fetch_tx,
+                read_only: false,
+                forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
+                allow_all_submit: false,
+                smtp_enabled: false,
+                dry_run: true,
+                sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
+                stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+                stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
+                stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
+                messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
+                patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
+                patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+                messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+                bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+            })
+        };
+
+        let addr = "127.0.0.1:12345".parse().unwrap();
+        let bare = axum::http::HeaderMap::new();
+
+        // The dangerous shape: a reverse proxy that forwards no markers makes
+        // every remote request look exactly like this one. Refusing by default
+        // is what stops a proxy nobody configured from publishing the bypass.
+        assert!(
+            !is_authorized(
+                &addr,
+                &state_with(false),
+                &bare,
+                None,
+                crate::settings::Permission::Review
+            ),
+            "loopback granted review without the deployment vouching for it"
+        );
+
+        assert!(
+            is_authorized(
+                &addr,
+                &state_with(true),
+                &bare,
+                None,
+                crate::settings::Permission::Review
+            ),
+            "an opted-in deployment lost its loopback bypass"
+        );
+
+        // Where a marker does appear it proves the caller is remote, so it
+        // still overrides the opt-in.
+        let mut forwarded = axum::http::HeaderMap::new();
+        forwarded.insert("x-forwarded-for", "203.0.113.195".parse().unwrap());
+        assert!(
+            !is_authorized(
+                &addr,
+                &state_with(true),
+                &forwarded,
+                None,
+                crate::settings::Permission::Review
+            ),
+            "a forwarded request was treated as local"
+        );
+    }
+
+    #[tokio::test]
+
     async fn test_bug_reads_require_an_authorized_principal() {
         const SECRET: &str = "bug-authz-secret-12345678901234567890";
         let db_settings = crate::settings::DatabaseSettings {
@@ -3873,11 +3959,18 @@ pub fn is_authorized(
     if state.allow_all_submit {
         return true;
     }
-    if addr.ip().to_canonical().is_loopback() && perm.allows_loopback_bypass() {
-        let has_proxy = headers.contains_key("x-forwarded-for")
+    if state.settings.server.trust_loopback
+        && addr.ip().to_canonical().is_loopback()
+        && perm.allows_loopback_bypass()
+    {
+        // A forwarded request also reaches us from loopback, so these markers
+        // still veto the bypass where they appear. They cannot be relied on to
+        // appear at all, which is why the operator has to vouch for the
+        // topology above rather than leaving it to be guessed here.
+        let forwarded = headers.contains_key("x-forwarded-for")
             || headers.contains_key("x-real-ip")
             || headers.contains_key("forwarded");
-        if !has_proxy {
+        if !forwarded {
             return true;
         }
     }

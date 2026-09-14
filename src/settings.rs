@@ -569,6 +569,22 @@ pub struct ServerSettings {
     /// developer machine with no real users.
     #[serde(default)]
     pub log_sign_in_links: bool,
+    /// Grants unauthenticated ingest, review and cancel to callers arriving on
+    /// the loopback interface.
+    ///
+    /// This has to be opted into, because the interface on its own proves
+    /// nothing. The deployed topology binds loopback and puts a reverse proxy
+    /// in front of it, so a request from the public internet also arrives from
+    /// loopback. Whether a proxy is present cannot be inferred either: a proxy
+    /// only forwards the usual markers when it is configured to, and nginx
+    /// forwards none of them unless told, so a missing header is
+    /// indistinguishable from a genuinely local caller.
+    ///
+    /// Leaving this off is therefore the only safe default. Turn it on for a
+    /// workstation that is not behind a proxy.
+    #[serde(default)]
+    pub trust_loopback: bool,
+
     #[serde(default)]
     pub acl: AclSettings,
 }
@@ -1136,6 +1152,7 @@ mod tests {
             testing_mode: false,
             jwt_secret: None,
             log_sign_in_links: false,
+            trust_loopback: false,
             acl: AclSettings::default(),
         };
         assert_eq!(server.sign_in_base_url(), "https://sashiko.example.org");
