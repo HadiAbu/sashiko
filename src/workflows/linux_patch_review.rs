@@ -467,9 +467,25 @@ pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
                 .selected_prompts
                 .into_iter()
                 .filter(|name| !is_stage_exclusive_guide(name))
+                .filter(|name| {
+                    // These names become file paths under the prompt tree and
+                    // their contents are inlined into every stage's system
+                    // prompt. The model chooses them, and a patch from a public
+                    // list can steer that choice, so anything that is not a
+                    // plain file name is dropped rather than resolved.
+                    let plain = !name.is_empty()
+                        && !name.contains('/')
+                        && !name.contains('\\')
+                        && !name.contains("..");
+                    if !plain {
+                        tracing::warn!("Ignoring prescreen guide with a path in its name: {name}");
+                    }
+                    plain
+                })
                 .collect();
             state.selected_guides = prompts;
         })
+
         .build()
 }
 
