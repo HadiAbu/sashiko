@@ -77,6 +77,12 @@ spec:
             # is served at. Startup fails without this whenever SMTP is set.
             - name: SASHIKO__SERVER__PUBLIC_BASE_URL
               value: "https://sashiko.dev"
+            # Who may act on the service once signed in. The capability lists
+            # live here rather than in the image's Settings.toml, which every
+            # deployment shares, and read a comma separated string for exactly
+            # that reason.
+            - name: SASHIKO__SERVER__ACL__ADMINS
+              value: "roman.gushchin@linux.dev"
             - name: SASHIKO__PROJECT__DOMAIN
               value: "sashiko.dev"
             - name: SASHIKO__AI__MODEL
@@ -126,6 +132,14 @@ spec:
                 secretKeyRef:
                   name: sashiko-secrets
                   key: LLM_API_KEY
+            # Signs sign-in links and the sessions they establish. Without it
+            # nobody can sign in, and replacing it signs everyone out, so it
+            # lives in the Secret rather than being minted at startup.
+            - name: SASHIKO__SERVER__JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-secrets
+                  key: SASHIKO__SERVER__JWT_SECRET
           args: ["--debug", "--track", "--download", "10"]
           volumeMounts:
             - name: sashiko-storage
