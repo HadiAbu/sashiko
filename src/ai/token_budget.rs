@@ -46,6 +46,28 @@ impl TokenBudget {
         self.current = 0;
     }
 
+    /// Bytes of text assumed to make up one token.
+    ///
+    /// Three is what the content these budgets are spent on actually measures:
+    /// source code, diffs and lock files all sit near three bytes per token.
+    /// Prose runs closer to four, so assuming three over-counts it and
+    /// truncates a little early. That is the direction to be wrong in, because
+    /// the opposite lets a tool result overrun the budget it was given.
+    pub const BYTES_PER_TOKEN: usize = 3;
+
+    /// Approximates the token count of a string from its byte length.
+    ///
+    /// This is deliberately arithmetic rather than a real encode. Sashiko
+    /// talks to several providers and each has its own vocabulary, so a count
+    /// produced by any single tokenizer is an approximation of the model
+    /// actually in use no matter how exact that tokenizer is. Callers spend
+    /// the number on context budgets that are orders of magnitude larger than
+    /// the error, while a real encode over a large tool output costs enough
+    /// CPU to stall the async runtime that asked for it.
+    pub fn approximate_tokens(text: &str) -> usize {
+        text.len().div_ceil(Self::BYTES_PER_TOKEN)
+    }
+
     /// Estimate token count for a string using cl100k_base (GPT-4/Gemini approximation).
     pub fn estimate_tokens(text: &str) -> usize {
         if text.is_empty() {
