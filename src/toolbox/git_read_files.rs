@@ -136,6 +136,12 @@ impl GitReadFilesTool {
     ) -> Result<Value> {
         let revision_virt = context.virtualize_ref(revision);
         let revision = revision_virt.as_str();
+        // Revision and path are joined into a single argument, so a leading
+        // dash on either end makes git read the whole thing as an option
+        // rather than as a rev:path pair.
+        if revision.starts_with('-') {
+            return Err(anyhow!("Invalid revision name: {}", revision));
+        }
         if path_str.starts_with('-') {
             return Err(anyhow!("Invalid path name: {}", path_str));
         }
