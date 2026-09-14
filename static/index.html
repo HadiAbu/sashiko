@@ -1534,7 +1534,6 @@
             selectedSubsystems: null,
             bugMinSeverity: '',
             bugLifecycleStatus: 'open',
-            bugPipelineState: '',
             bugAssignee: '',
             bugSortBy: 'severity',
             bugSortOrder: 'desc',
@@ -2703,14 +2702,6 @@
                             <option value="fixed" ${state.bugLifecycleStatus === 'fixed' ? 'selected' : ''}>Fixed</option>
                             <option value="closed" ${state.bugLifecycleStatus === 'closed' ? 'selected' : ''}>Closed</option>
                         </select>
-                        <select id="bugPipelineSelector" onchange="setBugFilter('pipeline_state', this.value)">
-                            <option value="" ${!state.bugPipelineState ? 'selected' : ''}>Any Analysis</option>
-                            <option value="pending" ${state.bugPipelineState === 'pending' ? 'selected' : ''}>Queued</option>
-                            <option value="running" ${state.bugPipelineState === 'running' ? 'selected' : ''}>Analyzing</option>
-                            <option value="succeeded" ${state.bugPipelineState === 'succeeded' ? 'selected' : ''}>Analyzed</option>
-                            <option value="failed" ${state.bugPipelineState === 'failed' ? 'selected' : ''}>Failed</option>
-                            <option value="abandoned" ${state.bugPipelineState === 'abandoned' ? 'selected' : ''}>Abandoned</option>
-                        </select>
                         <input type="text" id="bugAssigneeFilter" placeholder="Assignee (or none)" value="${escapeHtml(state.bugAssignee)}" style="width: 160px;" onchange="setBugFilter('assignee', this.value)">
                     </div>
 
@@ -2821,9 +2812,6 @@
                 }
                 if (state.bugLifecycleStatus) {
                     url += `&lifecycle_status=${encodeURIComponent(state.bugLifecycleStatus)}`;
-                }
-                if (state.bugPipelineState) {
-                    url += `&pipeline_state=${encodeURIComponent(state.bugPipelineState)}`;
                 }
                 if (state.bugAssignee) {
                     url += `&assignee=${encodeURIComponent(state.bugAssignee)}`;
@@ -3211,9 +3199,6 @@
                     renderSubsystemDropdown();
                 });
             }
-            if (key === 'pipeline_state') {
-                state.bugPipelineState = value;
-            }
             if (key === 'assignee') {
                 state.bugAssignee = value.trim();
             }
@@ -3228,7 +3213,6 @@
                 state.bugSubsystem = '';
                 state.bugMinSeverity = '';
                 state.bugLifecycleStatus = 'open';
-                state.bugPipelineState = '';
                 state.bugAssignee = '';
                 state.bugSortBy = 'severity';
                 state.bugSortOrder = 'desc';
@@ -3242,8 +3226,6 @@
                 if (sevSel) sevSel.value = '';
                 const statSel = document.getElementById('bugStatusSelector');
                 if (statSel) statSel.value = 'open';
-                const pipeSel = document.getElementById('bugPipelineSelector');
-                if (pipeSel) pipeSel.value = '';
                 const assigneeInput = document.getElementById('bugAssigneeFilter');
                 if (assigneeInput) assigneeInput.value = '';
             }
