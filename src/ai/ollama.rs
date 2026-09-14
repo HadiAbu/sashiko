@@ -14,7 +14,6 @@
 
 // This code was based on openai.rs
 
-use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
     ProviderCapabilities, ToolCall, classify_status_code,
@@ -340,37 +339,6 @@ fn translate_ollama_response(resp: OllamaResponse) -> Result<AiResponse> {
     })
 }
 
-/// Estimate token count for a request.
-fn estimate_tokens(request: &AiRequest) -> usize {
-    let mut total = 0;
-
-    if let Some(system) = &request.system {
-        total += TokenBudget::estimate_tokens(system);
-    }
-
-    for msg in &request.messages {
-        if let Some(content) = &msg.content {
-            total += TokenBudget::estimate_tokens(content);
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            for call in tool_calls {
-                total += TokenBudget::estimate_tokens(&call.function_name);
-                total += TokenBudget::estimate_tokens(&call.arguments.to_string());
-            }
-        }
-    }
-
-    if let Some(tools) = &request.tools {
-        for tool in tools {
-            total += TokenBudget::estimate_tokens(&tool.name);
-            total += TokenBudget::estimate_tokens(&tool.description);
-            total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
-        }
-    }
-
-    total
-}
-
 #[async_trait]
 impl AiProvider for OllamaClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
@@ -388,10 +356,6 @@ impl AiProvider for OllamaClient {
         let resp = self.post_request(&resp_body).await?;
 
         translate_ollama_response(resp)
-    }
-
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens(request)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -628,29 +592,6 @@ mod tests {
             OllamaClient::default_context_window_for_model("mistral"),
             128_000
         );
-    }
-
-    #[test]
-    fn test_estimate_tokens_basic() {
-        let request = AiRequest {
-            system: Some("System prompt".to_string()),
-            messages: vec![AiMessage {
-                role: AiRole::User,
-                content: Some("Hello world".to_string()),
-                thought: None,
-                thought_signature: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            tools: None,
-            temperature: None,
-            response_format: None,
-            context_tag: None,
-        };
-
-        let tokens = estimate_tokens(&request);
-        assert!(tokens > 0);
-        assert!(tokens < 100);
     }
 
     #[test]

@@ -232,11 +232,6 @@ impl AiProvider for GooseCliProvider {
         parse_inner_response(&text, usage)
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        let prompt = build_prompt(request);
-        TokenBudget::estimate_tokens(&prompt)
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),
@@ -460,12 +455,6 @@ mod tests {
     fn usage_is_absent_without_counts() {
         let result = serde_json::json!({"stopReason": "end_turn"});
         assert!(usage_from_result(&result).is_none());
-    }
-
-    #[test]
-    fn estimate_tokens_is_non_zero() {
-        let provider = test_provider("goose", "openai");
-        assert!(provider.estimate_tokens(&sample_request()) > 0);
     }
 
     #[test]

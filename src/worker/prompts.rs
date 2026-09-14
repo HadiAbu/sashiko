@@ -947,9 +947,6 @@ mod tests {
         ) -> anyhow::Result<crate::ai::AiResponse> {
             anyhow::bail!("mock: simulated AI failure")
         }
-        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
-            0
-        }
         fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
             crate::ai::ProviderCapabilities {
                 model_name: "mock".to_string(),
@@ -1092,10 +1089,6 @@ mod tests {
                     "Remote AI Error: Gemini candidate blocked again (finish reason: RECITATION)"
                 )
             }
-        }
-
-        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
-            0
         }
 
         fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
@@ -1267,10 +1260,6 @@ mod tests {
                 usage: None,
                 truncated: false,
             })
-        }
-
-        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
-            0
         }
 
         fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {

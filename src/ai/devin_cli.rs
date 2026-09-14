@@ -146,16 +146,6 @@ impl AiProvider for DevinCliProvider {
         parse_inner_response(&raw, None)
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        let chars: usize = request
-            .messages
-            .iter()
-            .filter_map(|m| m.content.as_ref())
-            .map(|c| c.len())
-            .sum();
-        chars / 4
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone().unwrap_or_else(|| "default".to_string()),

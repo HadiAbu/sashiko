@@ -590,32 +590,6 @@ fn translate_vllm_response(resp: VllmResponse) -> Result<AiResponse> {
     })
 }
 
-fn estimate_tokens_generic(request: &AiRequest) -> usize {
-    let mut total = 0;
-    if let Some(system) = &request.system {
-        total += TokenBudget::estimate_tokens(system);
-    }
-    for msg in &request.messages {
-        if let Some(content) = &msg.content {
-            total += TokenBudget::estimate_tokens(content);
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            for call in tool_calls {
-                total += TokenBudget::estimate_tokens(&call.function_name);
-                total += TokenBudget::estimate_tokens(&call.arguments.to_string());
-            }
-        }
-    }
-    if let Some(tools) = &request.tools {
-        for tool in tools {
-            total += TokenBudget::estimate_tokens(&tool.name);
-            total += TokenBudget::estimate_tokens(&tool.description);
-            total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
-        }
-    }
-    total
-}
-
 #[async_trait]
 impl AiProvider for VllmClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
@@ -643,10 +617,6 @@ impl AiProvider for VllmClient {
         let resp_body = serde_json::to_value(&vllm_req)?;
         let resp = self.post_request(&resp_body).await?;
         translate_vllm_response(resp)
-    }
-
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens_generic(request)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -1235,15 +1205,5 @@ mod tests {
 
         let err = VllmError::ApiError(reqwest::StatusCode::BAD_REQUEST, "bad".to_string());
         assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
-    }
-
-    #[test]
-    fn test_estimate_tokens_basic() {
-        let mut request = user_request("Hello world");
-        request.system = Some("System prompt".to_string());
-
-        let tokens = estimate_tokens_generic(&request);
-        assert!(tokens > 0);
-        assert!(tokens < 100);
     }
 }

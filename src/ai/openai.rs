@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiUsage,
     ClassifyAiError, ProviderCapabilities, ToolCall, classify_status_code,
@@ -560,32 +559,6 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
     })
 }
 
-fn estimate_tokens_generic(request: &AiRequest) -> usize {
-    let mut total = 0;
-    if let Some(system) = &request.system {
-        total += TokenBudget::estimate_tokens(system);
-    }
-    for msg in &request.messages {
-        if let Some(content) = &msg.content {
-            total += TokenBudget::estimate_tokens(content);
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            for call in tool_calls {
-                total += TokenBudget::estimate_tokens(&call.function_name);
-                total += TokenBudget::estimate_tokens(&call.arguments.to_string());
-            }
-        }
-    }
-    if let Some(tools) = &request.tools {
-        for tool in tools {
-            total += TokenBudget::estimate_tokens(&tool.name);
-            total += TokenBudget::estimate_tokens(&tool.description);
-            total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
-        }
-    }
-    total
-}
-
 #[async_trait]
 impl AiProvider for OpenAiCompatClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
@@ -597,10 +570,6 @@ impl AiProvider for OpenAiCompatClient {
         let resp_body = serde_json::to_value(&openai_req)?;
         let resp = self.post_request(&resp_body).await?;
         translate_ai_response(resp)
-    }
-
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens_generic(request)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -1287,48 +1256,6 @@ mod tests {
 
         let result = translate_ai_response(openai_resp);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_estimate_tokens() {
-        let request = AiRequest {
-            system: Some("System prompt".to_string()),
-            messages: vec![
-                AiMessage {
-                    role: AiRole::User,
-                    content: Some("Short message".to_string()),
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-                AiMessage {
-                    role: AiRole::Assistant,
-                    content: None,
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: Some(vec![ToolCall {
-                        id: "c1".to_string(),
-                        function_name: "my_function".to_string(),
-                        arguments: json!({"key": "value"}),
-                        thought_signature: None,
-                    }]),
-                    tool_call_id: None,
-                },
-            ],
-            tools: Some(vec![AiTool {
-                name: "my_function".to_string(),
-                description: "Does something".to_string(),
-                parameters: json!({"type": "object"}),
-            }]),
-            temperature: None,
-            response_format: None,
-            context_tag: None,
-        };
-
-        let tokens = estimate_tokens_generic(&request);
-        assert!(tokens > 10);
-        assert!(tokens < 200);
     }
 
     #[test]

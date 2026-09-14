@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
     AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ProviderCapabilities, ToolCall,
 };
@@ -439,32 +438,6 @@ fn translate_response(
     })
 }
 
-fn estimate_tokens_generic(request: &AiRequest) -> usize {
-    let mut total = 0;
-    if let Some(system) = &request.system {
-        total += TokenBudget::estimate_tokens(system);
-    }
-    for msg in &request.messages {
-        if let Some(content) = &msg.content {
-            total += TokenBudget::estimate_tokens(content);
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            for call in tool_calls {
-                total += TokenBudget::estimate_tokens(&call.function_name);
-                total += TokenBudget::estimate_tokens(&call.arguments.to_string());
-            }
-        }
-    }
-    if let Some(tools) = &request.tools {
-        for tool in tools {
-            total += TokenBudget::estimate_tokens(&tool.name);
-            total += TokenBudget::estimate_tokens(&tool.description);
-            total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
-        }
-    }
-    total
-}
-
 #[async_trait]
 impl AiProvider for BedrockClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
@@ -521,10 +494,6 @@ impl AiProvider for BedrockClient {
         info!("Bedrock response received. Tokens: {}", usage_str);
 
         translate_response(&resp)
-    }
-
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens_generic(request)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {

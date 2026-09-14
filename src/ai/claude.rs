@@ -616,41 +616,6 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
     })
 }
 
-pub fn estimate_tokens_generic(request: &AiRequest) -> usize {
-    use crate::ai::token_budget::TokenBudget;
-
-    let mut total = 0;
-
-    // Count system prompt tokens
-    if let Some(system) = &request.system {
-        total += TokenBudget::estimate_tokens(system);
-    }
-
-    // Count message tokens
-    for msg in &request.messages {
-        if let Some(content) = &msg.content {
-            total += TokenBudget::estimate_tokens(content);
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            for call in tool_calls {
-                total += TokenBudget::estimate_tokens(&call.function_name);
-                total += TokenBudget::estimate_tokens(&call.arguments.to_string());
-            }
-        }
-    }
-
-    // Count tool definition tokens
-    if let Some(tools) = &request.tools {
-        for tool in tools {
-            total += TokenBudget::estimate_tokens(&tool.name);
-            total += TokenBudget::estimate_tokens(&tool.description);
-            total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
-        }
-    }
-
-    total
-}
-
 // --- AiProvider Implementation ---
 
 #[async_trait]
@@ -673,11 +638,6 @@ impl AiProvider for ClaudeClient {
 
         // 4. Translate response back to generic format
         translate_ai_response(&response)
-    }
-
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        // Reuse existing cl100k_base tokenizer from token_budget.rs
-        estimate_tokens_generic(request)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -750,10 +710,6 @@ impl AiProvider for StdioClaudeClient {
                 "IPC channel disconnected waiting for response"
             )),
         }
-    }
-
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens_generic(request)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {

@@ -154,11 +154,6 @@ impl AiProvider for KiroCliProvider {
         parse_inner_response(&text, usage)
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        let prompt = build_prompt(request);
-        TokenBudget::estimate_tokens(&prompt)
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),
@@ -325,21 +320,6 @@ mod tests {
         let text = "This is not JSON at all.";
         let resp = parse_inner_response(text, None).unwrap();
         assert_eq!(resp.content.as_deref(), Some(text));
-    }
-
-    #[test]
-    fn test_estimate_tokens_uses_token_budget() {
-        let provider = KiroCliProvider {
-            model: "test".to_string(),
-            binary: "kiro-cli".to_string(),
-            agent: None,
-            context_window_size: 200_000,
-            timeout_secs: 300,
-        };
-        let req = sample_request();
-        let estimate = provider.estimate_tokens(&req);
-        // The prompt is non-empty, so estimate should be > 0
-        assert!(estimate > 0);
     }
 
     #[tokio::test]

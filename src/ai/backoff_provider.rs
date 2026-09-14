@@ -209,10 +209,6 @@ impl AiProvider for BackoffProvider {
         }
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        self.inner.estimate_tokens(request)
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         self.inner.get_capabilities()
     }
@@ -264,10 +260,6 @@ mod tests {
                 usage: None,
                 truncated: false,
             })
-        }
-
-        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
-            0
         }
 
         fn get_capabilities(&self) -> ProviderCapabilities {

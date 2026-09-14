@@ -1274,9 +1274,6 @@ mod tests {
         ) -> Result<crate::ai::AiResponse> {
             unreachable!("decoration tests never issue a request")
         }
-        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
-            0
-        }
         fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
             crate::ai::ProviderCapabilities {
                 model_name: "stub".into(),
@@ -1316,9 +1313,6 @@ mod tests {
                 usage: None,
                 truncated: false,
             })
-        }
-        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
-            0
         }
         fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
             crate::ai::ProviderCapabilities {

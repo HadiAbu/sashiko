@@ -271,10 +271,6 @@ impl AiProvider for VertexClient {
         }
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        claude::estimate_tokens_generic(request)
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),

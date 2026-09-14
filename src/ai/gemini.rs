@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ai::token_budget::TokenBudget;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, AiRole, AiUsage, ClassifyAiError,
     ProviderCapabilities, ToolCall, classify_status_code,
@@ -474,10 +473,6 @@ impl AiProvider for StdioGeminiClient {
         }
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens_generic(request)
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: "stdio-gemini".to_string(),
@@ -769,39 +764,12 @@ fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiResponse> {
     })
 }
 
-fn estimate_tokens_generic(request: &AiRequest) -> usize {
-    let mut total = 0;
-    for msg in &request.messages {
-        if let Some(content) = &msg.content {
-            total += TokenBudget::estimate_tokens(content);
-        }
-        if let Some(tool_calls) = &msg.tool_calls {
-            for call in tool_calls {
-                total += TokenBudget::estimate_tokens(&call.function_name);
-                total += TokenBudget::estimate_tokens(&call.arguments.to_string());
-            }
-        }
-    }
-    if let Some(tools) = &request.tools {
-        for tool in tools {
-            total += TokenBudget::estimate_tokens(&tool.name);
-            total += TokenBudget::estimate_tokens(&tool.description);
-            total += TokenBudget::estimate_tokens(&tool.parameters.to_string());
-        }
-    }
-    total
-}
-
 #[async_trait]
 impl AiProvider for GeminiClient {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
         let gen_req = translate_ai_request(request)?;
         let resp = GenAiClient::generate_content(self, gen_req).await?;
         translate_ai_response(resp)
-    }
-
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        estimate_tokens_generic(request)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -1180,53 +1148,6 @@ mod tests {
         );
 
         Ok(())
-    }
-
-    #[test]
-    fn test_estimate_tokens_logic() {
-        let request = AiRequest {
-            system: None,
-            messages: vec![
-                AiMessage {
-                    role: AiRole::User,
-                    content: Some("Short message".to_string()),
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                },
-                AiMessage {
-                    role: AiRole::Assistant,
-                    content: None,
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: Some(vec![ToolCall {
-                        id: "c1".to_string(),
-                        function_name: "my_function".to_string(),
-                        arguments: json!({"key": "value"}),
-                        thought_signature: None,
-                    }]),
-                    tool_call_id: None,
-                },
-            ],
-            tools: Some(vec![AiTool {
-                name: "my_function".to_string(),
-                description: "Does something".to_string(),
-                parameters: json!({"type": "OBJECT"}),
-            }]),
-            temperature: None,
-            response_format: None,
-            context_tag: None,
-        };
-
-        let tokens = estimate_tokens_generic(&request);
-        // "Short message" is ~2-3 tokens
-        // "my_function" is ~2 tokens
-        // "{\"key\": \"value\"}" is ~7 tokens
-        // tool metadata...
-        // Total should be around 20-40 tokens.
-        assert!(tokens > 10);
-        assert!(tokens < 200);
     }
 
     #[test]

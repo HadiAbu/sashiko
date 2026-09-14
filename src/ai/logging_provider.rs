@@ -114,10 +114,6 @@ impl AiProvider for LoggingProvider {
         Ok(response)
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        self.inner.estimate_tokens(request)
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         self.inner.get_capabilities()
     }

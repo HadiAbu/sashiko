@@ -166,16 +166,6 @@ impl AiProvider for ClaudeCliProvider {
         parse_inner_response(&result_text, usage)
     }
 
-    fn estimate_tokens(&self, request: &AiRequest) -> usize {
-        let chars: usize = request
-            .messages
-            .iter()
-            .filter_map(|m| m.content.as_ref())
-            .map(|c| c.len())
-            .sum();
-        chars / 4
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: self.model.clone(),

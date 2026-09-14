@@ -2603,9 +2603,6 @@ mod tests {
                 truncated: false,
             })
         }
-        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
-            0
-        }
         fn get_capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {
                 model_name: "mock".to_string(),
@@ -2620,10 +2617,6 @@ mod tests {
     impl AiProvider for FailingProvider {
         async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
             Err(anyhow::anyhow!("fatal provider failure"))
-        }
-
-        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
-            0
         }
 
         fn get_capabilities(&self) -> ProviderCapabilities {
@@ -2656,10 +2649,6 @@ mod tests {
                 usage: None,
                 truncated: false,
             })
-        }
-
-        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
-            0
         }
 
         fn get_capabilities(&self) -> ProviderCapabilities {
@@ -3182,9 +3171,6 @@ fi
                 }),
                 truncated: false,
             })
-        }
-        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
-            0
         }
         fn get_capabilities(&self) -> ProviderCapabilities {
             ProviderCapabilities {

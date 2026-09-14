@@ -21,10 +21,6 @@ impl AiProvider for RecordingProvider {
         })
     }
 
-    fn estimate_tokens(&self, _request: &AiRequest) -> usize {
-        0
-    }
-
     fn get_capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             model_name: "mock".to_string(),

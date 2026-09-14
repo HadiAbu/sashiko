@@ -368,9 +368,6 @@ pub trait AiProvider: Send + Sync {
     /// Generates content based on the provided request.
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse>;
 
-    /// Estimates the number of tokens that will be consumed by the given request.
-    fn estimate_tokens(&self, request: &AiRequest) -> usize;
-
     /// Returns the capabilities and constraints of this provider.
     fn get_capabilities(&self) -> ProviderCapabilities;
 
