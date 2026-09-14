@@ -833,7 +833,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start Email Worker
     let email_handle = if let Some(smtp_settings) = settings.smtp.clone() {
-        let email_worker = sashiko::worker::email::EmailWorker::new(db.clone(), smtp_settings);
+        let email_worker = sashiko::worker::email::EmailWorker::new(
+            db.clone(),
+            smtp_settings,
+            settings.server.log_sign_in_links,
+        );
+
         Some(tokio::spawn(async move {
             email_worker.run().await;
         }))

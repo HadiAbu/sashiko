@@ -560,6 +560,15 @@ pub struct ServerSettings {
     #[serde(default)]
     pub testing_mode: bool,
     pub jwt_secret: Option<String>,
+    /// Prints sign-in links in full to the log.
+    ///
+    /// A sign-in link is a bearer credential, and the log is the one place it
+    /// is read by something other than its recipient: proxies, log shippers and
+    /// anyone with journal access all see it. It is therefore withheld unless
+    /// this is switched on deliberately, which is only reasonable on a
+    /// developer machine with no real users.
+    #[serde(default)]
+    pub log_sign_in_links: bool,
     #[serde(default)]
     pub acl: AclSettings,
 }
@@ -1126,19 +1135,33 @@ mod tests {
             read_only: false,
             testing_mode: false,
             jwt_secret: None,
+            log_sign_in_links: false,
             acl: AclSettings::default(),
         };
         assert_eq!(server.sign_in_base_url(), "https://sashiko.example.org");
 
-        // With nothing configured the link is only ever logged, so a
+        // With nothing configured the link never leaves the machine, so a
         // best-effort address is enough.
         server.public_base_url = None;
         assert_eq!(server.sign_in_base_url(), "http://:::8080");
     }
 
     #[test]
+    fn test_sign_in_link_logging_is_off_unless_asked_for() {
+        // A configuration that never mentions the switch must not print
+        // credentials, because that is the configuration everyone deploys.
+        let server: ServerSettings = toml::from_str("host = \"::\"\nport = 8080").unwrap();
+        assert!(!server.log_sign_in_links);
+
+        let opted_in: ServerSettings =
+            toml::from_str("host = \"::\"\nport = 8080\nlog_sign_in_links = true").unwrap();
+        assert!(opted_in.log_sign_in_links);
+    }
+
+    #[test]
     fn test_startup_refuses_to_mail_links_nobody_can_open() {
         let mut settings = Settings::new().unwrap();
+
         // Shipped configuration has no SMTP, so the link is logged and the
         // base URL is nobody's problem.
         assert!(settings.smtp.is_none());

@@ -9,11 +9,22 @@ use tracing::{error, info, warn};
 pub struct EmailWorker {
     db: std::sync::Arc<crate::db::Database>,
     settings: SmtpSettings,
+    /// Mirrors server.log_sign_in_links, so that the one switch governs every
+    /// place a link could reach the log.
+    log_sign_in_links: bool,
 }
 
 impl EmailWorker {
-    pub fn new(db: std::sync::Arc<crate::db::Database>, settings: SmtpSettings) -> Self {
-        Self { db, settings }
+    pub fn new(
+        db: std::sync::Arc<crate::db::Database>,
+        settings: SmtpSettings,
+        log_sign_in_links: bool,
+    ) -> Self {
+        Self {
+            db,
+            settings,
+            log_sign_in_links,
+        }
     }
 
     pub async fn run(&self) {
@@ -68,7 +79,17 @@ impl EmailWorker {
                 "DRY RUN: Would have sent email to {}, cc {}, subject '{}'",
                 email_row.to_addresses, email_row.cc_addresses, email_row.subject
             );
-            info!("DRY RUN Body:\n{}", email_row.body);
+            // The body of a sign-in mail carries the link, which is a bearer
+            // credential and so is withheld from the log by default. Every
+            // other kind of mail is safe to show in full.
+            if email_row.kind == crate::db::EmailKind::SignInLink && !self.log_sign_in_links {
+                info!(
+                    "DRY RUN Body withheld because it contains a sign-in link. Set \
+                     server.log_sign_in_links to print it."
+                );
+            } else {
+                info!("DRY RUN Body:\n{}", email_row.body);
+            }
             return Ok(());
         }
 

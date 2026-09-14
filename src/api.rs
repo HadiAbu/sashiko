@@ -4011,8 +4011,19 @@ async fn request_link(
                         StatusCode::INTERNAL_SERVER_ERROR
                     })?;
                 tracing::info!("Queued sign-in link email for {}", email);
-            } else {
+            } else if state.settings.server.log_sign_in_links {
                 tracing::info!("SIGN-IN LINK REQUESTED for {}: {}", email, link);
+            } else {
+                // The link is a bearer credential, so it is not written to the
+                // log by default. Without a transport there is nothing else to
+                // do with it, which is worth saying plainly rather than
+                // leaving the request looking like it succeeded.
+                tracing::warn!(
+                    "Sign-in link requested for {} but no SMTP transport is configured, \
+                     so it could not be delivered. Set server.log_sign_in_links to print \
+                     it to the log instead.",
+                    email
+                );
             }
         } else {
             if !rate_ok {

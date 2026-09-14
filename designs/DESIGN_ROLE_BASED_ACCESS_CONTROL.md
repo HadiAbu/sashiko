@@ -168,7 +168,41 @@ sequenceDiagram
 - **Storage**: Only the SHA-256 hash of the token is stored in the database.
 - **Revocability**: Users and Root maintainers can view token metadata (prefix, description, created_at, last_used_at, expires_at) and immediately revoke active keys.
 
+### 3. Sign-in Links
+
+A sign-in link is itself an HS256 JWT carrying `typ: "sign_in_link"`, distinct
+from the `typ: "session"` token it is exchanged for. It lives for 30 minutes and
+is redeemed at `GET /api/auth/verify`, which returns a 24 hour session that can
+be refreshed up to a 30 day cap measured from the original `iat`.
+
+#### Links are withheld from the log by default
+
+The link is a bearer credential, so it must not be written anywhere that is read
+by something other than its recipient. Logs are the worst offender: they are
+shipped, aggregated and retained, and are typically readable by more people than
+the mailbox is.
+
+Two places would otherwise print it, and both are now governed by the single
+`server.log_sign_in_links` switch, which defaults to **off**:
+
+- the sign-in request handler, when no SMTP transport is configured and the link
+  would otherwise have nowhere to go;
+- the email worker's dry-run body dump. Only `EmailKind::SignInLink` bodies are
+  withheld; every other kind of mail still logs in full, because none of them
+  carries a credential.
+
+With the switch off and no transport configured, the request is logged at `warn`
+without the link, saying plainly that it could not be delivered. That is
+preferable to a line that looks like success.
+
+Enabling the switch is reasonable only on a developer machine with no real
+users. Note that the link still reaches the `email_outbox` table whenever a
+transport is configured, including in dry-run mode: that is inherent to having a
+mail queue, and the database is expected to be protected at least as well as the
+mailbox.
+
 ---
+
 
 ## Rust Type System & Enforcements
 
