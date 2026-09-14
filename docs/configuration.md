@@ -144,6 +144,35 @@ Settings for the Kiro CLI provider (`provider = "kiro-cli"`).
 | `host` | string | `"::"` | Listen address. `"::"` binds to all interfaces (IPv4 and IPv6). |
 | `port` | integer | `8080` | Listen port for the web UI and API. |
 | `read_only` | bool | `false` | When true, disables write API endpoints. Set automatically by `--no-api`. |
+| `public_base_url` | string | -- | The URL the service is reachable at from outside, with no trailing slash. Required whenever `[smtp]` is configured: sign-in links are mailed, and the bind address names no host a recipient can open. The server refuses to start without it. |
+| `jwt_secret` | string | -- | Signs sign-in links and session tokens. Without it, sign-in returns `501` and no identity can be established. Keep it stable: replacing it invalidates every session and every unopened link. Prefer `SASHIKO__SERVER__JWT_SECRET` over writing it to disk. |
+| `log_sign_in_links` | bool | `false` | Writes sign-in links to the log. For a developer machine with no real users; a link in a log is a credential anyone reading the log can spend. |
+
+### `[server.acl]`
+
+Capability lists, matched against the address a caller signed in with. Every
+list is empty by default, which grants nothing (fail-closed). The local
+operator token covers `ingest`, `cancel` and `review` for tooling that can read
+the server's token file, so these lists are only about remote, identified
+callers.
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `admins` | list | All capabilities, including root-level maintenance operations. |
+| `security` | list | Reads and comments on every bug and reads raw AI transcripts. Grants no ingest, cancel or review. |
+| `bug_reporters` | list | May file new bugs over HTTP. Empty means only admins can. |
+| `ingest` | list | May submit patches (`/api/submit`). |
+| `cancel` | list | May halt running workloads. |
+| `review` | list | May trigger AI analyses of existing patches. |
+| `blocklist` | list | Denies everything, overriding every grant above. |
+
+Each list accepts either a TOML array or a comma separated string, so a
+deployment can name its operators through the environment instead of baking
+them into the image:
+
+```bash
+SASHIKO__SERVER__ACL__ADMINS="first@example.org,second@example.org"
+```
 
 ### `[git]`
 
