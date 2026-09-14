@@ -55,7 +55,9 @@ pub struct GooseCliProvider {
     /// Backend goose itself talks to, passed as GOOSE_PROVIDER.
     pub goose_provider: String,
     /// Extra environment for the child, e.g. OPENAI_HOST for a local vLLM
-    /// server. The parent environment is inherited; these entries win.
+    /// server. The parent environment is inherited and these entries win
+    /// over it, but not over the variables Sashiko pins to keep goose a
+    /// completion backend.
     pub env: BTreeMap<String, String>,
     pub context_window_size: usize,
     pub timeout_secs: u64,
@@ -82,8 +84,13 @@ fn create_isolated_config() -> Result<TempDir> {
     Ok(tmp)
 }
 
-/// Environment for one goose run. `env` overrides are applied last so a
-/// configuration file can correct any default.
+/// Environment for one goose run. The caller's entries land first, so they
+/// add to and override whatever goose would otherwise inherit from Sashiko,
+/// and the variables Sashiko derives from its own settings are pinned after
+/// them. A stray GOOSE_MODE or XDG_CONFIG_HOME in a configuration file
+/// therefore cannot hand goose back its own tools or the user's own
+/// configuration, and GOOSE_MODEL cannot drift away from the model the
+/// response cache is keyed on.
 fn build_env(
     model: &str,
     goose_provider: &str,
@@ -91,7 +98,7 @@ fn build_env(
     config_home: &str,
     extra: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    let mut env = BTreeMap::new();
+    let mut env = extra.clone();
     env.insert("XDG_CONFIG_HOME".to_string(), config_home.to_string());
     env.insert("GOOSE_PROVIDER".to_string(), goose_provider.to_string());
     env.insert("GOOSE_MODEL".to_string(), model.to_string());
@@ -102,9 +109,6 @@ fn build_env(
         "GOOSE_CONTEXT_LIMIT".to_string(),
         context_window_size.to_string(),
     );
-    for (key, value) in extra {
-        env.insert(key.clone(), value.clone());
-    }
     env
 }
 
@@ -265,16 +269,29 @@ mod tests {
     }
 
     #[test]
-    fn env_overrides_win() {
+    fn env_entries_reach_the_child() {
         let mut extra = BTreeMap::new();
         extra.insert(
             "OPENAI_HOST".to_string(),
             "http://localhost:8000".to_string(),
         );
-        extra.insert("GOOSE_MODE".to_string(), "auto".to_string());
         let env = build_env("m1", "openai", 4096, "/tmp/cfg", &extra);
         assert_eq!(env.get("OPENAI_HOST").unwrap(), "http://localhost:8000");
-        assert_eq!(env.get("GOOSE_MODE").unwrap(), "auto");
+    }
+
+    #[test]
+    fn env_entries_cannot_unpin_the_isolation() {
+        let mut extra = BTreeMap::new();
+        extra.insert("GOOSE_MODE".to_string(), "auto".to_string());
+        extra.insert(
+            "XDG_CONFIG_HOME".to_string(),
+            "/home/user/.config".to_string(),
+        );
+        extra.insert("GOOSE_MODEL".to_string(), "some-other-model".to_string());
+        let env = build_env("m1", "openai", 4096, "/tmp/cfg", &extra);
+        assert_eq!(env.get("GOOSE_MODE").unwrap(), "chat");
+        assert_eq!(env.get("XDG_CONFIG_HOME").unwrap(), "/tmp/cfg");
+        assert_eq!(env.get("GOOSE_MODEL").unwrap(), "m1");
     }
 
     #[test]

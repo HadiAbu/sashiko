@@ -347,8 +347,10 @@ pub struct GooseCliSettings {
     /// with an OPENAI_HOST override for a local vLLM server.
     #[serde(default = "default_goose_cli_provider")]
     pub goose_provider: String,
-    /// Environment overrides for the goose child process, e.g. OPENAI_HOST.
-    /// goose inherits Sashiko's environment; these entries win.
+    /// Environment for the goose child process, e.g. OPENAI_HOST. goose
+    /// inherits Sashiko's environment and these entries win over it, but
+    /// not over the variables Sashiko pins to keep goose a completion
+    /// backend.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_goose_cli_context_window")]

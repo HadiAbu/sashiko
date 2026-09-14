@@ -277,8 +277,13 @@ OPENAI_API_KEY = "dummy"
 `goose_provider` accepts any goose provider id (`openai`, `ollama`,
 `anthropic`, `google`, ...). The `[ai.goose_cli.env]` table is passed to the
 goose child process; goose inherits Sashiko's environment, so exported
-variables work too and the table only overrides them. Keep real API keys in
+variables work too and the table overrides them. Keep real API keys in
 the environment rather than in the settings file.
+
+The table cannot override the variables that make goose a completion
+backend. `GOOSE_MODE`, `XDG_CONFIG_HOME` and the model and provider taken
+from `[ai]` are pinned after it, so a stray entry cannot hand goose back its
+own tools or the user's own configuration.
 
 goose prepends its own system prompt and platform tool schemas to every
 request, which costs roughly 5k tokens before Sashiko's prompt is even

@@ -145,7 +145,7 @@ Settings for the goose provider (`provider = "goose"`).
 |-----|------|---------|-------------|
 | `binary` | string | `"goose"` | Path to the goose binary. |
 | `goose_provider` | string | `"openai"` | Backend goose itself talks to, passed as GOOSE_PROVIDER. |
-| `env` | table | `{}` | Environment overrides for the goose child process, e.g. `OPENAI_HOST`. goose inherits Sashiko's environment; these entries win. |
+| `env` | table | `{}` | Environment for the goose child process, e.g. `OPENAI_HOST`. goose inherits Sashiko's environment and these entries win over it, but they cannot override the variables Sashiko pins to keep goose a completion backend (`GOOSE_MODE`, `GOOSE_MODEL`, `GOOSE_PROVIDER`, `GOOSE_CONTEXT_LIMIT`, `XDG_CONFIG_HOME`). |
 | `context_window_size` | integer | `128000` | Context window size. goose adds roughly 5k tokens of its own prompt, so keep `max_input_tokens` well below this. |
 
 ### `[server]`
