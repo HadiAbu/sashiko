@@ -2239,7 +2239,7 @@ impl Reviewer {
     async fn queue_notifications(
         ctx: &ReviewContext,
         patchset_id: i64,
-        review_id: Option<i64>,
+        _review_id: Option<i64>,
         patch_id: i64,
         patch_message_id: &str,
         patchset_message_id: &str,
@@ -2256,21 +2256,20 @@ impl Reviewer {
             }
         };
 
-        let newly_discovered_preexisting = if let Some(r_id) = review_id {
-            ctx.db
-                .list_bugs_for_review(r_id)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|(_, is_new)| *is_new)
-                .map(|(bug, _)| bug)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        let mut new_findings = Vec::new();
+        if let Some(findings_arr) = findings {
+            for f in findings_arr {
+                let preexisting = f
+                    .get("preexisting")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if !preexisting {
+                    new_findings.push(f.clone());
+                }
+            }
+        }
 
-        let findings_count = findings.map(|f| f.len()).unwrap_or(0);
-        let total_issues_count = findings_count + newly_discovered_preexisting.len();
+        let total_issues_count = new_findings.len();
 
         let msg_id = patch_message_id;
         let msg_id_clean = msg_id.trim_matches(|c| c == '<' || c == '>');
@@ -2525,23 +2524,7 @@ impl Reviewer {
                         total_issues_count
                     ));
 
-                    let mut new_findings = Vec::new();
-                    let mut existing_findings = Vec::new();
-
-                    if let Some(findings_arr) = findings {
-                        for f in findings_arr {
-                            let preexisting = f
-                                .get("preexisting")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
-                            if preexisting {
-                                existing_findings.push(f.clone());
-                            } else {
-                                new_findings.push(f.clone());
-                            }
-                        }
-                    }
-
+                    let mut sorted_findings = new_findings.clone();
                     let sort_by_severity = |a: &Value, b: &Value| {
                         let sev_a = Severity::from_str(
                             a.get("severity").and_then(|v| v.as_str()).unwrap_or("Low"),
@@ -2552,8 +2535,7 @@ impl Reviewer {
                         sev_b.cmp(&sev_a)
                     };
 
-                    new_findings.sort_by(sort_by_severity);
-                    existing_findings.sort_by(sort_by_severity);
+                    sorted_findings.sort_by(sort_by_severity);
 
                     let format_finding = |f: &Value| {
                         let problem = f
@@ -2568,43 +2550,8 @@ impl Reviewer {
                         format!("- [{}] {}\n", severity, problem)
                     };
 
-                    let has_preexisting =
-                        !existing_findings.is_empty() || !newly_discovered_preexisting.is_empty();
-
-                    if !new_findings.is_empty() && has_preexisting {
-                        header.push_str("\nNew issues:\n");
-                        for f in &new_findings {
-                            header.push_str(&format_finding(f));
-                        }
-                        header.push_str("\nPre-existing issues:\n");
-                        for f in &existing_findings {
-                            header.push_str(&format_finding(f));
-                        }
-                        for bug in &newly_discovered_preexisting {
-                            header.push_str(&format!(
-                                "- [{}] {}: https://sashiko.dev/bug/{}\n",
-                                bug.severity().as_str(),
-                                bug.problem().trim(),
-                                bug.bugid
-                            ));
-                        }
-                    } else if !new_findings.is_empty() {
-                        for f in &new_findings {
-                            header.push_str(&format_finding(f));
-                        }
-                    } else if has_preexisting {
-                        header.push_str("\nPre-existing issues:\n");
-                        for f in &existing_findings {
-                            header.push_str(&format_finding(f));
-                        }
-                        for bug in &newly_discovered_preexisting {
-                            header.push_str(&format!(
-                                "- [{}] {}: https://sashiko.dev/bug/{}\n",
-                                bug.severity().as_str(),
-                                bug.problem().trim(),
-                                bug.bugid
-                            ));
-                        }
+                    for f in &sorted_findings {
+                        header.push_str(&format_finding(f));
                     }
 
                     header.push_str("--\n\n");
@@ -3507,14 +3454,9 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
         let row = rows.next().await?.expect("Expected email in outbox");
         let body: String = row.get(0)?;
         let expected_mixed_body = "\
-Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
-
-New issues:
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
 - [High] New High issue
 - [Low] New Low issue
-
-Pre-existing issues:
-- [Medium] Medium issue
 --
 
 inline review content\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchset/msg_id_1?part=1";
@@ -3622,21 +3564,15 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         let mut rows = db
             .conn
             .query(
-                "SELECT body FROM email_outbox WHERE patch_id = ?",
+                "SELECT status, body FROM email_outbox WHERE patch_id = ?",
                 libsql::params![p_id_3],
             )
             .await?;
         let row = rows.next().await?.expect("Expected email in outbox");
-        let body: String = row.get(0)?;
-        let expected_only_body = "\
-Thank you for your contribution! Sashiko AI review found 1 potential issue(s) to consider:
-
-Pre-existing issues:
-- [Medium] Medium issue
---
-
-inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchset/msg_id_1?part=3";
-        assert_eq!(body, expected_only_body);
+        let status: String = row.get(0)?;
+        let body: String = row.get(1)?;
+        assert_eq!(status, "Skipped");
+        assert_eq!(body, "Skipped due to no findings");
 
         // Setup for Scenario 4: Linked newly discovered preexisting bug with slug
         let rev_id = db
@@ -3719,14 +3655,9 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         let row = rows.next().await?.expect("Expected email in outbox");
         let body: String = row.get(0)?;
         let expected_scenario_4 = "\
-Thank you for your contribution! Sashiko AI review found 3 potential issue(s) to consider:
-
-New issues:
+Thank you for your contribution! Sashiko AI review found 2 potential issue(s) to consider:
 - [High] New High issue
 - [Low] New Low issue
-
-Pre-existing issues:
-- [High] High UAF in cleanup: https://sashiko.dev/bug/linux-deadbeef
 --
 
 inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patchset/msg_id_1?part=4";
