@@ -3647,12 +3647,12 @@
                                         </div>
                                         <a href="${bugLink}" style="font-weight:600; font-size:0.9em; white-space:nowrap;">View Details &rarr;</a>
                                     </div>
-                                    ${b.description ? `
+                                    ${(b.description || b.inline_review) ? `
                                         <div style="margin-top:10px;">
                                             <button class="toggle-btn" onclick="toggleCollapsible('${cardId}', this)">▶ Inline Review</button>
                                             <div id="${cardId}" class="collapsible" style="position:relative; margin-top:6px;">
                                                 <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                                                <div class="log-inline-block">${escapeHtml(b.description, true, false)}</div>
+                                                <div class="log-inline-block">${escapeHtml(b.description || b.inline_review, true, false)}</div>
                                             </div>
                                         </div>
                                     ` : ''}
@@ -3884,7 +3884,8 @@
             const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}`;
 
             let inlineHtml = '';
-            if (r.description) {
+            const inlineReview = r.inline_review || r.description;
+            if (inlineReview) {
                 // If we found issues (parsedFindings is true and result isn't "No regressions"), expand by default
                 const hasIssues = parsedFindings && !displayResult.includes('No regressions');
                 const isOpen = hasIssues ? 'open' : '';
@@ -3894,7 +3895,7 @@
                         <button class="toggle-btn" onclick="toggleCollapsible('inline-${uniqueId}', this)">${icon} Inline Review</button>
                         <div id="inline-${uniqueId}" class="collapsible ${isOpen}" style="position: relative;">
                             <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                            <div class="log-inline-block">${escapeHtml(r.description, true, true)}</div>
+                            <div class="log-inline-block">${escapeHtml(inlineReview, true, true)}</div>
                         </div>
                     </div>
                 `;
