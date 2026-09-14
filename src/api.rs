@@ -1247,9 +1247,17 @@ async fn get_bug(
     let access = bug_access(&state, &principal, bug.id).await?;
     val["can_comment"] = serde_json::Value::Bool(!state.read_only && access.can_comment());
     val["can_manage"] = serde_json::Value::Bool(!state.read_only && access.can_manage());
+    let mut family = state
+        .db
+        .bug_family(bug.id, false)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let family_ids: Vec<i64> = family.iter().map(|member| member.id).collect();
+    let readable = readable_bug_ids(&state, &principal, &family_ids).await?;
+    family.retain(|member| readable.contains(&member.id));
     val["evidence"] = state
         .db
-        .bug_evidence(bug.id)
+        .bug_evidence(&family)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     if let Some(obj) = val.as_object_mut() {
@@ -1281,6 +1289,9 @@ async fn attach_duplicate_relations(
             return Ok(());
         };
         if !bug_access(state, principal, canonical_id).await?.can_read() {
+            if let Some(obj) = val.as_object_mut() {
+                obj.remove("duplicate_of_id");
+            }
             return Ok(());
         }
         if let Some(canonical) = state.db.get_bug(canonical_id).await.ok().flatten() {
@@ -3699,6 +3710,123 @@ mod tests {
             ),
             "a forwarded request was treated as local"
         );
+    }
+
+    #[tokio::test]
+    async fn bug_evidence_excludes_inaccessible_family_members() {
+        let db = Arc::new(
+            Database::new(&crate::settings::DatabaseSettings {
+                url: ":memory:".into(),
+                token: String::new(),
+            })
+            .await
+            .unwrap(),
+        );
+        db.migrate().await.unwrap();
+        let mut ids = Vec::new();
+        for (name, section) in [
+            ("canonical", "SECTION A"),
+            ("hidden", "SECTION B"),
+            ("sibling", "SECTION A"),
+        ] {
+            let bug: crate::db::NewBug = serde_json::from_value(serde_json::json!({
+                "bugid": name, "title": format!("{name} title"), "reporter": format!("{name}@example.org"),
+                "subsystems": [{"name": section, "source": "maintainers_section"}]
+            })).unwrap();
+            let id = db.create_bug(&bug).await.unwrap();
+            for kind in ["report", "comment"] {
+                db.add_bug_enrichment(
+                    id,
+                    &crate::db::NewBugEnrichment {
+                        kind: kind.into(),
+                        content: Some(format!("{name} {kind} confidential content")),
+                        model: Some(format!("{name}-model")),
+                        tool: format!("{name}-tool"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            ids.push(id);
+        }
+        for &id in &ids[1..] {
+            db.mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
+                ephemeral_id: id,
+                canonical_id: ids[0],
+                reasoning: "same defect",
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let settings = Arc::new(crate::settings::Settings::new().unwrap());
+        let (sender, _) = mpsc::channel(1);
+        let (fetch_sender, _) = mpsc::channel(1);
+        let state = Arc::new(AppState {
+            settings,
+            db,
+            sender,
+            fetch_sender,
+            read_only: false,
+            allow_all_submit: false,
+            smtp_enabled: false,
+            dry_run: true,
+            forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
+            sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
+            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
+            stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
+            messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
+            patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
+            patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+            messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+            bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+        });
+        let index = crate::maintainers::MaintainersIndex::from_reader(
+            b"Maintainers List\n================\n\nSECTION A\nM:\tAlice <a@example.org>\nF:\ta/\n\nSECTION B\nM:\tBob <b@example.org>\nF:\tb/\n".as_slice()
+        ).unwrap();
+        let acl = crate::settings::AclSettings {
+            admins: vec!["operator@example.org".into()],
+            ..Default::default()
+        };
+        // Exercise the canonical, a sibling duplicate, and a duplicate whose
+        // canonical bug is invisible. Resolve locally to avoid global test state.
+        for (email, id, count, excluded) in [
+            ("a@example.org", ids[0], 2, vec!["hidden"]),
+            ("a@example.org", ids[2], 2, vec!["hidden"]),
+            ("b@example.org", ids[1], 1, vec!["canonical", "sibling"]),
+            ("operator@example.org", ids[0], 3, vec![]),
+        ] {
+            let principal = BugPrincipal::resolve(email, &acl, Some(&index));
+            let Json(body) = get_bug(
+                principal,
+                State(state.clone()),
+                Query(BugQuery {
+                    id: Some(id),
+                    bugid: None,
+                    slug: None,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(body["evidence"]["count"], count);
+            let evidence = body["evidence"].to_string();
+            for name in excluded {
+                assert!(
+                    !evidence.contains(name),
+                    "{email} learned about {name}: {evidence}"
+                );
+            }
+            if email == "b@example.org" {
+                assert!(body.get("duplicate_of_id").is_none());
+                assert!(body.get("duplicate_of").is_none());
+            }
+            if email == "operator@example.org" {
+                assert!(evidence.contains("hidden comment confidential content"));
+                assert!(evidence.contains("hidden-model"));
+            }
+        }
     }
 
     #[tokio::test]

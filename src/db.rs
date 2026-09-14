@@ -2153,8 +2153,8 @@ impl Database {
         }
     }
 
-    pub async fn bug_evidence(&self, id: i64) -> Result<serde_json::Value> {
-        let family = self.bug_family(id, false).await?;
+    /// Builds evidence only from the family members authorized by the caller.
+    pub async fn bug_evidence(&self, family: &[Bug]) -> Result<serde_json::Value> {
         struct RawDiscovery<'a> {
             bug_id: i64,
             bugid: String,
@@ -2195,7 +2195,7 @@ impl Database {
             }
         }
 
-        for bug in &family {
+        for bug in family {
             let candidates: Vec<_> = bug
                 .enrichments
                 .iter()
@@ -7111,7 +7111,11 @@ mod tests {
             .await?;
         assert!(db.get_bug_logs(ids[0]).await?.unwrap().contains("refuted"));
         // Multiple enrichment stages must not inflate the number of discoveries.
-        assert_eq!(db.bug_evidence(ids[0]).await?["count"], 1);
+        assert_eq!(
+            db.bug_evidence(&db.bug_family(ids[0], false).await?)
+                .await?["count"],
+            1
+        );
         let human = db.with_bug_actor("maintainer@example.org", "web", None);
         human
             .change_bug_status_with_reason(
@@ -7137,7 +7141,9 @@ mod tests {
                 ..Default::default()
             })
             .await?;
-        let evidence = db.bug_evidence(ids[1]).await?;
+        let evidence = db
+            .bug_evidence(&db.bug_family(ids[1], false).await?)
+            .await?;
         assert_eq!(evidence["count"], 3);
         assert_eq!(evidence["models"], json!(["model-a", "model-b"]));
         assert_eq!(evidence["tools"], json!(["reviewer-a", "reviewer-b"]));
@@ -7245,7 +7251,7 @@ mod tests {
             .await?;
         assert_eq!(db.get_bug(id).await?.unwrap().enrichments.len(), count);
         // A legacy report has no invented model attribution.
-        let evidence = db.bug_evidence(id).await?;
+        let evidence = db.bug_evidence(&db.bug_family(id, false).await?).await?;
         assert_eq!(evidence["count"], 1);
         assert_eq!(evidence["unknown_models"], 1);
         assert_eq!(evidence["models"], json!([]));
@@ -7471,7 +7477,9 @@ mod tests {
         assert_eq!(summary["tools"], json!(["sashiko:linux_patch_review"]));
         assert_eq!(summary["unknown_models"], 0);
 
-        let evidence = db.bug_evidence(bug_id).await?;
+        let evidence = db
+            .bug_evidence(&db.bug_family(bug_id, false).await?)
+            .await?;
         assert_eq!(evidence["count"], 1);
         assert_eq!(evidence["models"], json!(["test-model"]));
         assert_eq!(evidence["unknown_models"], 0);
@@ -7706,7 +7714,9 @@ mod tests {
         .await?;
 
         // Query bug_evidence for canonical bug 1
-        let evidence = db.bug_evidence(bug1_id).await?;
+        let evidence = db
+            .bug_evidence(&db.bug_family(bug1_id, false).await?)
+            .await?;
         assert_eq!(evidence["count"], 4);
 
         let discoveries = evidence["discoveries"].as_array().unwrap();

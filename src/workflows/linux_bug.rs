@@ -2723,7 +2723,12 @@ mod tests {
                 .unwrap()
                 .contains("missing length check")
         );
-        assert_eq!(db.bug_evidence(bug.id).await.unwrap()["count"], 1);
+        assert_eq!(
+            db.bug_evidence(&db.bug_family(bug.id, false).await.unwrap())
+                .await
+                .unwrap()["count"],
+            1
+        );
     }
 
     #[tokio::test]
