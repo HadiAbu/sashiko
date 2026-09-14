@@ -387,10 +387,15 @@ done
     async fn test_generate_content_includes_redacted_stderr_on_startup_exit() {
         let tmp = tempfile::tempdir().unwrap();
         let fake = tmp.path().join("fake-kiro-cli");
+        // The agent waits for the initialize request before exiting, so the
+        // client always reaches the read and reports the exit. Letting it
+        // exit on a timer instead lets a loaded machine turn the write into
+        // a broken pipe and report that instead.
         std::fs::write(
             &fake,
             r#"#!/bin/sh
 printf '%s\n' 'authentication failed token=abc123' >&2
+IFS= read -r line
 sleep 0.1
 exit 2
 "#,
