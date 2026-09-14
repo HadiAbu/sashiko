@@ -345,7 +345,7 @@ async fn main() -> Result<()> {
     info!("Missed: {}", missed_count);
     info!("Not Reviewed/Found: {}", not_reviewed_count);
     info!("Skipped (No Description): {}", skipped_count);
-    info!("Total Concerns (Before Stage 8): {}", total_concerns);
+    info!("Total Concerns (Before Deduplication): {}", total_concerns);
     info!("Total Findings (Final Report): {}", total_findings);
 
     if valid_metric_count > 0 {

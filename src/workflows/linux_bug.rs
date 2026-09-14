@@ -62,18 +62,6 @@ impl BugStage {
         BugStage::ReportGeneration,
     ];
 
-    /// Position of the stage in the pipeline, starting at 1.
-    pub const fn number(self) -> u8 {
-        match self {
-            BugStage::Normalization => 1,
-            BugStage::Verification => 2,
-            BugStage::Deduplication => 3,
-            BugStage::OriginTracing => 4,
-            BugStage::SeverityAssessment => 5,
-            BugStage::ReportGeneration => 6,
-        }
-    }
-
     /// Stable machine-readable identifier used to build enrichment kinds.
     pub const fn id(self) -> &'static str {
         match self {
@@ -99,8 +87,12 @@ impl BugStage {
     }
 
     /// Heading that opens the stage in the interaction log.
+    ///
+    /// Names the stage rather than numbering it, because a position in the
+    /// pipeline stops being true the moment a stage is inserted ahead of it,
+    /// and this string is read by people, by the model and by the interface.
     pub fn heading(self) -> String {
-        format!("# Stage {}. {}", self.number(), self.title())
+        format!("# {}", self.title())
     }
 
     /// Enrichment kind under which the stage interactions are persisted.
@@ -1750,7 +1742,6 @@ async fn record_bug_stage<T>(
             kind: stage.enrichment_kind(),
             content: Some(format!("{} completed", stage.title())),
             data_json: Some(serde_json::json!({
-                "stage_number": stage.number(),
                 "stage_id": stage.id(),
                 "stage_title": stage.title(),
             })),
@@ -1837,8 +1828,8 @@ pub async fn process_issue_worker(
         }
     }
 
-    // Stage 1: Normalization & Canonical Naming
-    info!("--- Stage 1: Normalization ---");
+    // Normalization and canonical naming.
+    info!("--- {} ---", BugStage::Normalization.title());
     let maintainers_hint = crate::maintainers::get_global_maintainers()
         .or_else(|| {
             tools.as_ref().and_then(|tb| {
@@ -1905,12 +1896,12 @@ pub async fn process_issue_worker(
     let title_prefix = extract_title_prefix(&norm.canonical_title);
 
     info!(
-        "Stage 1 Complete: Normalized to '{}' (prefix '{}') with official subsystems '{:?}'",
+        "Normalization complete: title '{}' (prefix '{}') with official subsystems '{:?}'",
         norm.canonical_title, title_prefix, official_subsystems
     );
 
-    // Stage 2: Verification & Ground-Truth Confirmation
-    info!("--- Stage 2: Verification ---");
+    // Verification and ground-truth confirmation.
+    info!("--- {} ---", BugStage::Verification.title());
     let prefetched_context =
         prefetch_bug_locations(tools.as_ref(), &master_sha, &effective_locations).await;
     let mut verify_session = VerifySession {
@@ -1931,7 +1922,7 @@ pub async fn process_issue_worker(
 
     let verification = verify_result.output;
     info!(
-        "Stage 2 Complete: Verification returned is_false_positive={}",
+        "Verification complete: is_false_positive={}",
         verification.is_false_positive
     );
 
@@ -1972,8 +1963,8 @@ pub async fn process_issue_worker(
         .and_then(|v| serde_json::to_string_pretty(v).ok())
         .unwrap_or_else(|| "[]".to_string());
 
-    // Stage 3: Deduplication Confirmation (under BUG_DEDUP_LOCK)
-    info!("--- Stage 3: Deduplication ---");
+    // Deduplication confirmation, under BUG_DEDUP_LOCK.
+    info!("--- {} ---", BugStage::Deduplication.title());
     let query_vector = extract_bug_vector(
         &norm.canonical_title,
         &official_subsystem_names,
@@ -1994,7 +1985,7 @@ pub async fn process_issue_worker(
         );
 
         info!(
-            "Stage 3: Found {} potential candidates.",
+            "Deduplication: found {} potential candidates.",
             candidate_matches.len()
         );
 
@@ -2067,10 +2058,10 @@ pub async fn process_issue_worker(
     if is_dup {
         return Ok(dup_outcome.unwrap());
     }
-    info!("Stage 3 Complete: Novel bug confirmed.");
+    info!("Deduplication complete: novel bug confirmed.");
 
-    // Stage 4: Origin Tracing (Enrichment)
-    info!("--- Stage 4: Origin Tracing ---");
+    // Origin tracing, recorded as an enrichment.
+    info!("--- {} ---", BugStage::OriginTracing.title());
     let tracing_runner = SessionRunner::new(provider).with_max_turns(30);
     let mut tracing_session = TracingSession {
         input: &input,
@@ -2092,8 +2083,8 @@ pub async fn process_issue_worker(
     };
     let introduced_in_commit = format_commit(tools.as_ref(), introducing_commit_sha).await;
 
-    // Stage 5: Severity & Impact Estimation (Enrichment)
-    info!("--- Stage 5: Severity & Impact Calibration ---");
+    // Severity and impact estimation, recorded as an enrichment.
+    info!("--- {} ---", BugStage::SeverityAssessment.title());
     let mut severity_session = SeveritySession {
         canonical_title: &norm.canonical_title,
         canonical_description: &norm.canonical_description,
@@ -2113,8 +2104,8 @@ pub async fn process_issue_worker(
     let severity_output = severity_result.output;
     let severity = Severity::from_str(&severity_output.severity);
 
-    // Stage 6: Standalone Plaintext Review Generation (Enrichment)
-    info!("--- Stage 6: Standalone Review Generation ---");
+    // Standalone plaintext review generation, recorded as an enrichment.
+    info!("--- {} ---", BugStage::ReportGeneration.title());
     let verified_prefetched =
         prefetch_bug_locations(tools.as_ref(), &master_sha, &verified_locations).await;
     let effective_prefetched = if !verified_prefetched.is_empty() {
@@ -2140,8 +2131,8 @@ pub async fn process_issue_worker(
 
     let inline_review = report_result.output;
 
-    // Stage 7: Final Database Write
-    info!("--- Stage 7: Final Database Write ---");
+    // Final database write.
+    info!("--- Final database write ---");
 
     db.update_bug_outcome(
         bug_row.id,
@@ -2761,21 +2752,21 @@ mod tests {
     }
 
     #[test]
-    fn test_bug_stages_are_numbered_and_named() {
-        for (index, stage) in BugStage::ALL.iter().enumerate() {
-            assert_eq!(stage.number() as usize, index + 1, "{stage:?}");
-            assert_eq!(
-                stage.heading(),
-                format!("# Stage {}. {}", stage.number(), stage.title())
-            );
+    fn test_bug_stages_are_named_not_numbered() {
+        for stage in BugStage::ALL {
+            assert_eq!(stage.heading(), format!("# {}", stage.title()));
             assert_eq!(stage.enrichment_kind(), format!("{}_run", stage.id()));
+            // A heading that carried a position would go stale the moment a
+            // stage was inserted ahead of it.
+            assert!(
+                !stage.heading().contains(char::is_numeric),
+                "{stage:?} heading names a position: {}",
+                stage.heading()
+            );
         }
         let ids: std::collections::BTreeSet<&str> = BugStage::ALL.iter().map(|s| s.id()).collect();
         assert_eq!(ids.len(), BugStage::ALL.len());
-        assert_eq!(
-            BugStage::ReportGeneration.heading(),
-            "# Stage 6. Report generation"
-        );
+        assert_eq!(BugStage::ReportGeneration.heading(), "# Report generation");
     }
 
     #[test]

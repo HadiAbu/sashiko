@@ -53,25 +53,26 @@ pub struct LinuxPatchReviewState {
     /// Stages selected by dynamic planning (or overridden by manual_stages).
     pub planned_stages: Vec<String>,
 
-    /// Aggregated raw concerns collected from Stages 1-7.
+    /// Aggregated raw concerns collected from the analysis stages.
     pub all_concerns: Vec<Value>,
-    /// Aggregated raw dismissed concerns collected from Stages 1-7.
+    /// Aggregated raw dismissed concerns collected from the analysis stages.
     pub all_dismissed_concerns: Vec<Value>,
 
-    /// Deduplicated concerns from Stage 8.
+    /// Deduplicated concerns from the deduplication stage.
     pub deduplicated_concerns: Vec<Value>,
-    /// Deduplicated dismissed concerns from Stage 8.
+    /// Deduplicated dismissed concerns from the deduplication stage.
     pub deduplicated_dismissed_concerns: Vec<Value>,
 
-    /// Filtered patch-introduced concerns after Stage 9 conflict resolution.
+    /// Filtered patch-introduced concerns after the conflict-resolution stage.
     pub patch_concerns: Vec<Value>,
-    /// Candidate pre-existing concerns extracted after Stage 9 for separate processing.
+    /// Candidate pre-existing concerns extracted after the conflict-resolution
+    /// stage for separate processing.
     pub concerns: Vec<Value>,
 
-    /// Verified findings from Stage 10.
+    /// Verified findings from the verification stage.
     pub findings: Vec<Value>,
 
-    /// Generated LKML plain-text review from Stage 11.
+    /// Generated LKML plain-text review from the report stage.
     pub review_inline: String,
     /// Fix suggestions.
     pub fixes: String,
@@ -1388,8 +1389,8 @@ mod tests {
     #[test]
     fn test_analysis_stages_keep_the_guidance_the_schema_alone_does_not_carry() {
         // The vendored guides still tell the model to use TodoWrite, which no
-        // longer exists, and stage 10 keeps an anti-charity directive of its
-        // own. Both belong to stages 1 to 7 as well.
+        // longer exists, and the verification stage keeps an anti-charity
+        // directive of its own. Both belong to the analysis stages as well.
         for required in [
             "Do not call or mention TodoWrite",
             "Do not be overly charitable to the existing code",
@@ -1401,7 +1402,7 @@ mod tests {
         ] {
             assert!(
                 STAGE_JSON_SCHEMA_EXAMPLE.contains(required),
-                "stage 1-7 guidance lost: {required}"
+                "analysis stage guidance lost: {required}"
             );
         }
     }
