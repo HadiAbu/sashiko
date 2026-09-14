@@ -1369,7 +1369,23 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 3.");
+        // Version 4 runs after the compatibility blocks above rather than in
+        // sequence with the others, because it rewrites rows in the bugs table
+        // and those blocks are what create that table for databases left in an
+        // intermediate branch state.
+        if current_version < 4 {
+            info!("Applying database migration version 4 (retire folded bug pipelines)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!(
+                "migrations/004_retire_folded_bug_pipelines.sql"
+            ))
+            .await?;
+            tx.execute("PRAGMA user_version = 4", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 4.");
+
         Ok(())
     }
 
@@ -13044,6 +13060,59 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_migration_retires_folded_bugs_left_in_the_pipeline() {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let canonical = create_pending_bug(&db, "linux-canonical").await;
+        let folded = create_pending_bug(&db, "linux-folded").await;
+
+        // Reproduce what folding used to leave behind: the triage state says
+        // the bug is a duplicate while the pipeline still says it is running.
+        db.conn
+            .execute(
+                "UPDATE bugs
+                    SET lifecycle_status = 'duplicate',
+                        duplicate_of_id = ?1,
+                        pipeline_state = 'running',
+                        locked_by = 'dead-worker:1',
+                        lease_expires_at = NULL
+                  WHERE id = ?2",
+                libsql::params![canonical, folded],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute("PRAGMA user_version = 3", ())
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT pipeline_state, locked_by FROM bugs WHERE id = ?",
+                libsql::params![folded],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "succeeded");
+        assert!(row.get::<Option<String>>(1).unwrap().is_none());
+
+        // A healed row is out of reach of the claim query, which is the whole
+        // point: it must not be analysed again to rediscover a finding the
+        // canonical bug already carries.
+        let claimed = db.claim_pending_bug("worker:1", 300, 3).await.unwrap();
+        assert_eq!(claimed.map(|b| b.id), Some(canonical));
     }
 
     #[tokio::test]
