@@ -850,6 +850,8 @@ pub struct UpdateBugOutcomeParams<'a> {
 
 #[derive(Default, Debug, Clone)]
 pub struct MarkDuplicateBugParams<'a> {
+    /// Automatic analysis may only fold a bug that has not been triaged.
+    pub preserve_triage: bool,
     pub ephemeral_id: i64,
     pub canonical_id: i64,
     pub reasoning: &'a str,
@@ -2883,7 +2885,22 @@ impl Database {
         if let Some(vector) = params.vector_json {
             self.update_bug_vector(id, vector).await?;
         }
-        self.set_bug_lifecycle_status(id, params.lifecycle_status)
+        // A verdict initializes triage; it must not undo a human decision
+        // made while this analysis was pending or running.
+        self.conn
+            .execute(
+                "UPDATE bugs SET lifecycle_status = ?, updated_at = ?,
+                    audit_author = ?, audit_tool = ?, audit_model = ?
+             WHERE id = ? AND lifecycle_status = 'new'",
+                libsql::params![
+                    params.lifecycle_status.as_str(),
+                    now,
+                    self.bug_actor.as_str(),
+                    self.bug_tool.as_str(),
+                    self.bug_model.clone(),
+                    id
+                ],
+            )
             .await?;
         // Producing an outcome at all means the analysis ran to completion.
         self.set_bug_pipeline_state(id, BugPipelineState::Succeeded)
@@ -3327,7 +3344,8 @@ impl Database {
     /// [Reliability Framework] Safely transitions a bug into a Duplicate state while
     /// atomically migrating all associated review linkages to the pre-existing canonical bug.
     /// This single Transaction boundary guarantees tearing cannot occur during deduplication.
-    pub async fn mark_bug_as_duplicate(&self, params: MarkDuplicateBugParams<'_>) -> Result<()> {
+    /// Returns false when automatic deduplication preserves existing triage.
+    pub async fn mark_bug_as_duplicate(&self, params: MarkDuplicateBugParams<'_>) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
         let tx = self.conn.transaction().await?;
 
@@ -3347,17 +3365,23 @@ impl Database {
         if params.ephemeral_id == params.canonical_id || !canonical_exists {
             bail!("Choose an existing canonical bug, distinct from this bug");
         }
-        let source_exists = {
+        let source_status = {
             let mut source = tx
                 .query(
-                    "SELECT id FROM bugs WHERE id = ?",
+                    "SELECT lifecycle_status FROM bugs WHERE id = ?",
                     libsql::params![params.ephemeral_id],
                 )
                 .await?;
-            source.next().await?.is_some()
-        };
-        if !source_exists {
-            bail!("Bug not found");
+            source
+                .next()
+                .await?
+                .map(|row| row.get::<String>(0))
+                .transpose()?
+        }
+        .ok_or_else(|| anyhow::anyhow!("Bug not found"))?;
+        if params.preserve_triage && source_status != BugLifecycleStatus::New.as_str() {
+            tx.rollback().await?;
+            return Ok(false);
         }
 
         // Folding a bug into a canonical one ends its pipeline, so the
@@ -3425,7 +3449,7 @@ impl Database {
         .await?;
 
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     pub async fn migrate_review_bugs(&self, from_bug_id: i64, to_bug_id: i64) -> Result<()> {
@@ -12986,6 +13010,7 @@ mod tests {
         };
         let dup_id = db.create_bug(&dup_bug).await.unwrap();
         let dup_params = MarkDuplicateBugParams {
+            preserve_triage: false,
             ephemeral_id: dup_id,
             canonical_id: bug_id,
             reasoning: "Duplicate issue",
@@ -13344,6 +13369,90 @@ mod tests {
             !claimed.contains(&dup_id),
             "a folded bug must never be handed to a worker"
         );
+    }
+
+    #[tokio::test]
+    async fn analysis_verdicts_preserve_existing_triage() {
+        for status in [
+            BugLifecycleStatus::New,
+            BugLifecycleStatus::Open,
+            BugLifecycleStatus::Closed,
+            BugLifecycleStatus::Dismissed,
+            BugLifecycleStatus::Fixed,
+            BugLifecycleStatus::Duplicate,
+        ] {
+            for verdict in [BugLifecycleStatus::Open, BugLifecycleStatus::Dismissed] {
+                let db = Database::new(&crate::settings::DatabaseSettings {
+                    url: ":memory:".into(),
+                    token: String::new(),
+                })
+                .await
+                .unwrap();
+                db.migrate().await.unwrap();
+                let id = create_pending_bug(&db, "linux-triaged").await;
+                let canonical = create_pending_bug(&db, "linux-canonical").await;
+                let other = create_pending_bug(&db, "linux-other").await;
+                db.claim_pending_bug("worker", 300, 3).await.unwrap();
+                if status == BugLifecycleStatus::Duplicate {
+                    db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+                        ephemeral_id: id,
+                        canonical_id: canonical,
+                        reasoning: "human triage",
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                } else {
+                    db.change_bug_status_with_reason(id, status, Some("human triage"))
+                        .await
+                        .unwrap();
+                }
+                if status != BugLifecycleStatus::New {
+                    assert!(
+                        !db.mark_bug_as_duplicate(MarkDuplicateBugParams {
+                            preserve_triage: true,
+                            ephemeral_id: id,
+                            canonical_id: other,
+                            reasoning: "automatic deduplication",
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap()
+                    );
+                }
+                db.update_bug_outcome(
+                    id,
+                    UpdateBugOutcomeParams {
+                        lifecycle_status: verdict,
+                        inline_review: "analysis report",
+                        verified_on_sha: Some("abc123"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let bug = db.get_bug(id).await.unwrap().unwrap();
+                assert_eq!(
+                    bug.lifecycle_status,
+                    if status == BugLifecycleStatus::New {
+                        verdict
+                    } else {
+                        status
+                    }
+                );
+                assert_eq!(bug.pipeline_state, BugPipelineState::Succeeded);
+                assert_eq!(
+                    bug.duplicate_of_id,
+                    (status == BugLifecycleStatus::Duplicate).then_some(canonical)
+                );
+                assert_eq!(bug.inline_review(), "analysis report");
+                assert!(
+                    bug.enrichments
+                        .iter()
+                        .any(|e| e.content.as_deref() == Some("human triage"))
+                );
+            }
+        }
     }
 
     /// The lease is short and the worker renews it while it works. Renewal has

@@ -2029,27 +2029,33 @@ pub async fn process_issue_worker(
                     existing.id, existing.bugid
                 );
                 let logs = serde_json::to_string(&full_history).unwrap_or_default();
-                db.mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
-                    ephemeral_id: bug_row.id,
-                    canonical_id: existing.id,
-                    reasoning: &dedup.reasoning,
-                    logs: None,
-                    tokens_in: None,
-                    tokens_out: None,
-                    tokens_cached: None,
-                })
-                .await?;
-                if let Some(r_id) = input.review_id {
-                    db.link_review_to_bug(r_id, existing.id, false).await?;
+                let folded = db
+                    .mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
+                        preserve_triage: true,
+                        ephemeral_id: bug_row.id,
+                        canonical_id: existing.id,
+                        reasoning: &dedup.reasoning,
+                        logs: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                        tokens_cached: None,
+                    })
+                    .await?;
+                if folded {
+                    if let Some(r_id) = input.review_id {
+                        db.link_review_to_bug(r_id, existing.id, false).await?;
+                    }
+                    (
+                        true,
+                        Some(BugOutcome::Duplicate {
+                            existing_bug: existing.clone(),
+                            reasoning: dedup.reasoning,
+                            logs: Some(logs),
+                        }),
+                    )
+                } else {
+                    (false, None)
                 }
-                (
-                    true,
-                    Some(BugOutcome::Duplicate {
-                        existing_bug: existing.clone(),
-                        reasoning: dedup.reasoning,
-                        logs: Some(logs),
-                    }),
-                )
             } else {
                 (false, None)
             }

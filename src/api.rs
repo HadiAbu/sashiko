@@ -2438,6 +2438,7 @@ mod tests {
             .await
             .unwrap();
         db.mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
+            preserve_triage: false,
             ephemeral_id: duplicate,
             canonical_id: canonical,
             reasoning: "same defect",
@@ -2856,6 +2857,7 @@ mod tests {
             .await
             .unwrap();
         db.mark_bug_as_duplicate(crate::db::MarkDuplicateBugParams {
+            preserve_triage: false,
             ephemeral_id: dup_id,
             canonical_id: bug_id,
             reasoning: "Dup of test_device",
