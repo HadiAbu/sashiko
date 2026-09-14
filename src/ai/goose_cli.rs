@@ -37,6 +37,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -244,11 +245,48 @@ impl AiProvider for GooseCliProvider {
     }
 
     fn cache_identity(&self) -> String {
-        // The backend goose fronts changes the answer, so it belongs in the
-        // identity. context_window_size stays out: it only budgets the prompt
-        // the cache already hashes.
-        crate::ai::cache_identity_with(&self.model, &[("provider", Some(&self.goose_provider))])
+        // Everything that picks the backend belongs here. goose_provider
+        // names the family, and the env table points at the instance:
+        // OPENAI_HOST is goose's base_url, so without it two local servers
+        // both serving "qwen3-8b-ov" replay each other's answers. The table
+        // can hold an API key, so it contributes a digest rather than its
+        // contents. GOOSE_CONTEXT_LIMIT reaches the child and decides how
+        // much of the prompt the backend sees, exactly as num_ctx does for
+        // ollama, so it counts too.
+        let context_limit = self.context_window_size.to_string();
+        let env_digest = digest_env(&self.env);
+        crate::ai::cache_identity_with(
+            &self.model,
+            &[
+                ("provider", Some(&self.goose_provider)),
+                ("context_limit", Some(context_limit.as_str())),
+                ("env", env_digest.as_deref()),
+            ],
+        )
     }
+}
+
+/// Condenses the child's environment into a short hex digest, or nothing
+/// when there is none to report. The table is ordered, so the digest is
+/// stable across runs.
+fn digest_env(env: &BTreeMap<String, String>) -> Option<String> {
+    if env.is_empty() {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    for (key, value) in env {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+    Some(
+        hasher.finalize()[..8]
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -365,6 +403,45 @@ mod tests {
         let openai = test_provider("goose", "openai");
         let ollama = test_provider("goose", "ollama");
         assert_ne!(openai.cache_identity(), ollama.cache_identity());
+    }
+
+    #[test]
+    fn cache_identity_separates_two_hosts_serving_one_model() {
+        let host = |url: &str| {
+            let mut provider = test_provider("goose", "openai");
+            provider
+                .env
+                .insert("OPENAI_HOST".to_string(), url.to_string());
+            provider
+        };
+
+        assert_ne!(
+            host("http://localhost:8000").cache_identity(),
+            host("http://localhost:8001").cache_identity()
+        );
+    }
+
+    #[test]
+    fn cache_identity_tracks_the_context_limit() {
+        let mut narrow = test_provider("goose", "openai");
+        narrow.context_window_size = 8192;
+        let mut wide = test_provider("goose", "openai");
+        wide.context_window_size = 32768;
+        assert_ne!(narrow.cache_identity(), wide.cache_identity());
+    }
+
+    #[test]
+    fn cache_identity_keeps_the_env_out_of_the_key() {
+        let mut provider = test_provider("goose", "openai");
+        provider
+            .env
+            .insert("OPENAI_API_KEY".to_string(), "sk-secret".to_string());
+        assert!(!provider.cache_identity().contains("sk-secret"));
+    }
+
+    #[test]
+    fn env_digest_is_absent_without_entries() {
+        assert!(digest_env(&BTreeMap::new()).is_none());
     }
 
     #[test]
