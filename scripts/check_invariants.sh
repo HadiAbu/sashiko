@@ -72,6 +72,19 @@ if [ "$UNLEASED" -gt 0 ]; then
         "SELECT id, bugid, locked_by, attempt_count FROM bugs WHERE pipeline_state = 'running' AND lease_expires_at IS NULL;"
 fi
 
+# Invariant 6: a bug folded into another has finished with the pipeline.
+#
+# Folding is a terminal outcome, so a duplicate still sitting in pending or
+# running means the fold did not retire the analysis. That row is invisible to
+# the recovery queries once its lease is gone, and it would otherwise be
+# reclaimed and analysed again to rediscover a finding already recorded on the
+# canonical bug.
+LIVE_DUPES=$(count "SELECT count(*) FROM bugs WHERE lifecycle_status = 'duplicate' AND pipeline_state NOT IN ('succeeded', 'abandoned');")
+if [ "$LIVE_DUPES" -gt 0 ]; then
+    report "Found $LIVE_DUPES duplicate bugs that never left the analysis pipeline!" \
+        "SELECT id, bugid, pipeline_state, duplicate_of_id, lease_expires_at FROM bugs WHERE lifecycle_status = 'duplicate' AND pipeline_state NOT IN ('succeeded', 'abandoned');"
+fi
+
 if [ "$FAILED" -ne 0 ]; then
     exit 1
 fi
