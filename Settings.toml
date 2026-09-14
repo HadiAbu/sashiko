@@ -101,6 +101,13 @@ temperature = 1.0
 # max_input_tokens = 200000
 # max_interactions = 150
 
+# To use goose in front of a local server (no API key needed), see
+# docs/examples/Settings.goose-cli.toml for the matching [ai.goose_cli.env]:
+# provider = "goose"
+# model = "qwen3-8b-ov"
+# max_input_tokens = 4000
+# max_interactions = 50
+
 # To use OpenRouter, also export OPENAI_API_KEY with the API key in the environment
 # provider = "openai-compatible"
 # model = "openrouter/free"
@@ -138,6 +145,13 @@ prompt_caching = true
 # [ai.kiro_cli]
 # binary = "kiro-cli"
 # context_window_size = 200000
+
+# [ai.goose_cli]
+# binary = "goose"
+# goose_provider = "openai"        # Backend goose itself talks to
+# context_window_size = 32768
+# [ai.goose_cli.env]               # Whatever that backend needs
+# OPENAI_HOST = "http://localhost:8000"
 
 [server]
 host = "::"
