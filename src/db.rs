@@ -1234,45 +1234,62 @@ impl Database {
         candidates
     }
 
+    /// Resolve a message id to the patchset it names.
+    ///
+    /// Two patchsets answering to one message id is a state the database
+    /// should not be in, and a repair migration clears the rows that reached
+    /// it. The lookup still has to answer while such a row exists, so it
+    /// takes the first claimant: a message id is claimed by the series that
+    /// sent it before any later series can borrow it.
+    ///
+    /// A message id that names no cover letter is looked up as a patch, which
+    /// is how the parts of a series without a cover letter resolve. A patch
+    /// can sit in two patchsets while the database is in that state, so that
+    /// lookup takes the first claimant as well.
+    pub async fn find_patchset_id_by_msgid(&self, msg_id: &str) -> Result<Option<i64>> {
+        let candidates = Self::get_msgid_candidates(msg_id);
+
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id FROM patchsets WHERE cover_letter_message_id = ?
+                     ORDER BY id ASC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                return Ok(Some(row.get(0)?));
+            }
+        }
+
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT patchset_id FROM patches WHERE message_id = ?
+                     ORDER BY id ASC LIMIT 1",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                return Ok(Some(row.get(0)?));
+            }
+        }
+
+        Ok(None)
+    }
+
     pub async fn get_patchset_details_by_msgid(
         &self,
         msg_id: &str,
         page: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
-        let candidates = Self::get_msgid_candidates(msg_id);
-
-        // 1. Try to find a patchset where this is the cover letter
-        for clid in &candidates {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT id FROM patchsets WHERE cover_letter_message_id = ? ORDER BY id DESC LIMIT 1",
-                    libsql::params![clid.clone()],
-                )
-                .await?;
-            if let Ok(Some(row)) = rows.next().await {
-                let id: i64 = row.get(0)?;
-                return self.get_patchset_details(id, page, limit).await;
-            }
+        match self.find_patchset_id_by_msgid(msg_id).await? {
+            Some(id) => self.get_patchset_details(id, page, limit).await,
+            None => Ok(None),
         }
-
-        // 2. Fallback: Find a patchset that contains this message as a patch
-        for clid in &candidates {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT patchset_id FROM patches WHERE message_id = ? ORDER BY id DESC LIMIT 1",
-                    libsql::params![clid.clone()],
-                )
-                .await?;
-            if let Ok(Some(row)) = rows.next().await {
-                let id: i64 = row.get(0)?;
-                return self.get_patchset_details(id, page, limit).await;
-            }
-        }
-
-        Ok(None)
     }
 
     pub async fn get_message_body(&self, msg_id: &str) -> Result<Option<String>> {
@@ -5970,37 +5987,10 @@ impl Database {
         page: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
-        let candidates = Self::get_msgid_candidates(msg_id);
-
-        for clid in &candidates {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT id FROM patchsets WHERE cover_letter_message_id = ? ORDER BY id DESC LIMIT 1",
-                    libsql::params![clid.clone()],
-                )
-                .await?;
-            if let Ok(Some(row)) = rows.next().await {
-                let id: i64 = row.get(0)?;
-                return self.get_patchset_summary(id, page, limit).await;
-            }
+        match self.find_patchset_id_by_msgid(msg_id).await? {
+            Some(id) => self.get_patchset_summary(id, page, limit).await,
+            None => Ok(None),
         }
-
-        for clid in &candidates {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT patchset_id FROM patches WHERE message_id = ? ORDER BY id DESC LIMIT 1",
-                    libsql::params![clid.clone()],
-                )
-                .await?;
-            if let Ok(Some(row)) = rows.next().await {
-                let id: i64 = row.get(0)?;
-                return self.get_patchset_summary(id, page, limit).await;
-            }
-        }
-
-        Ok(None)
     }
 
     pub async fn get_patchset_details_by_slug(
@@ -12376,6 +12366,109 @@ mod tests {
             .unwrap();
         assert_eq!(updated["status"], "Failed");
         assert_eq!(updated["failed_reason"], "Fetch failed: timeout");
+    }
+
+    /// Until the repair migration has run, a cover letter message id can name
+    /// two patchsets, because a series posted as a reply used to adopt the
+    /// thread root as its own cover letter. The id resolves to the series that
+    /// claimed it first, not to whichever row was written last.
+    #[tokio::test]
+    async fn test_patchset_by_msgid_resolves_to_the_first_claimant() {
+        let db = setup_db().await;
+        let cover = "20260913-remove-pg_private-v4-0-848550f7574e@nvidia.com";
+        let cover_subject = "[PATCH v4 00/16] Remove PG_private";
+
+        let thread_id = db.create_thread(cover, cover_subject, 1000).await.unwrap();
+        db.create_message(
+            cover,
+            thread_id,
+            None,
+            "Author A",
+            cover_subject,
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The series that sent the cover letter took its subject from part 0.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (1, ?, ?, '[PATCH v4 00/16] Remove PG_private', 0, 'Author A', 1000,
+                         'Reviewed', 16, 16)",
+                libsql::params![thread_id, cover],
+            )
+            .await
+            .unwrap();
+
+        // An unrelated series replied into the same thread and took the same
+        // id with it, later.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (2, ?, ?, '[PATCH 1/3] md: Use folio_alloc_buffers()', 1, 'Author B', 2000,
+                         'Reviewed', 3, 3)",
+                libsql::params![thread_id, cover],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.find_patchset_id_by_msgid(cover).await.unwrap(),
+            Some(1),
+            "the first claimant of a message id must win the lookup"
+        );
+
+        let details = db
+            .get_patchset_details_by_msgid(cover, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details["subject"], "[PATCH v4 00/16] Remove PG_private");
+
+        let summary = db
+            .get_patchset_summary_by_msgid(cover, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary["id"], 1);
+
+        // A patch can sit in two patchsets while the database is in this
+        // state, so the patch lookup answers the same way as the cover letter
+        // lookup: the row that recorded it first.
+        let part = "20260914041830.2072626-1-willy@infradead.org";
+        db.create_message(
+            part,
+            thread_id,
+            Some(cover),
+            "Author B",
+            "[PATCH 1/3] md: Use folio_alloc_buffers()",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch(1, part, 1, "diff").await.unwrap();
+        db.create_patch(2, part, 1, "diff").await.unwrap();
+
+        assert_eq!(
+            db.find_patchset_id_by_msgid(part).await.unwrap(),
+            Some(1),
+            "a patch held by two patchsets resolves to the one that recorded it first"
+        );
     }
 
     /// Verify that has_patchset_by_msgid detects patchsets by bare SHA
