@@ -18,7 +18,7 @@ use anyhow::{Result, bail};
 use libsql::Builder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct Database {
     pub conn: libsql::Connection,
@@ -1481,8 +1481,48 @@ impl Database {
             self.conn.execute("PRAGMA user_version = 5", ()).await?;
         }
 
-        info!("Database schema is up to date at version 5.");
+        if current_version < 6 {
+            info!("Applying database migration version 6 (repair borrowed series names)...");
+            let tx = self.conn.transaction().await?;
+            Self::repair_borrowed_series_names(&tx).await?;
+            tx.execute("PRAGMA user_version = 6", ()).await?;
+            tx.commit().await?;
+        }
 
+        info!("Database schema is up to date at version 6.");
+
+        Ok(())
+    }
+
+    /// Repeats the borrowed name repair until it stops rewriting rows.
+    ///
+    /// A pass moves a series onto its own first patch only while no other
+    /// patchset holds that name, and the statement matches rows against the
+    /// table as it stood when the pass began. A series whose honest name is
+    /// held by a borrower therefore has to wait for the pass after the one
+    /// that moves the borrower away.
+    ///
+    /// Each rewritten row ends up named after one of its own patches, which
+    /// is the one thing the statement will not rewrite, so the work left
+    /// strictly shrinks and the repetition ends. The bound only guards
+    /// against that reasoning being broken by a later edit to the statement.
+    async fn repair_borrowed_series_names(tx: &libsql::Transaction) -> Result<()> {
+        const MAX_PASSES: u32 = 16;
+        let repair = include_str!("migrations/006_repair_borrowed_series_names.sql");
+
+        for pass in 1..=MAX_PASSES {
+            let renamed = tx.execute(repair, ()).await?;
+            if renamed == 0 {
+                return Ok(());
+            }
+            info!("Migration version 6 pass {pass} renamed {renamed} series.");
+        }
+
+        // A repair that will not settle leaves names no worse than it found
+        // them, because every row it touched now answers to one of its own
+        // patches. Refusing to start the server over that would cost more
+        // than the handful of rows left behind.
+        warn!("Repair of borrowed series names did not settle in {MAX_PASSES} passes.");
         Ok(())
     }
 
@@ -12817,6 +12857,280 @@ mod tests {
             .await
             .unwrap();
         rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    /// Runs the repair exactly as migration 6 does, until it settles.
+    async fn run_borrowed_name_repair(db: &Database) {
+        let tx = db.conn.transaction().await.unwrap();
+        Database::repair_borrowed_series_names(&tx).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    /// Records a message, which both patchsets and patches point at.
+    ///
+    /// Two series can record the same part, so an id already present is left
+    /// as it stands.
+    async fn ensure_message(db: &Database, thread_id: i64, message_id: &str) {
+        db.conn
+            .execute(
+                "INSERT OR IGNORE INTO messages (message_id, thread_id, author, subject, date)
+                 VALUES (?, ?, 'An Author', 'A subject', 1000)",
+                libsql::params![message_id, thread_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Inserts a patchset under a name, with the parts it is made of.
+    ///
+    /// A subject_index above 0 is what marks a series that never saw a cover
+    /// letter of its own, which is the state the repair looks for.
+    async fn insert_series(
+        db: &Database,
+        id: i64,
+        thread_id: i64,
+        name: &str,
+        subject_index: i64,
+        parts: &[(&str, u32)],
+    ) {
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (?, ?, ?, 'A subject', ?, 'An Author', 1000, 'Reviewed', 3, ?)",
+                libsql::params![id, thread_id, name, subject_index, parts.len() as i64],
+            )
+            .await
+            .unwrap();
+        for (message_id, part_index) in parts {
+            ensure_message(db, thread_id, message_id).await;
+            db.create_patch(id, message_id, *part_index, "diff")
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The repair renames the patchset that borrowed a message id after its
+    /// own first patch, and leaves the series that sent it alone.
+    #[tokio::test]
+    async fn test_migration_repairs_borrowed_series_names() {
+        let db = setup_db().await;
+        let cover = "20260913-remove-pg_private-v4-0-848550f7574e@nvidia.com";
+        let cover_subject = "[PATCH v4 00/16] Remove PG_private";
+        let borrower_1 = "20260914041830.2072626-1-willy@infradead.org";
+        let borrower_2 = "20260914041830.2072626-2-willy@infradead.org";
+
+        let thread_id = db.create_thread(cover, cover_subject, 1000).await.unwrap();
+        for (message_id, subject, date) in [
+            (cover, cover_subject, 1000),
+            (borrower_1, "[PATCH 1/3] md: part 1", 2001),
+            (borrower_2, "[PATCH 2/3] md: part 2", 2002),
+        ] {
+            db.create_message(
+                message_id,
+                thread_id,
+                None,
+                "An Author",
+                subject,
+                date,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // The series that sent the cover letter, and the series that replied
+        // into its thread and took the same name.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (1, ?, ?, ?, 0, 'An Author', 1000, 'Reviewed', 16, 16)",
+                libsql::params![thread_id, cover, cover_subject],
+            )
+            .await
+            .unwrap();
+        insert_series(
+            &db,
+            2,
+            thread_id,
+            cover,
+            1,
+            &[(borrower_2, 2), (borrower_1, 1)],
+        )
+        .await;
+
+        run_borrowed_name_repair(&db).await;
+
+        assert_eq!(
+            series_identity(&db, 2).await,
+            borrower_1,
+            "the borrowing series must be renamed after its own first patch"
+        );
+        assert_eq!(
+            series_identity(&db, 1).await,
+            cover,
+            "the series that sent the cover letter keeps its name"
+        );
+        assert_eq!(db.find_patchset_id_by_msgid(cover).await.unwrap(), Some(1));
+        assert_eq!(
+            db.find_patchset_id_by_msgid(borrower_1).await.unwrap(),
+            Some(2)
+        );
+
+        // With the collision gone, a second run has nothing left to rename.
+        run_borrowed_name_repair(&db).await;
+        assert_eq!(series_identity(&db, 2).await, borrower_1);
+        assert_eq!(series_identity(&db, 1).await, cover);
+    }
+
+    /// A series whose honest name is held by another borrower is repaired
+    /// too, on the pass after the one that moves that borrower away.
+    #[tokio::test]
+    async fn test_migration_repairs_a_chain_of_borrowed_names() {
+        let db = setup_db().await;
+        let cover = "cover-of-the-first-thread@example.com";
+        let held_by_first = "series-one-part-1@example.com";
+        let held_by_second = "series-two-part-1@example.com";
+
+        let thread_id = db
+            .create_thread(cover, "A cover letter", 1000)
+            .await
+            .unwrap();
+        ensure_message(&db, thread_id, cover).await;
+        // The series that sent the cover letter owns that name.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (1, ?, ?, 'A cover letter', 0, 'An Author', 1000, 'Reviewed', 2, 2)",
+                libsql::params![thread_id, cover],
+            )
+            .await
+            .unwrap();
+        // Borrows the cover letter's name, and its honest name is in turn
+        // held by the series below.
+        insert_series(&db, 2, thread_id, cover, 1, &[(held_by_first, 1)]).await;
+        // Borrows the name of the patch that series 2 is waiting for.
+        insert_series(&db, 3, thread_id, held_by_first, 1, &[(held_by_second, 1)]).await;
+
+        run_borrowed_name_repair(&db).await;
+
+        assert_eq!(
+            series_identity(&db, 3).await,
+            held_by_second,
+            "the series at the end of the chain takes its own first patch"
+        );
+        assert_eq!(
+            series_identity(&db, 2).await,
+            held_by_first,
+            "the series behind it takes the name freed by that rename"
+        );
+        assert_eq!(
+            series_identity(&db, 1).await,
+            cover,
+            "the series that sent the cover letter keeps its name"
+        );
+        assert_eq!(db.find_patchset_id_by_msgid(cover).await.unwrap(), Some(1));
+    }
+
+    /// Two series that record the same patch are left alone, because moving
+    /// both onto it would replace one collision with another.
+    #[tokio::test]
+    async fn test_migration_leaves_series_that_share_a_first_patch() {
+        let db = setup_db().await;
+        let cover = "cover-of-the-thread@example.com";
+        let shared_patch = "the-same-patch@example.com";
+
+        let thread_id = db
+            .create_thread(cover, "A cover letter", 1000)
+            .await
+            .unwrap();
+        ensure_message(&db, thread_id, cover).await;
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (1, ?, ?, 'A cover letter', 0, 'An Author', 1000, 'Reviewed', 2, 2)",
+                libsql::params![thread_id, cover],
+            )
+            .await
+            .unwrap();
+        insert_series(&db, 2, thread_id, cover, 1, &[(shared_patch, 1)]).await;
+        insert_series(&db, 3, thread_id, cover, 1, &[(shared_patch, 1)]).await;
+
+        run_borrowed_name_repair(&db).await;
+
+        assert_eq!(
+            series_identity(&db, 2).await,
+            cover,
+            "neither series may take a name the other would take as well"
+        );
+        assert_eq!(series_identity(&db, 3).await, cover);
+        assert_eq!(
+            db.find_patchset_id_by_msgid(shared_patch).await.unwrap(),
+            Some(2),
+            "the shared patch still resolves through the patches table, to the
+             series that recorded it first"
+        );
+    }
+
+    /// A fetch of a thread names its row after the message id it was asked
+    /// for, and comes back to that name on the next attempt. A row in a state
+    /// the fetch restarts from therefore keeps its name, borrowed or not.
+    #[tokio::test]
+    async fn test_migration_leaves_a_name_a_fetch_would_reuse() {
+        let db = setup_db().await;
+        let fetched = "the-message-that-was-fetched@example.com";
+        let own_patch = "the-fetched-series-part-1@example.com";
+
+        let thread_id = db
+            .create_thread(fetched, "A cover letter", 1000)
+            .await
+            .unwrap();
+        ensure_message(&db, thread_id, fetched).await;
+        // The series that sent the fetched message owns that name.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (1, ?, ?, 'A cover letter', 0, 'An Author', 1000, 'Reviewed', 2, 2)",
+                libsql::params![thread_id, fetched],
+            )
+            .await
+            .unwrap();
+        // The row the fetch created, which borrowed that name and has not
+        // finished fetching.
+        insert_series(&db, 2, thread_id, fetched, 1, &[(own_patch, 1)]).await;
+        db.conn
+            .execute("UPDATE patchsets SET status = 'Fetching' WHERE id = 2", ())
+            .await
+            .unwrap();
+
+        run_borrowed_name_repair(&db).await;
+
+        assert_eq!(
+            series_identity(&db, 2).await,
+            fetched,
+            "a row the fetch would come back to keeps the name it is tracked by"
+        );
+
+        // Once the fetch is done the row is renamed like any other borrower.
+        db.conn
+            .execute("UPDATE patchsets SET status = 'Reviewed' WHERE id = 2", ())
+            .await
+            .unwrap();
+        run_borrowed_name_repair(&db).await;
+        assert_eq!(series_identity(&db, 2).await, own_patch);
     }
 
     /// Verify that has_patchset_by_msgid detects patchsets by bare SHA
