@@ -465,9 +465,18 @@ fn translate_vllm_request(
 /// instructions, tool results) survive intact and only the oversized ones
 /// are cut.
 fn fit_messages_to_budget(messages: &mut [VllmMessage], input_budget: usize) {
+    // Counted arithmetically rather than with a real tokenizer. vLLM serves
+    // whatever model it was started with, so no tokenizer available here is
+    // the right one anyway, and encoding a whole prompt to find out it is too
+    // long is the cost this is meant to avoid. It also makes the cut below
+    // consistent with the count, since both are in bytes.
     let counts: Vec<usize> = messages
         .iter()
-        .map(|m| m.content.as_deref().map_or(0, TokenBudget::estimate_tokens))
+        .map(|m| {
+            m.content
+                .as_deref()
+                .map_or(0, TokenBudget::approximate_tokens)
+        })
         .collect();
     let total: usize = counts.iter().sum();
     if total <= input_budget {
@@ -987,7 +996,7 @@ mod tests {
 
         let total: usize = messages
             .iter()
-            .map(|m| TokenBudget::estimate_tokens(m.content.as_deref().unwrap()))
+            .map(|m| TokenBudget::approximate_tokens(m.content.as_deref().unwrap()))
             .sum();
         // Allow some slack for the truncation marker.
         assert!(total < 1100, "total {} tokens exceeds budget", total);

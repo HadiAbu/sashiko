@@ -219,8 +219,8 @@ impl AiProvider for GooseCliProvider {
         // goose reports its own token counts; fall back to estimates when a
         // build omits them.
         let usage = usage_from_result(&result).or_else(|| {
-            let prompt_tokens = TokenBudget::estimate_tokens(&prompt);
-            let completion_tokens = TokenBudget::estimate_tokens(&text);
+            let prompt_tokens = TokenBudget::approximate_tokens(&prompt);
+            let completion_tokens = TokenBudget::approximate_tokens(&text);
             Some(AiUsage {
                 prompt_tokens,
                 completion_tokens,

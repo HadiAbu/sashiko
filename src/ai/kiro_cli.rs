@@ -142,8 +142,8 @@ impl AiProvider for KiroCliProvider {
 
         // Synthesize usage from token estimates since kiro-cli does not
         // expose provider token counts.
-        let prompt_tokens = TokenBudget::estimate_tokens(&prompt);
-        let completion_tokens = TokenBudget::estimate_tokens(&text);
+        let prompt_tokens = TokenBudget::approximate_tokens(&prompt);
+        let completion_tokens = TokenBudget::approximate_tokens(&text);
         let usage = Some(AiUsage {
             prompt_tokens,
             completion_tokens,
