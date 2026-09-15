@@ -1452,7 +1452,19 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 4.");
+        // Built outside a transaction. CREATE INDEX on the patches table walks
+        // every row, and on a production sized database that is long enough
+        // that holding a write transaction open for it would stall the single
+        // shared connection for the duration.
+        if current_version < 5 {
+            info!("Applying database migration version 5 (index patches by message id)...");
+            self.conn
+                .execute_batch(include_str!("migrations/005_index_patches_message_id.sql"))
+                .await?;
+            self.conn.execute("PRAGMA user_version = 5", ()).await?;
+        }
+
+        info!("Database schema is up to date at version 5.");
 
         Ok(())
     }
@@ -7109,6 +7121,44 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    /// The message id lookup behind /api/patchset must seek an index.
+    ///
+    /// UNIQUE(patchset_id, message_id) looks like it covers this query but
+    /// cannot serve it: the query constrains only message_id, and SQLite will
+    /// not seek an index whose leading column is unconstrained. Without a
+    /// dedicated index the planner reports SCAN patches and reads the diff of
+    /// every patch in the database on every lookup, which is invisible in a
+    /// functional test because the answer stays correct either way.
+    #[tokio::test]
+    async fn test_patch_msgid_lookup_uses_an_index() -> Result<()> {
+        let db = Database::new(&DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+
+        let plan: String = db
+            .conn
+            .query(
+                "EXPLAIN QUERY PLAN \
+                 SELECT patchset_id FROM patches WHERE message_id = ? ORDER BY id DESC LIMIT 1",
+                libsql::params!["<probe@example.org>"],
+            )
+            .await?
+            .next()
+            .await?
+            .expect("EXPLAIN QUERY PLAN returns a row")
+            .get::<String>(3)?;
+
+        assert!(
+            plan.contains("USING INDEX") && !plan.contains("SCAN patches"),
+            "message id lookups must seek an index, got: {plan}"
+        );
+
+        Ok(())
+    }
+
     /// The bug schema ships as a single migration, so a fresh database reaches
     /// the final layout in one step. This pins that migrate is idempotent, that
     /// it leaves shared infrastructure tables alone, and that the resulting
