@@ -4544,6 +4544,117 @@ impl Database {
         Ok(())
     }
 
+    /// Report whether `candidate_msg_id` is the cover letter of a series of
+    /// `total_parts` parts at `version`, written by `author`.
+    ///
+    /// Every part of a series points at its cover letter through In-Reply-To,
+    /// but a series is just as often posted in reply to an unrelated thread or
+    /// to its own previous version, and then that message belongs to somebody
+    /// else. A cover letter announces part 0 of exactly as many parts, at the
+    /// same version, from the same author.
+    pub async fn message_is_cover_letter_for(
+        &self,
+        candidate_msg_id: &str,
+        author: &str,
+        total_parts: u32,
+        version: Option<u32>,
+    ) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT subject, author FROM messages WHERE message_id = ?",
+                libsql::params![candidate_msg_id],
+            )
+            .await?;
+
+        let Ok(Some(row)) = rows.next().await else {
+            return Ok(false);
+        };
+
+        let subject: String = row.get(0).unwrap_or_default();
+        let candidate_author: String = row.get(1).unwrap_or_default();
+        let (index, total) = crate::patch::parse_subject_index(&subject);
+
+        Ok(index == 0
+            && total == total_parts
+            && crate::patch::parse_subject_version(&subject).unwrap_or(1) == version.unwrap_or(1)
+            && crate::patch::authors_match(&candidate_author, author))
+    }
+
+    /// Name a patchset after one of its own messages.
+    ///
+    /// A series is named by its cover letter, and by its lowest-numbered part
+    /// when it has none. Parts arrive in any order, so a part may take the
+    /// name over only from a higher-numbered part of the same series: the name
+    /// then settles on part 1 and stops moving. An id that is not one of the
+    /// series' own parts is a cover letter or a placeholder minted for a
+    /// fetch, and either way the caller knows better than the parts do.
+    async fn adopt_series_identity(
+        &self,
+        patchset_id: i64,
+        identity: &str,
+        own_part_index: Option<u32>,
+    ) -> Result<()> {
+        let Some(part_index) = own_part_index else {
+            self.set_series_identity(patchset_id, identity).await?;
+            return Ok(());
+        };
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT cover_letter_message_id FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let current: Option<String> = match rows.next().await {
+            Ok(Some(row)) => row.get(0).ok(),
+            _ => None,
+        };
+
+        let replace = match current.as_deref() {
+            None => true,
+            Some(current) if current == identity => false,
+            // A placeholder id stands in until a real message shows up.
+            Some(current) if current.ends_with("@sashiko.local") => true,
+            Some(current) => self
+                .patch_part_index(patchset_id, current)
+                .await?
+                .is_some_and(|current_index| current_index > part_index),
+        };
+
+        if replace {
+            self.set_series_identity(patchset_id, identity).await?;
+        }
+        Ok(())
+    }
+
+    async fn set_series_identity(&self, patchset_id: i64, identity: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
+                libsql::params![identity, patchset_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The part number a message holds in a patchset, or None when the message
+    /// is not one of its patches.
+    async fn patch_part_index(&self, patchset_id: i64, message_id: &str) -> Result<Option<u32>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT part_index FROM patches WHERE patchset_id = ? AND message_id = ?",
+                libsql::params![patchset_id, message_id],
+            )
+            .await?;
+        match rows.next().await {
+            Ok(Some(row)) => Ok(row.get::<Option<u32>>(0).ok().flatten()),
+            _ => Ok(None),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_patchset(
         &self,
@@ -4566,6 +4677,14 @@ impl Database {
     ) -> Result<Option<i64>> {
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
+
+        // A series with no cover letter names itself after a part, and this
+        // message is that part when the caller passed its own id. Such a name
+        // yields to a lower-numbered part; every other name is a cover letter
+        // or a placeholder and stands.
+        let identity_from_own_part =
+            (cover_letter_message_id == Some(message_id) && part_index > 0).then_some(part_index);
+
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
         let mut clid_candidates = Vec::new();
         if let Some(clid) = cover_letter_message_id {
@@ -4648,11 +4767,7 @@ impl Database {
                 ).await?;
 
                 if let Some(real_clid) = cover_letter_message_id {
-                    self.conn
-                        .execute(
-                            "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
-                            libsql::params![real_clid, id],
-                        )
+                    self.adopt_series_identity(id, real_clid, identity_from_own_part)
                         .await?;
                 }
 
@@ -4999,11 +5114,7 @@ impl Database {
             }
 
             if let Some(clid) = cover_letter_message_id {
-                self.conn
-                    .execute(
-                        "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
-                        libsql::params![clid, target_id],
-                    )
+                self.adopt_series_identity(target_id, clid, identity_from_own_part)
                     .await?;
             }
 
@@ -12469,6 +12580,243 @@ mod tests {
             Some(1),
             "a patch held by two patchsets resolves to the one that recorded it first"
         );
+    }
+
+    /// A message only counts as a series' cover letter when it announces part
+    /// 0 of exactly that many parts, at that version, from that author.
+    #[tokio::test]
+    async fn test_message_is_cover_letter_for_rejects_a_foreign_thread_root() {
+        let db = setup_db().await;
+        let cover = "20260913-remove-pg_private-v4-0-848550f7574e@nvidia.com";
+        let cover_subject = "[PATCH v4 00/16] Remove PG_private";
+        let sender = "Zi Yan <ziy@nvidia.com>";
+
+        let thread_id = db.create_thread(cover, cover_subject, 1000).await.unwrap();
+        db.create_message(
+            cover,
+            thread_id,
+            None,
+            sender,
+            cover_subject,
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.message_is_cover_letter_for(cover, sender, 16, Some(4))
+                .await
+                .unwrap(),
+            "the series it announces owns it"
+        );
+        assert!(
+            !db.message_is_cover_letter_for(cover, "Matthew Wilcox <willy@infradead.org>", 3, None)
+                .await
+                .unwrap(),
+            "a three part series from another author must not claim it"
+        );
+        assert!(
+            !db.message_is_cover_letter_for(cover, sender, 16, Some(5))
+                .await
+                .unwrap(),
+            "the next version of a series must not claim the previous cover letter"
+        );
+        assert!(
+            !db.message_is_cover_letter_for("never-seen@example.com", sender, 16, Some(4))
+                .await
+                .unwrap(),
+            "a message that was never ingested announces nothing"
+        );
+    }
+
+    /// A series posted into somebody else's thread is named after its own
+    /// first patch, and the thread root keeps naming the series that sent it.
+    #[tokio::test]
+    async fn test_reply_series_is_named_after_its_own_first_patch() {
+        let db = setup_db().await;
+        let cover = "20260913-remove-pg_private-v4-0-848550f7574e@nvidia.com";
+        let cover_subject = "[PATCH v4 00/16] Remove PG_private";
+        let host_author = "Zi Yan <ziy@nvidia.com>";
+        let reply_author = "Matthew Wilcox <willy@infradead.org>";
+        let reply_1 = "20260914041830.2072626-1-willy@infradead.org";
+        let reply_2 = "20260914041830.2072626-2-willy@infradead.org";
+
+        let thread_id = db.create_thread(cover, cover_subject, 1000).await.unwrap();
+        db.create_message(
+            cover,
+            thread_id,
+            None,
+            host_author,
+            cover_subject,
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let host_id = db
+            .create_patchset(
+                thread_id,
+                Some(cover),
+                cover,
+                cover_subject,
+                host_author,
+                1000,
+                16,
+                1,
+                "to",
+                "cc",
+                Some(4),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Both parts of the reply series carry In-Reply-To of the host's
+        // cover letter, so ingestion names the series after each part itself.
+        let reply_id = ingest_reply_part(&db, thread_id, cover, reply_author, reply_1, 1).await;
+        let same_id = ingest_reply_part(&db, thread_id, cover, reply_author, reply_2, 2).await;
+
+        assert_eq!(same_id, reply_id, "the reply series' parts belong together");
+        assert_ne!(
+            reply_id, host_id,
+            "a reply series is not the series it replies to"
+        );
+        assert_eq!(
+            series_identity(&db, reply_id).await,
+            reply_1,
+            "a later part must not rename the series"
+        );
+        assert_eq!(
+            db.find_patchset_id_by_msgid(cover).await.unwrap(),
+            Some(host_id),
+            "the cover letter still names the series that sent it"
+        );
+        assert_eq!(
+            db.find_patchset_id_by_msgid(reply_1).await.unwrap(),
+            Some(reply_id),
+            "the reply series answers to its own first patch"
+        );
+    }
+
+    /// Parts arrive in any order, so a name taken by a later part moves to the
+    /// first patch once that shows up, and then stops moving.
+    #[tokio::test]
+    async fn test_series_name_settles_on_the_lowest_numbered_part() {
+        let db = setup_db().await;
+        let cover = "20260913-remove-pg_private-v4-0-848550f7574e@nvidia.com";
+        let author = "Matthew Wilcox <willy@infradead.org>";
+        let reply_1 = "20260914041830.2072626-1-willy@infradead.org";
+        let reply_2 = "20260914041830.2072626-2-willy@infradead.org";
+        let reply_3 = "20260914041830.2072626-3-willy@infradead.org";
+
+        let thread_id = db
+            .create_thread(cover, "[PATCH v4 00/16] Remove PG_private", 1000)
+            .await
+            .unwrap();
+
+        let ps_id = ingest_reply_part(&db, thread_id, cover, author, reply_2, 2).await;
+        assert_eq!(series_identity(&db, ps_id).await, reply_2);
+
+        ingest_reply_part(&db, thread_id, cover, author, reply_1, 1).await;
+        assert_eq!(
+            series_identity(&db, ps_id).await,
+            reply_1,
+            "the first patch takes the name from a later part"
+        );
+
+        ingest_reply_part(&db, thread_id, cover, author, reply_3, 3).await;
+        assert_eq!(
+            series_identity(&db, ps_id).await,
+            reply_1,
+            "a later part leaves the name alone"
+        );
+    }
+
+    /// Ingest one part of a three part series that was posted in reply to
+    /// `in_reply_to`, the way process_parsed_article does once it finds that
+    /// message is not this series' cover letter.
+    async fn ingest_reply_part(
+        db: &Database,
+        thread_id: i64,
+        in_reply_to: &str,
+        author: &str,
+        message_id: &str,
+        part_index: u32,
+    ) -> i64 {
+        let subject = format!("[PATCH {}/3] md: part {}", part_index, part_index);
+        let date = 2000 + i64::from(part_index);
+
+        db.create_message(
+            message_id,
+            thread_id,
+            Some(in_reply_to),
+            author,
+            &subject,
+            date,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let patchset_id = db
+            .create_patchset(
+                thread_id,
+                Some(message_id),
+                message_id,
+                &subject,
+                author,
+                date,
+                3,
+                1,
+                "to",
+                "cc",
+                None,
+                part_index,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        db.create_patch(patchset_id, message_id, part_index, "diff")
+            .await
+            .unwrap();
+
+        patchset_id
+    }
+
+    /// The message id a patchset answers to.
+    async fn series_identity(db: &Database, patchset_id: i64) -> String {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT cover_letter_message_id FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
     }
 
     /// Verify that has_patchset_by_msgid detects patchsets by bare SHA

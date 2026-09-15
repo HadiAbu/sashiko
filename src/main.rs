@@ -2112,19 +2112,42 @@ async fn process_parsed_article(
     );
     */
 
-    let cover_letter_id = if group == "git-fetch" {
+    let cover_letter_id: Option<String> = if group == "git-fetch" {
         // Always use root_msg_id for git-fetch to match the placeholder ID
-        Some(root_msg_id.as_str())
-    } else if group == "api-submit" {
+        Some(root_msg_id.clone())
+    } else if group == "api-submit" || group.starts_with("git-import") {
         if metadata.total == 1 {
-            Some(metadata.message_id.as_str())
+            Some(metadata.message_id.clone())
         } else {
-            Some(root_msg_id.as_str())
+            Some(root_msg_id.clone())
         }
     } else if metadata.index == 0 || metadata.total == 1 {
-        Some(metadata.message_id.as_str())
+        Some(metadata.message_id.clone())
     } else {
-        metadata.in_reply_to.as_deref()
+        // git send-email points a part at its cover letter, but a series is
+        // just as often posted in reply to an unrelated thread or to its own
+        // previous version. Naming this series after that message would hand
+        // it somebody else's identity, so a part that cannot find its own
+        // cover letter names the series after itself; the database keeps the
+        // lowest-numbered part's name.
+        let parent_is_our_cover_letter = match metadata.in_reply_to.as_deref() {
+            Some(parent) => worker_db
+                .message_is_cover_letter_for(
+                    parent,
+                    &metadata.author,
+                    metadata.total,
+                    metadata.version,
+                )
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
+
+        if parent_is_our_cover_letter {
+            metadata.in_reply_to.clone()
+        } else {
+            Some(metadata.message_id.clone())
+        }
     };
 
     if metadata.is_patch_or_cover {
@@ -2187,7 +2210,7 @@ async fn process_parsed_article(
         match worker_db
             .create_patchset(
                 thread_id,
-                cover_letter_id,
+                cover_letter_id.as_deref(),
                 metadata.message_id.as_str(),
                 &subject,
                 &author,
