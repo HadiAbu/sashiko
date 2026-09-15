@@ -51,24 +51,19 @@ impl Truncator {
             };
         }
 
-        let max_chars = max_tokens * TokenBudget::BYTES_PER_TOKEN;
+        let budget_bytes = max_tokens * TokenBudget::BYTES_PER_TOKEN;
         let lines: Vec<&str> = diff.lines().collect();
         let total_lines = lines.len();
 
         // Heuristic: If total lines is small but content is huge, we have long lines.
         // We calculate 'allowed_lines' based on a conservative average line length (e.g. 50 chars).
-        let allowed_lines = max_chars / 50;
+        let allowed_lines = budget_bytes / 50;
 
         if total_lines <= allowed_lines {
-            // Vulnerability Fix: If we are here, estimated > max_tokens.
-            // But line count is small. This implies huge lines.
-            // We must perform character-based truncation.
-            let kept: String = diff.chars().take(max_chars).collect();
+            // Too few lines to drop any, yet over budget, so the lines
+            // themselves are huge. Nothing can be cut on a line boundary.
             return TruncationResult {
-                content: format!(
-                    "{}\n... [Output truncated. Content too large ({} tokens). Displaying first {} chars] ...\n",
-                    kept, estimated, max_chars
-                ),
+                content: Self::head_of(diff, max_tokens, estimated),
                 truncated: true,
             };
         }
@@ -78,12 +73,8 @@ impl Truncator {
 
         if keep_top + keep_bottom >= total_lines {
             // Should be covered by above check, but safety fallback
-            let kept: String = diff.chars().take(max_chars).collect();
             return TruncationResult {
-                content: format!(
-                    "{}\n... [Output truncated. Content too large. Displaying first {} chars] ...\n",
-                    kept, max_chars
-                ),
+                content: Self::head_of(diff, max_tokens, estimated),
                 truncated: true,
             };
         }
@@ -107,14 +98,11 @@ impl Truncator {
             result.push('\n');
         }
 
-        // Final Safety Check
+        // Final safety net: the kept head and tail, plus the notice between
+        // them, can still come to more than the budget allows.
         if TokenBudget::approximate_tokens(&result) > max_tokens {
-            let kept: String = result.chars().take(max_chars).collect();
             return TruncationResult {
-                content: format!(
-                    "{}\n... [Output truncated after line filtering. Original size: {} tokens] ...\n",
-                    kept, estimated
-                ),
+                content: Self::head_of(&result, max_tokens, estimated),
                 truncated: true,
             };
         }
@@ -231,6 +219,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_truncate_diff_long_line_respects_the_byte_budget() {
+        // One line far wider than the budget, so there is no line boundary to
+        // cut on and the result comes from the mid-line path.
+        let diff = format!("+{}", "x".repeat(50_000));
+
+        let res = Truncator::truncate_diff(&diff, 200, "Diff");
+
+        assert!(res.truncated);
+        assert!(res.content.len() <= 200 * TokenBudget::BYTES_PER_TOKEN);
+    }
+
+    #[test]
+    fn test_truncate_diff_multibyte_stays_within_the_byte_budget() {
+        // The budget is in bytes, so counting the kept prefix in characters
+        // overruns it by the encoded width of whatever is kept: three times
+        // over for this input, and four for a wider code point.
+        let diff = format!("+{}", "→".repeat(50_000));
+        let budget_bytes = 200 * TokenBudget::BYTES_PER_TOKEN;
+
+        let res = Truncator::truncate_diff(&diff, 200, "Diff");
+
+        assert!(res.truncated);
+        assert!(
+            res.content.len() <= budget_bytes,
+            "produced {} bytes against a {} byte budget",
+            res.content.len(),
+            budget_bytes
+        );
+        // Cutting on a byte offset must not split a character.
+        assert!(res.content.is_char_boundary(res.content.len()));
+    }
+
+    #[test]
     fn test_truncate_diff() {
         // The line-based path needs a diff wider than its per-line allowance,
         // so a handful of short lines would only ever reach the character
@@ -248,21 +269,35 @@ mod tests {
 
     #[test]
     fn test_truncate_diff_long_line() {
-        // 1000 chars "a", but max_tokens = 20 (approx 80 chars)
-        // allowed_lines = 80/50 = 1.
-        // total_lines = 1.
-        // 1 <= 1 -> Triggers long line logic.
+        // 1000 chars "a", but max_tokens = 20 (60 bytes).
+        // allowed_lines = 60/50 = 1, total_lines = 1, so this takes the
+        // mid-line path.
         let long_line = "a".repeat(1000);
         let res = Truncator::truncate_diff(&long_line, 20, "Diff");
 
-        // Should strictly be around max_tokens * 4 + overhead of message
+        // The notice counts against the budget, and at 60 bytes there is no
+        // room for both it and any content, so the notice is all that comes
+        // back. Reporting the truncation matters more than a few bytes of a
+        // line nobody can read the rest of. Same rule as the sequential path.
         assert!(res.content.len() < 300);
         assert!(res.content.contains("Output truncated"));
-        assert!(res.content.starts_with("aaaa"));
         assert!(
             res.truncated,
             "Should be marked as truncated despite being a single line"
         );
+    }
+
+    #[test]
+    fn test_truncate_diff_long_line_keeps_content_at_a_realistic_budget() {
+        // Any budget a tool is actually given dwarfs the notice, so the head
+        // of the line survives.
+        let long_line = "a".repeat(100_000);
+        let res = Truncator::truncate_diff(&long_line, 10_000, "Diff");
+
+        assert!(res.truncated);
+        assert!(res.content.starts_with("aaaa"));
+        assert!(res.content.contains("Output truncated"));
+        assert!(res.content.len() <= 10_000 * TokenBudget::BYTES_PER_TOKEN);
     }
 
     #[test]
