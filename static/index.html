@@ -354,13 +354,17 @@
         .controls input[type="text"] {
             background: var(--input-bg);
             color: var(--text);
-            flex: 1;
-            min-width: 200px;
             padding: 4px 8px;
             font-family: inherit;
             font-size: inherit;
             border: 1px solid var(--border);
             border-radius: 3px;
+        }
+
+        #searchInput {
+            flex: 1;
+            min-width: 140px;
+            max-width: 360px;
         }
 
         .controls button,
@@ -2709,10 +2713,11 @@
 
                     <button onclick="triggerSearch()">Search</button>
                     <button onclick="clearSearch()">Clear</button>
-                    <div style="flex:1"></div>
-                    <button id="btn-patchsets" onclick="setListMode('patchsets')" class="${state.listMode === 'patchsets' ? 'active' : ''}">Patchsets</button>
-                    <button id="btn-messages" onclick="setListMode('messages')" class="${state.listMode === 'messages' ? 'active' : ''}">Messages</button>
-                    <button id="btn-bugs" onclick="setListMode('bugs')" class="${state.listMode === 'bugs' ? 'active' : ''}">Bugs</button>
+                    <div style="display: flex; gap: 8px; margin-left: auto;">
+                        <button id="btn-patchsets" onclick="setListMode('patchsets')" class="${state.listMode === 'patchsets' ? 'active' : ''}">Patchsets</button>
+                        <button id="btn-messages" onclick="setListMode('messages')" class="${state.listMode === 'messages' ? 'active' : ''}">Messages</button>
+                        <button id="btn-bugs" onclick="setListMode('bugs')" class="${state.listMode === 'bugs' ? 'active' : ''}">Bugs</button>
+                    </div>
                 </div>
                 <table id="dataTable">
                     <thead id="tableHead"></thead>
