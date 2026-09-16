@@ -1043,6 +1043,12 @@ async fn get_patchset_summary(
             .db
             .get_patchset_summary(id_val, query.page, query.per_page)
             .await
+    } else if query.id.contains('-') && !query.id.contains('@') {
+        info!("Fetching summary for patchset slug: {}", query.id);
+        state
+            .db
+            .get_patchset_summary_by_slug(&query.id, query.page, query.per_page)
+            .await
     } else {
         info!("Fetching summary for patchset msgid: {}", query.id);
         state
