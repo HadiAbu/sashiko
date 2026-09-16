@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Client;
 use sashiko::api::{PatchsetsResponse, SubmitRequest, SubmitResponse};
 use sashiko::auth::LocalToken;
+use sashiko::project::ProjectId;
 use sashiko::settings::Settings;
 use sashiko::utils::utf8_prefix;
 use serde_json::{Value, from_str};
@@ -27,6 +28,19 @@ use std::sync::OnceLock;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 static COLOR_CHOICE: OnceLock<ColorChoice> = OnceLock::new();
+
+/// The project this invocation is for, resolved once in `main`.
+///
+/// Held the way `COLOR_CHOICE` is, for the same reason: it comes from a global
+/// flag and is read far from where it is parsed, and threading it through every
+/// intervening signature would say nothing the flag does not already say.
+static PROJECT: OnceLock<ProjectId> = OnceLock::new();
+
+/// The resolved project. Defaults rather than panicking, because a command that
+/// never touches a project should not depend on `main` having set it.
+fn project() -> ProjectId {
+    PROJECT.get().copied().unwrap_or_default()
+}
 
 #[derive(Parser)]
 #[command(name = "sashiko-cli")]
@@ -47,6 +61,10 @@ struct Cli {
     /// When to use color: auto (default), always, never
     #[arg(long, global = true, default_value = "auto")]
     color: ColorMode,
+
+    /// The codebase to review (default: the configured project, else linux)
+    #[arg(long, global = true, env = "SASHIKO_PROJECT")]
+    project: Option<ProjectId>,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -243,6 +261,14 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // Same precedence as the server: the flag, then what the settings file
+    // says it is for, then the default. A missing or unreadable settings file
+    // is not fatal here, since most commands only talk to a running server.
+    let configured_project = Settings::new().ok().and_then(|s| s.project.kind);
+    PROJECT
+        .set(cli.project.or(configured_project).unwrap_or_default())
+        .expect("project is set exactly once, here");
 
     let client = build_client();
 
@@ -1602,6 +1628,10 @@ async fn handle_local(
             baseline_ref,
             "--repo".to_string(),
             repo_path.to_string_lossy().to_string(),
+            // The worker resolves its own prompts, and without being told the
+            // project it resolves the default one's.
+            "--project".to_string(),
+            project().as_str().to_string(),
         ];
 
         if no_ai {

@@ -1741,6 +1741,11 @@ async fn run_review_tool_with_cmd(
         baseline,
         "--worktree-dir",
         &settings.review.worktree_dir,
+        // The worker is a fresh process with a cleared environment, so it
+        // would otherwise fall back to the default project and load the
+        // kernel prompts no matter what this daemon was started for.
+        "--project",
+        settings.project.kind.unwrap_or_default().as_str(),
         "--ai-provider",
         match settings.ai.provider.as_str() {
             "claude" | "stdio-claude" | "claude-cli" | "codex-cli" | "copilot-cli" | "kiro-cli"

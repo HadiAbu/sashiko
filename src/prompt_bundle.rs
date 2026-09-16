@@ -15,13 +15,30 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+use crate::project::ProjectId;
+
 include!(concat!(env!("OUT_DIR"), "/prompts_generated.rs"));
 
 const COMPLETE_MARKER: &str = ".sashiko-prompts-complete";
 
-pub fn default_kernel_prompts_path() -> Result<PathBuf> {
+/// The installed prompt directory for a project.
+///
+/// A missing directory is an error rather than a path returned anyway. Every
+/// `@include` resolves against this root and silently yields nothing when the
+/// file is absent, which is deliberate for an optional guide but would turn a
+/// project with no prompts at all into a review that runs with an empty system
+/// prompt and reports nothing.
+pub fn project_prompts_path(project: ProjectId) -> Result<PathBuf> {
     let root = install_prompt_bundle(false)?;
-    Ok(root.join("kernel"))
+    let path = root.join(project.prompt_dir());
+    if !path.is_dir() {
+        anyhow::bail!(
+            "no prompts for project {project}: expected a {} directory in the prompt bundle at {}",
+            project.prompt_dir(),
+            path.display()
+        );
+    }
+    Ok(path)
 }
 
 /// Returns the compiled-in content of `kernel/severity.md`.

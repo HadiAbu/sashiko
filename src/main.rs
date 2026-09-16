@@ -20,6 +20,7 @@ use sashiko::local_review::{
     ProgressEvent, ReviewOptions, WorkerOptions, print_worker_json, result_has_error,
     result_has_high_or_critical_findings, run_git_review, run_worker_from_stdin,
 };
+use sashiko::project::ProjectId;
 use sashiko::prompt_bundle;
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::Settings;
@@ -69,6 +70,12 @@ struct Cli {
     /// Debug feature: run only these analysis stages, by name
     #[arg(long, hide = true, value_delimiter = ',')]
     stages: Option<Vec<String>>,
+
+    /// The codebase to review (default: the configured project, else linux)
+    ///
+    /// Global, so it means the same thing wherever it is typed.
+    #[arg(long, global = true, env = "SASHIKO_PROJECT")]
+    project: Option<ProjectId>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -262,6 +269,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Debug logging enabled");
     }
 
+    // Resolved once, before anything dispatches on it, so the flag, the
+    // environment and the settings file cannot be read in a different order by
+    // two different code paths.
+    let project = effective_project(
+        cli.project,
+        settings_result.as_ref().ok().and_then(|s| s.project.kind),
+    )?;
+
     if let Some(command) = &cli.command {
         match command {
             Commands::Init {
@@ -292,7 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     *no_ai,
                     custom_prompt.clone(),
                     ai_provider.clone(),
-                    resolve_prompts_path(prompts.clone())?,
+                    resolve_prompts_path(prompts.clone(), project)?,
                     *format,
                     *color,
                     stages.clone(),
@@ -322,7 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     baseline: baseline.clone(),
                     repo: repo.clone(),
                     worktree_dir: worktree_dir.clone(),
-                    prompts: resolve_prompts_path(prompts.clone())?,
+                    prompts: resolve_prompts_path(prompts.clone(), project)?,
                     review_patch_index: *review_patch_index,
                     review_commit: review_commit.clone(),
                     no_ai: *no_ai,
@@ -364,6 +379,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e.into());
         }
     };
+
+    // The resolved project is the answer to the flag, the environment and the
+    // file together. Writing it back means everything reading the settings
+    // from here on, including the reviewer that has to pass it to its worker
+    // subprocesses, sees the same answer rather than re-deriving it.
+    settings.project.kind = Some(project);
+    info!("Reviewing project: {project}");
 
     if cli.no_ai {
         settings.ai.no_ai = true;
@@ -1132,12 +1154,37 @@ fn handle_init_command(
     Ok(())
 }
 
-fn resolve_prompts_path(path: Option<PathBuf>) -> Result<PathBuf, Box<dyn std::error::Error>> {
+/// The project this invocation is for.
+///
+/// The flag wins over the settings file, but a settings file naming a
+/// different project is not overridden silently. A settings file is what points
+/// at a database, a git tree and a port, so a flag that disagrees with it is
+/// asking to run one project against another one's state. Refusing is cheap;
+/// noticing afterwards is not.
+fn effective_project(
+    requested: Option<ProjectId>,
+    configured: Option<ProjectId>,
+) -> Result<ProjectId, String> {
+    match (requested, configured) {
+        (Some(flag), Some(configured)) if flag != configured => Err(format!(
+            "--project {flag} disagrees with the loaded settings, which are for {configured}; \
+             point at the settings for {flag} or drop the flag"
+        )),
+        (Some(flag), _) => Ok(flag),
+        (None, Some(configured)) => Ok(configured),
+        (None, None) => Ok(ProjectId::default()),
+    }
+}
+
+fn resolve_prompts_path(
+    path: Option<PathBuf>,
+    project: ProjectId,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if let Some(path) = path {
         return Ok(path);
     }
 
-    Ok(prompt_bundle::default_kernel_prompts_path()?)
+    Ok(prompt_bundle::project_prompts_path(project)?)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2561,6 +2608,64 @@ mod tests {
         assert_eq!(calculate_progress_metrics(1, 5, 20), (1, 100, 20));
         assert_eq!(calculate_progress_metrics(5, 2, 20), (2, 40, 8));
         assert_eq!(calculate_progress_metrics(0, 5, 20), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_project_defaults_to_linux_when_nothing_names_one() {
+        // An existing deployment passes no flag and has no kind in its
+        // settings, and must keep getting the kernel behaviour.
+        assert_eq!(effective_project(None, None), Ok(ProjectId::Linux));
+    }
+
+    #[test]
+    fn test_project_flag_and_settings_are_each_enough_alone() {
+        assert_eq!(
+            effective_project(Some(ProjectId::Sashiko), None),
+            Ok(ProjectId::Sashiko)
+        );
+        assert_eq!(
+            effective_project(None, Some(ProjectId::Sashiko)),
+            Ok(ProjectId::Sashiko)
+        );
+    }
+
+    #[test]
+    fn test_project_flag_wins_when_the_settings_agree() {
+        assert_eq!(
+            effective_project(Some(ProjectId::Linux), Some(ProjectId::Linux)),
+            Ok(ProjectId::Linux)
+        );
+    }
+
+    #[test]
+    fn test_disagreeing_project_is_refused_rather_than_resolved() {
+        // The settings file is what names the database, the git tree and the
+        // port. Letting the flag win here would run one project against
+        // another one's state, so neither side wins and the run stops.
+        let err = effective_project(Some(ProjectId::Sashiko), Some(ProjectId::Linux)).unwrap_err();
+        assert!(err.contains("sashiko"), "{err}");
+        assert!(err.contains("linux"), "{err}");
+    }
+
+    #[test]
+    fn test_project_is_accepted_wherever_it_is_typed() {
+        // Global, so it parses before a subcommand, after one, and with none.
+        let bare = Cli::try_parse_from(["sashiko", "--project", "sashiko"]).unwrap();
+        assert_eq!(bare.project, Some(ProjectId::Sashiko));
+
+        let before = Cli::try_parse_from(["sashiko", "--project", "sashiko", "review"]).unwrap();
+        assert_eq!(before.project, Some(ProjectId::Sashiko));
+
+        let after = Cli::try_parse_from(["sashiko", "review", "--project", "sashiko"]).unwrap();
+        assert_eq!(after.project, Some(ProjectId::Sashiko));
+
+        let absent = Cli::try_parse_from(["sashiko", "review"]).unwrap();
+        assert_eq!(absent.project, None);
+    }
+
+    #[test]
+    fn test_unknown_project_is_rejected_by_the_parser() {
+        assert!(Cli::try_parse_from(["sashiko", "--project", "freebsd"]).is_err());
     }
 
     #[test]
