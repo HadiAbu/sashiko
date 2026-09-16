@@ -19,7 +19,6 @@ use crate::toolbox::framework::LlmTool;
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 pub struct GitReadFilesTool;
 
@@ -147,9 +146,8 @@ impl GitReadFilesTool {
             return Err(anyhow!("Invalid path name: {}", path_str));
         }
 
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path)
-            .args(["show", &format!("{}:{}", revision, path_str)]);
+        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        cmd.args(["show", &format!("{}:{}", revision, path_str)]);
 
         let output = capped_output(&mut cmd).await?;
         if !output.is_usable() {

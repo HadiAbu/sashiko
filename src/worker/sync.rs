@@ -2,7 +2,6 @@ use crate::git_ops::ensure_remote;
 use anyhow::Result;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -31,8 +30,7 @@ impl GitSyncWorker {
         info!("GitSyncWorker: Starting sync cycle.");
 
         // Enumerate all configured remotes
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
+        let output = crate::git_cmd::in_dir_async(&self.repo_path)
             .args(["remote"])
             .output()
             .await?;
@@ -54,8 +52,7 @@ impl GitSyncWorker {
 
         for remote in remotes {
             // Get URL for the remote
-            let url_output = Command::new("git")
-                .current_dir(&self.repo_path)
+            let url_output = crate::git_cmd::in_dir_async(&self.repo_path)
                 .args(["remote", "get-url", remote])
                 .output()
                 .await?;

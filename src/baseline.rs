@@ -143,9 +143,7 @@ impl BaselineRegistry {
     }
 
     fn read_file_from_git(repo_path: &Path, rev: &str, file_path: &str) -> Result<String> {
-        use std::process::Command;
-        let output = Command::new("git")
-            .current_dir(repo_path)
+        let output = crate::git_cmd::in_dir(repo_path)
             .args(["show", &format!("{}:{}", rev, file_path)])
             .output()?;
 
@@ -224,10 +222,7 @@ impl BaselineRegistry {
     }
 
     fn load_git_remotes(repo_path: &Path) -> Result<HashMap<String, String>> {
-        use std::process::Command;
-
-        let output = Command::new("git")
-            .current_dir(repo_path)
+        let output = crate::git_cmd::in_dir(repo_path)
             .args(["remote", "-v"])
             .output()?;
 
@@ -897,8 +892,7 @@ F: patterns/
         let repo_path = temp_dir.path();
 
         // Init git repo to avoid ensure_remote failing too hard
-        std::process::Command::new("git")
-            .current_dir(repo_path)
+        crate::git_cmd::in_dir(repo_path)
             .arg("init")
             .output()
             .unwrap();
@@ -939,8 +933,7 @@ F: patterns/
         let temp_dir = tempfile::tempdir().unwrap();
         let repo_path = temp_dir.path();
 
-        std::process::Command::new("git")
-            .current_dir(repo_path)
+        crate::git_cmd::in_dir(repo_path)
             .arg("init")
             .output()
             .unwrap();

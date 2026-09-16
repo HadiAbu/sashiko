@@ -19,7 +19,6 @@ use crate::toolbox::framework::LlmTool;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 pub struct GitDiffTool;
 
@@ -75,13 +74,8 @@ impl LlmTool<SashikoToolContext> for GitDiffTool {
             return Err(anyhow!("Invalid revision names"));
         }
 
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path).args([
-            "diff",
-            "--diff-algorithm=histogram",
-            base,
-            target,
-        ]);
+        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        cmd.args(["diff", "--diff-algorithm=histogram", base, target]);
 
         if let Some(paths_val) = args["paths"].as_array() {
             cmd.arg("--");

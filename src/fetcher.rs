@@ -18,7 +18,6 @@ use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
@@ -363,8 +362,7 @@ impl FetchAgent {
         };
 
         // Check if remote exists
-        let status = Command::new("git")
-            .current_dir(&self.repo_path)
+        let status = crate::git_cmd::in_dir_async(&self.repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["remote", "get-url", name])
             .stdout(Stdio::null())
@@ -373,8 +371,7 @@ impl FetchAgent {
             .await?;
 
         if status.success() {
-            let output = Command::new("git")
-                .current_dir(&self.repo_path)
+            let output = crate::git_cmd::in_dir_async(&self.repo_path)
                 .args(["-c", "safe.bareRepository=all"])
                 .args(["remote", "get-url", name])
                 .output()
@@ -388,8 +385,7 @@ impl FetchAgent {
                     redact_secret(&current_url),
                     redact_secret(&authenticated_url)
                 );
-                Command::new("git")
-                    .current_dir(&self.repo_path)
+                crate::git_cmd::in_dir_async(&self.repo_path)
                     .args(["-c", "safe.bareRepository=all"])
                     .args(["remote", "set-url", name, &authenticated_url])
                     .output()
@@ -401,8 +397,7 @@ impl FetchAgent {
                 name,
                 redact_secret(&authenticated_url)
             );
-            let output = Command::new("git")
-                .current_dir(&self.repo_path)
+            let output = crate::git_cmd::in_dir_async(&self.repo_path)
                 .args(["-c", "safe.bareRepository=all"])
                 .args(["remote", "add", name, &authenticated_url])
                 .output()
@@ -428,8 +423,7 @@ impl FetchAgent {
         let mut dropped_graph = false;
 
         loop {
-            let output = Command::new("git")
-                .current_dir(&self.repo_path)
+            let output = crate::git_cmd::in_dir_async(&self.repo_path)
                 .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
                 .arg("fetch")
                 .args(args)
@@ -495,8 +489,7 @@ impl FetchAgent {
             args.extend(["rev-parse", "--verify", &arg_str]);
         };
 
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
+        let output = crate::git_cmd::in_dir_async(&self.repo_path)
             .args(&args)
             .output()
             .await;
@@ -523,8 +516,7 @@ impl FetchAgent {
     }
 
     async fn resolve_sha(&self, commit: &str) -> Result<String> {
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
+        let output = crate::git_cmd::in_dir_async(&self.repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["rev-parse", "--verify", commit])
             .output()
@@ -591,18 +583,15 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Setup dummy repo
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .arg("init")
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
@@ -611,13 +600,11 @@ mod tests {
         let mut file = File::create(&file_path)?;
         writeln!(file, "content")?;
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "-m", "Subject Line\n\nBody Line"])
             .output()
             .await?;
@@ -625,8 +612,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
 
-        let output = Command::new("git")
-            .current_dir(&repo_path)
+        let output = crate::git_cmd::in_dir_async(&repo_path)
             .args(["rev-parse", "HEAD"])
             .output()
             .await?;
@@ -663,18 +649,15 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Setup dummy repo
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .arg("init")
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
@@ -683,13 +666,11 @@ mod tests {
         let mut file = File::create(&file_path)?;
         writeln!(file, "content")?;
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "-m", "Subject Line"])
             .output()
             .await?;
@@ -697,8 +678,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
 
-        let output = Command::new("git")
-            .current_dir(&repo_path)
+        let output = crate::git_cmd::in_dir_async(&repo_path)
             .args(["rev-parse", "HEAD^{tree}"])
             .output()
             .await?;
@@ -709,8 +689,7 @@ mod tests {
             "Tree SHA should not be considered a present commit"
         );
 
-        let output = Command::new("git")
-            .current_dir(&repo_path)
+        let output = crate::git_cmd::in_dir_async(&repo_path)
             .args(["rev-parse", "HEAD"])
             .output()
             .await?;

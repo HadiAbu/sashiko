@@ -19,7 +19,6 @@ use crate::toolbox::framework::LlmTool;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 pub struct GitBlameTool;
 
@@ -78,8 +77,8 @@ impl LlmTool<SashikoToolContext> for GitBlameTool {
         let start_line = args["start_line"].as_u64();
         let end_line = args["end_line"].as_u64();
 
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path).arg("blame");
+        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        cmd.arg("blame");
 
         if let (Some(s), Some(e)) = (start_line, end_line) {
             cmd.arg(format!("-L{},{}", s, e));

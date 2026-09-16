@@ -1630,8 +1630,7 @@ async fn handle_review_command(
 
 fn current_git_toplevel() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
-    let output = std::process::Command::new("git")
-        .current_dir(&cwd)
+    let output = sashiko::git_cmd::in_dir(&cwd)
         .args(["rev-parse", "--show-toplevel"])
         .output()?;
 

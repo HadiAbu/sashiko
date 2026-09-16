@@ -134,8 +134,7 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         let run_git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .current_dir(&repo_path)
+            let status = crate::git_cmd::in_dir(&repo_path)
                 .args(args)
                 .status()
                 .unwrap();
@@ -158,8 +157,7 @@ mod tests {
         let rt = Runtime::new().unwrap();
 
         // Resolve actual HEAD~1 SHA
-        let output = std::process::Command::new("git")
-            .current_dir(&repo_path)
+        let output = crate::git_cmd::in_dir(&repo_path)
             .args(["rev-parse", "HEAD~1"])
             .output()
             .unwrap();
@@ -177,8 +175,7 @@ mod tests {
         assert!(content.contains(&head_minus_1));
 
         // It should NOT contain the current HEAD SHA
-        let output_current = std::process::Command::new("git")
-            .current_dir(&repo_path)
+        let output_current = crate::git_cmd::in_dir(&repo_path)
             .args(["rev-parse", "HEAD"])
             .output()
             .unwrap();
@@ -553,8 +550,7 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         let run_git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .current_dir(&repo_path)
+            let status = crate::git_cmd::in_dir(&repo_path)
                 .args(args)
                 .status()
                 .unwrap();

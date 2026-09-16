@@ -840,8 +840,7 @@ impl Reviewer {
                     if let BaselineResolution::Commit(sha_str) = candidate {
                         // Attempt to fetch the missing commit from the
                         // mainline remote.
-                        let _ = Command::new("git")
-                            .current_dir(&repo_path)
+                        let _ = crate::git_cmd::in_dir_async(&repo_path)
                             .args(["fetch", mainline_remote, sha_str])
                             .output()
                             .await;
@@ -854,8 +853,7 @@ impl Reviewer {
                                 // v7.2-rc2). Those aren't fetchable by SHA,
                                 // so pull tags from the mainline remote and
                                 // retry.
-                                let _ = Command::new("git")
-                                    .current_dir(&repo_path)
+                                let _ = crate::git_cmd::in_dir_async(&repo_path)
                                     .args(["fetch", mainline_remote, "--tags"])
                                     .output()
                                     .await;

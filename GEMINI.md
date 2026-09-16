@@ -67,10 +67,16 @@ Use `make` to run common development tasks:
 
 - **Unit Tests:** Write unit tests for new logic, ideally in the same file within a `tests` module.
 - **Integration Tests:** Use `tests/` directory for integration tests that test the public API.
+- **Never Run The Suite From Git:** Do not run `cargo test`, `make test` or `make check-pr` under `git rebase --exec`, `git bisect run`, or a git hook. This checkout is a linked worktree, and git exports `GIT_DIR` to every command it starts, which points the test fixtures at the real repository instead of their temporary directories. To verify a series commit by commit, clone into a throwaway directory (`git clone . /tmp/verify && cd /tmp/verify`) and run the checks there.
 
 ## 6. Asynchronous Code
 
 - **Async/Await:** Use idiomatic `async`/`await` patterns. Be mindful of blocking operations in async contexts; use `tokio::task::spawn_blocking` if necessary.
+
+## 7. Spawning Git
+
+- **One Constructor:** Never write `Command::new("git")`. Build every git invocation with `git_cmd::in_dir`, `git_cmd::in_dir_async`, or `git_cmd::detached_async` for the rare command that names every path it touches. A test in `src/git_cmd.rs` fails the build if a raw constructor appears anywhere else in `src/`.
+- **Why:** Git reads `GIT_DIR`, `GIT_WORK_TREE` and their relatives before it looks at the working directory, so a command that appears anchored by `current_dir` is silently redirected when those variables are inherited. The constructors remove them.
 
 # Project Map
 

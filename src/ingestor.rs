@@ -273,7 +273,7 @@ impl Ingestor {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            let output = Command::new("git")
+            let output = crate::git_cmd::detached_async()
                 .arg("clone")
                 .arg("--bare")
                 .arg(format!("--depth={}", n))
@@ -290,10 +290,9 @@ impl Ingestor {
             }
         } else {
             // Repo exists, ensure remote is correct then fetch
-            let remote_output = Command::new("git")
+            let remote_output = crate::git_cmd::in_dir_async(path)
                 .arg("-c")
                 .arg("safe.bareRepository=all")
-                .current_dir(path)
                 .arg("remote")
                 .arg("get-url")
                 .arg("origin")
@@ -306,10 +305,9 @@ impl Ingestor {
                     .to_string();
                 if current_url != url {
                     info!("Updating remote origin from {} to {}", current_url, url);
-                    let set_url_output = Command::new("git")
+                    let set_url_output = crate::git_cmd::in_dir_async(path)
                         .arg("-c")
                         .arg("safe.bareRepository=all")
-                        .current_dir(path)
                         .arg("remote")
                         .arg("set-url")
                         .arg("origin")
@@ -327,10 +325,9 @@ impl Ingestor {
             }
 
             info!("Fetching latest changes in {:?} with depth {}", path, n);
-            let output = Command::new("git")
+            let output = crate::git_cmd::in_dir_async(path)
                 .arg("-c")
                 .arg("safe.bareRepository=all")
-                .current_dir(path)
                 .arg("fetch")
                 .arg(format!("--depth={}", n))
                 .arg("origin")
@@ -514,11 +511,10 @@ impl Ingestor {
 
         // 1. Start git rev-list (Producer)
         info!("Starting object enumeration...");
-        let mut rev_list_cmd = Command::new("git");
+        let mut rev_list_cmd = crate::git_cmd::in_dir_async(path);
         rev_list_cmd
             .arg("-c")
             .arg("safe.bareRepository=all")
-            .current_dir(path)
             .arg("rev-list")
             .arg("--all")
             .arg("--objects");
@@ -539,11 +535,10 @@ impl Ingestor {
         let mut rev_list_reader = BufReader::new(rev_list_stdout).lines();
 
         // 2. Start git cat-file --batch (Consumer)
-        let mut cat_file_cmd = Command::new("git");
+        let mut cat_file_cmd = crate::git_cmd::in_dir_async(path);
         cat_file_cmd
             .arg("-c")
             .arg("safe.bareRepository=all")
-            .current_dir(path)
             .arg("cat-file")
             .arg("--batch")
             .stdin(Stdio::piped())

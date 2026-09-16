@@ -11,11 +11,7 @@ struct Fixture {
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .unwrap();
+    let output = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
     assert!(
         output.status.success(),
         "git {args:?}: {}",

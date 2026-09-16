@@ -810,8 +810,7 @@ Return ONLY a valid JSON object matching this schema:
         #[allow(clippy::collapsible_if)]
         if let Some(tb) = &self.tools {
             if let Some(sha) = &parsed.introducing_commit_sha {
-                let output = std::process::Command::new("git")
-                    .current_dir(tb.get_worktree_path())
+                let output = crate::git_cmd::in_dir(tb.get_worktree_path())
                     .args(["cat-file", "-e", &format!("{}^{{commit}}", sha)])
                     .output()
                     .map_err(|e| ValidationError::FormatViolation(e.to_string()))?;
@@ -1288,8 +1287,7 @@ async fn get_master_sha(tools: Option<&Arc<ToolBox>>) -> String {
     tokio::task::spawn_blocking(move || {
         let worktree = tb.get_worktree_path();
         for ref_name in ["origin/master", "master", "HEAD"] {
-            if let Ok(output) = std::process::Command::new("git")
-                .current_dir(worktree)
+            if let Ok(output) = crate::git_cmd::in_dir(worktree)
                 .args(["rev-parse", ref_name])
                 .output()
                 && output.status.success()
@@ -1315,8 +1313,7 @@ async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Opt
     tokio::task::spawn_blocking(move || {
         let worktree = tb.get_worktree_path();
 
-        let subject = std::process::Command::new("git")
-            .current_dir(worktree)
+        let subject = crate::git_cmd::in_dir(worktree)
             .args(["log", "-1", "--format=%s", &sha])
             .output()
             .ok()
@@ -1329,8 +1326,7 @@ async fn format_commit(tools: Option<&Arc<ToolBox>>, sha: Option<String>) -> Opt
             })
             .unwrap_or_else(|| "unknown".to_string());
 
-        let release = std::process::Command::new("git")
-            .current_dir(worktree)
+        let release = crate::git_cmd::in_dir(worktree)
             .args(["describe", "--contains", &sha])
             .output()
             .ok()
@@ -1383,8 +1379,7 @@ pub async fn deterministic_blame_fallback(
         let Some(line) = loc.get("line").and_then(|v| v.as_u64()) else {
             continue;
         };
-        let blame_output = tokio::process::Command::new("git")
-            .current_dir(worktree)
+        let blame_output = crate::git_cmd::in_dir_async(worktree)
             .args(["-c", "safe.bareRepository=all"])
             .args([
                 "blame",
@@ -1506,8 +1501,7 @@ pub async fn prefetch_bug_locations(
                 break;
             }
 
-            let git_output = std::process::Command::new("git")
-                .current_dir(&worktree)
+            let git_output = crate::git_cmd::in_dir(&worktree)
                 .args(["show", &format!("{}:{}", master_sha_owned, file)])
                 .output();
 
@@ -1515,16 +1509,14 @@ pub async fn prefetch_bug_locations(
                 Ok(o) if o.status.success() => (o, file.clone()),
                 _ => {
                     // Try tracing rename forwards first
-                    let last_commit = std::process::Command::new("git")
-                        .current_dir(&worktree)
+                    let last_commit = crate::git_cmd::in_dir(&worktree)
                         .args(["log", "-n", "1", "--format=%H", "--", &file])
                         .output();
                     let mut resolved = None;
                     if let Ok(lc) = last_commit {
                         let sha = String::from_utf8_lossy(&lc.stdout).trim().to_string();
                         if !sha.is_empty() {
-                            let diff_out = std::process::Command::new("git")
-                                .current_dir(&worktree)
+                            let diff_out = crate::git_cmd::in_dir(&worktree)
                                 .args(["show", "-M", "--name-status", "--format=", &sha])
                                 .output();
                             if let Ok(do_out) = diff_out {
@@ -1536,8 +1528,7 @@ pub async fn prefetch_bug_locations(
                                         && parts[1] == file
                                     {
                                         let next_path = parts[2].trim();
-                                        let try_out = std::process::Command::new("git")
-                                            .current_dir(&worktree)
+                                        let try_out = crate::git_cmd::in_dir(&worktree)
                                             .args([
                                                 "show",
                                                 &format!("{}:{}", master_sha_owned, next_path),
@@ -1557,8 +1548,7 @@ pub async fn prefetch_bug_locations(
 
                     if resolved.is_none() {
                         // Fallback: check git log --follow backwards
-                        let rename_cmd = std::process::Command::new("git")
-                            .current_dir(&worktree)
+                        let rename_cmd = crate::git_cmd::in_dir(&worktree)
                             .args(["log", "--follow", "--name-only", "--format=format:", &file])
                             .output();
                         if let Some(ro) = rename_cmd.ok().filter(|r| r.status.success()) {
@@ -1568,8 +1558,7 @@ pub async fn prefetch_bug_locations(
                                 if trimmed.is_empty() || trimmed == file {
                                     continue;
                                 }
-                                let try_out = std::process::Command::new("git")
-                                    .current_dir(&worktree)
+                                let try_out = crate::git_cmd::in_dir(&worktree)
                                     .args(["show", &format!("{}:{}", master_sha_owned, trimmed)])
                                     .output();
                                 if let Some(to) = try_out.ok().filter(|t| t.status.success()) {
@@ -3266,19 +3255,16 @@ mod tests {
         let path = temp.path();
 
         // Initialize a minimal git repository with a C source file
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["init"])
-            .current_dir(path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["config", "user.name", "Test"])
-            .current_dir(path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["config", "user.email", "test@example.com"])
-            .current_dir(path)
             .output()
             .unwrap();
 
@@ -3293,14 +3279,12 @@ static int target_kernel_func(int a, int b)
 }
 "#;
         std::fs::write(path.join("test_file.c"), c_code).unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["add", "test_file.c"])
-            .current_dir(path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["commit", "-m", "initial commit"])
-            .current_dir(path)
             .output()
             .unwrap();
 
@@ -3348,44 +3332,37 @@ Call Trace:
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path();
 
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["init"])
-            .current_dir(path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["config", "user.name", "Test"])
-            .current_dir(path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["config", "user.email", "test@example.com"])
-            .current_dir(path)
             .output()
             .unwrap();
 
         let c_code = "int old_fn() {\n    return 42;\n}\n";
         std::fs::write(path.join("old_net.c"), c_code).unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["add", "old_net.c"])
-            .current_dir(path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["commit", "-m", "add old_net.c"])
-            .current_dir(path)
             .output()
             .unwrap();
 
         // Rename old_net.c -> new_net.c
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["mv", "old_net.c", "new_net.c"])
-            .current_dir(path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["commit", "-m", "rename to new_net.c"])
-            .current_dir(path)
             .output()
             .unwrap();
 
@@ -3410,38 +3387,32 @@ Call Trace:
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path();
 
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["init"])
-            .current_dir(path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["config", "user.name", "Test"])
-            .current_dir(path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["config", "user.email", "test@example.com"])
-            .current_dir(path)
             .output()
             .unwrap();
 
         let c_code = "int a = 1;\nint b = 2;\nint c = 3;\n";
         std::fs::write(path.join("file.c"), c_code).unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["add", "file.c"])
-            .current_dir(path)
             .output()
             .unwrap();
-        std::process::Command::new("git")
+        crate::git_cmd::in_dir(path)
             .args(["commit", "-m", "initial commit"])
-            .current_dir(path)
             .output()
             .unwrap();
 
         let head_commit = String::from_utf8_lossy(
-            &std::process::Command::new("git")
-                .current_dir(path)
+            &crate::git_cmd::in_dir(path)
                 .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()

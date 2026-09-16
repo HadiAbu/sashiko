@@ -83,8 +83,7 @@ impl GitWorktree {
         let output = {
             let lock = get_worktree_lock();
             let _guard = lock.lock().await;
-            Command::new("git")
-                .current_dir(repo_path)
+            crate::git_cmd::in_dir_async(repo_path)
                 .args(["-c", "safe.bareRepository=all"])
                 .arg("worktree")
                 .arg("add")
@@ -103,8 +102,7 @@ impl GitWorktree {
             ));
         }
 
-        let output = Command::new("git")
-            .current_dir(&path)
+        let output = crate::git_cmd::in_dir_async(&path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["reset", "--hard", commit_hash])
             .output()
@@ -146,7 +144,7 @@ impl GitWorktree {
 
         info!("Creating scratch clone at {:?}", path);
 
-        let output = Command::new("git")
+        let output = crate::git_cmd::detached_async()
             .args(["-c", "safe.bareRepository=all"])
             .arg("clone")
             .arg("--shared")
@@ -163,8 +161,7 @@ impl GitWorktree {
             ));
         }
 
-        let output = Command::new("git")
-            .current_dir(&path)
+        let output = crate::git_cmd::in_dir_async(&path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["reset", "--hard", commit_hash])
             .output()
@@ -189,8 +186,7 @@ impl GitWorktree {
     pub async fn apply_patch(&self, patch_content: &str) -> Result<()> {
         info!("Applying patch in {:?}", self.path);
 
-        let mut child = Command::new("git")
-            .current_dir(&self.path)
+        let mut child = crate::git_cmd::in_dir_async(&self.path)
             .env("GIT_AUTHOR_NAME", "Sashiko Bot")
             .env("GIT_AUTHOR_EMAIL", "sashiko@localhost")
             .env("GIT_COMMITTER_NAME", "Sashiko Bot")
@@ -211,8 +207,7 @@ impl GitWorktree {
         let output = child.wait_with_output().await?;
 
         if !output.status.success() {
-            let _ = Command::new("git")
-                .current_dir(&self.path)
+            let _ = crate::git_cmd::in_dir_async(&self.path)
                 .args(["-c", "safe.bareRepository=all"])
                 .arg("am")
                 .arg("--abort")
@@ -230,8 +225,7 @@ impl GitWorktree {
     }
 
     pub async fn get_commit_show(&self, hash: &str) -> Result<String> {
-        let output = Command::new("git")
-            .current_dir(&self.path)
+        let output = crate::git_cmd::in_dir_async(&self.path)
             .args(["show", "--patch", hash])
             .output()
             .await?;
@@ -247,8 +241,7 @@ impl GitWorktree {
     }
 
     pub async fn get_commit_message(&self, hash: &str) -> Result<String> {
-        let output = Command::new("git")
-            .current_dir(&self.path)
+        let output = crate::git_cmd::in_dir_async(&self.path)
             .args(["show", "--no-patch", hash])
             .output()
             .await?;
@@ -264,8 +257,7 @@ impl GitWorktree {
     }
 
     pub async fn is_merge_commit(&self, hash: &str) -> Result<bool> {
-        let output = Command::new("git")
-            .current_dir(&self.path)
+        let output = crate::git_cmd::in_dir_async(&self.path)
             .args(["rev-list", "--parents", "-n", "1", hash])
             .output()
             .await?;
@@ -280,8 +272,7 @@ impl GitWorktree {
     }
 
     pub async fn is_empty_commit(&self, hash: &str) -> Result<bool> {
-        let output = Command::new("git")
-            .current_dir(&self.path)
+        let output = crate::git_cmd::in_dir_async(&self.path)
             .args([
                 "diff-tree",
                 "--no-commit-id",
@@ -302,8 +293,7 @@ impl GitWorktree {
 
     pub async fn reset_hard(&self, ref_name: &str) -> Result<()> {
         info!("Resetting worktree to {}", ref_name);
-        let output = Command::new("git")
-            .current_dir(&self.path)
+        let output = crate::git_cmd::in_dir_async(&self.path)
             .args(["reset", "--hard", ref_name])
             .output()
             .await?;
@@ -316,8 +306,7 @@ impl GitWorktree {
         }
 
         // Also clean untracked files to be safe
-        let clean_output = Command::new("git")
-            .current_dir(&self.path)
+        let clean_output = crate::git_cmd::in_dir_async(&self.path)
             .args(["clean", "-fdx"])
             .output()
             .await?;
@@ -342,8 +331,7 @@ impl GitWorktree {
         let output = {
             let lock = get_worktree_lock();
             let _guard = lock.lock().await;
-            Command::new("git")
-                .current_dir(&self.repo_path)
+            crate::git_cmd::in_dir_async(&self.repo_path)
                 .args(["-c", "safe.bareRepository=all"])
                 .arg("worktree")
                 .arg("remove")
@@ -366,8 +354,7 @@ impl GitWorktree {
 
 #[allow(dead_code)]
 pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
-    let output = Command::new("git")
-        .current_dir(repo_path)
+    let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["-c", "safe.bareRepository=all"])
         .arg("cat-file")
         .arg("-p")
@@ -388,8 +375,7 @@ pub async fn read_blob(repo_path: &Path, hash: &str) -> Result<Vec<u8>> {
 pub async fn git_file_exists_at(repo_path: &Path, file_path: &str, commit: Option<&str>) -> bool {
     let target = commit.unwrap_or("HEAD");
     let obj = format!("{}:{}", target, file_path);
-    let output = Command::new("git")
-        .current_dir(repo_path)
+    let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["-c", "safe.bareRepository=all"])
         .args(["cat-file", "-e", &obj])
         .output()
@@ -417,8 +403,7 @@ pub async fn git_find_file_rename(
     // 2. Trace forward renames (up to 5 steps) via git show -M on the commit modifying the file
     let mut current_file = file_path.to_string();
     for _ in 0..5 {
-        let last_commit_output = Command::new("git")
-            .current_dir(repo_path)
+        let last_commit_output = crate::git_cmd::in_dir_async(repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["log", "-n", "1", "--format=%H", "--", &current_file])
             .output()
@@ -436,8 +421,7 @@ pub async fn git_find_file_rename(
             break;
         }
 
-        let diff_output = Command::new("git")
-            .current_dir(repo_path)
+        let diff_output = crate::git_cmd::in_dir_async(repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .args(["show", "-M", "--name-status", "--format=", &commit_sha])
             .output()
@@ -469,9 +453,8 @@ pub async fn git_find_file_rename(
     }
 
     // 3. Fallback: check git log --follow backwards
-    let mut cmd = Command::new("git");
-    cmd.current_dir(repo_path)
-        .args(["-c", "safe.bareRepository=all"])
+    let mut cmd = crate::git_cmd::in_dir_async(repo_path);
+    cmd.args(["-c", "safe.bareRepository=all"])
         .arg("log")
         .arg("--follow")
         .arg("--name-only")
@@ -503,8 +486,7 @@ pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
     let output = {
         let lock = get_worktree_lock();
         let _guard = lock.lock().await;
-        Command::new("git")
-            .current_dir(repo_path)
+        crate::git_cmd::in_dir_async(repo_path)
             .args(["-c", "safe.bareRepository=all"])
             .arg("worktree")
             .arg("prune")
@@ -524,8 +506,7 @@ pub async fn prune_worktrees(repo_path: &Path) -> Result<()> {
 #[allow(dead_code)]
 pub async fn ensure_submodule_config_compat(repo_path: &Path) -> Result<()> {
     info!("Ensuring submodule config compatibility in {:?}", repo_path);
-    let output = Command::new("git")
-        .current_dir(repo_path)
+    let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["-c", "safe.bareRepository=all"])
         .args(["config", "--unset", "core.worktree"])
         .output()
@@ -568,8 +549,7 @@ pub async fn ensure_gc_disabled(repo_path: &Path) -> Result<()> {
 
     let mut failures = Vec::new();
     for (key, value) in KEYS {
-        let output = Command::new("git")
-            .current_dir(repo_path)
+        let output = crate::git_cmd::in_dir_async(repo_path)
             .args(["config", key, value])
             .output()
             .await?;
@@ -596,8 +576,7 @@ pub async fn ensure_gc_disabled(repo_path: &Path) -> Result<()> {
 /// instead of this function joining the two.
 async fn object_dir(repo_path: &Path, name: &str) -> Result<PathBuf> {
     let relative = format!("objects/{}", name);
-    let output = Command::new("git")
-        .current_dir(repo_path)
+    let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["rev-parse", "--git-path", &relative])
         .output()
         .await?;
@@ -651,8 +630,7 @@ pub async fn drop_commit_graph(repo_path: &Path) -> Result<()> {
 
 /// Runs one `git commit-graph write`, returning git's own output.
 async fn run_commit_graph_write(repo_path: &Path) -> Result<std::process::Output> {
-    Ok(Command::new("git")
-        .current_dir(repo_path)
+    Ok(crate::git_cmd::in_dir_async(repo_path)
         .args(["commit-graph", "write", "--reachable"])
         .output()
         .await?)
@@ -782,8 +760,7 @@ pub async fn repack_repository(repo_path: &Path) -> Result<()> {
     info!("Repacking {:?}", repo_path);
     let started = std::time::Instant::now();
 
-    let output = Command::new("git")
-        .current_dir(repo_path)
+    let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["repack", "--geometric=2", "-d", "--write-midx"])
         .output()
         .await?;
@@ -934,8 +911,7 @@ async fn fetch_remote(
     args: &[&str],
     timeout: std::time::Duration,
 ) -> std::result::Result<(), String> {
-    let fetch_future = Command::new("git")
-        .current_dir(repo_path)
+    let fetch_future = crate::git_cmd::in_dir_async(repo_path)
         .args(GIT_PROTOCOL_RESTRICTIONS)
         .args(args)
         .kill_on_drop(true)
@@ -987,8 +963,7 @@ pub async fn ensure_remote(
         let global_lock = get_global_config_lock();
         let _global_guard = global_lock.lock().await;
 
-        let check = Command::new("git")
-            .current_dir(repo_path)
+        let check = crate::git_cmd::in_dir_async(repo_path)
             .args(["remote", "get-url", name])
             .output()
             .await?;
@@ -1003,8 +978,7 @@ pub async fn ensure_remote(
                     redact_secret(&current_url),
                     redact_secret(url)
                 );
-                let update = Command::new("git")
-                    .current_dir(repo_path)
+                let update = crate::git_cmd::in_dir_async(repo_path)
                     .args(["remote", "set-url", name, url])
                     .output()
                     .await?;
@@ -1017,8 +991,7 @@ pub async fn ensure_remote(
             }
         } else {
             info!("Adding remote {} ({})", name, redact_secret(url));
-            let add = Command::new("git")
-                .current_dir(repo_path)
+            let add = crate::git_cmd::in_dir_async(repo_path)
                 .args(["remote", "add", name, url])
                 .output()
                 .await?;
@@ -1066,8 +1039,7 @@ pub async fn ensure_remote(
 
     // Check if HEAD exists
     let head_ref = format!("refs/remotes/{}/HEAD", name);
-    let head_exists = Command::new("git")
-        .current_dir(repo_path)
+    let head_exists = crate::git_cmd::in_dir_async(repo_path)
         .args(["show-ref", "--verify", "-q", &head_ref])
         .status()
         .await
@@ -1201,8 +1173,7 @@ pub async fn ensure_remote(
         let global_lock = get_global_config_lock();
         let _global_guard = global_lock.lock().await;
 
-        let set_head = Command::new("git")
-            .current_dir(repo_path)
+        let set_head = crate::git_cmd::in_dir_async(repo_path)
             .args(GIT_PROTOCOL_RESTRICTIONS)
             .args(["remote", "set-head", name, "--auto"])
             .output()
@@ -1213,8 +1184,7 @@ pub async fn ensure_remote(
             let mut head_resolved = false;
             for branch in ["master", "main", "for-next", "for-linus"] {
                 let branch_ref = format!("refs/remotes/{}/{}", name, branch);
-                let branch_exists = Command::new("git")
-                    .current_dir(repo_path)
+                let branch_exists = crate::git_cmd::in_dir_async(repo_path)
                     .args(["show-ref", "--verify", "-q", &branch_ref])
                     .status()
                     .await
@@ -1222,8 +1192,7 @@ pub async fn ensure_remote(
                     .unwrap_or(false);
 
                 if branch_exists {
-                    let set_explicit = Command::new("git")
-                        .current_dir(repo_path)
+                    let set_explicit = crate::git_cmd::in_dir_async(repo_path)
                         .args(GIT_PROTOCOL_RESTRICTIONS)
                         .args(["remote", "set-head", name, branch])
                         .output()
@@ -1250,15 +1219,13 @@ pub async fn ensure_remote(
             for default_branch in ["master", "main"] {
                 let remote_ref = format!("refs/remotes/origin/{}", default_branch);
                 let local_ref = format!("refs/heads/{}", default_branch);
-                let remote_exists = Command::new("git")
-                    .current_dir(repo_path)
+                let remote_exists = crate::git_cmd::in_dir_async(repo_path)
                     .args(["show-ref", "--verify", "-q", &remote_ref])
                     .status()
                     .await
                     .map(|s| s.success())
                     .unwrap_or(false);
-                let local_exists = Command::new("git")
-                    .current_dir(repo_path)
+                let local_exists = crate::git_cmd::in_dir_async(repo_path)
                     .args(["show-ref", "--verify", "-q", &local_ref])
                     .status()
                     .await
@@ -1266,8 +1233,7 @@ pub async fn ensure_remote(
                     .unwrap_or(false);
 
                 if remote_exists && local_exists {
-                    let _ = Command::new("git")
-                        .current_dir(repo_path)
+                    let _ = crate::git_cmd::in_dir_async(repo_path)
                         .args(["update-ref", &local_ref, &remote_ref])
                         .output()
                         .await;
@@ -1280,8 +1246,7 @@ pub async fn ensure_remote(
 }
 
 pub async fn get_remote_branches(repo_path: &Path, remote_name: &str) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .current_dir(repo_path)
+    let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["branch", "-r", "--list", &format!("{}/*", remote_name)])
         .output()
         .await?;
@@ -1305,8 +1270,7 @@ pub async fn get_remote_branches(repo_path: &Path, remote_name: &str) -> Result<
 }
 
 pub async fn get_commit_hash(path: &Path, ref_name: &str) -> Result<String> {
-    let output = Command::new("git")
-        .current_dir(path)
+    let output = crate::git_cmd::in_dir_async(path)
         .args(["rev-parse", ref_name])
         .output()
         .await?;
@@ -1402,8 +1366,7 @@ pub async fn get_git_log(params: GitLogParams) -> Result<String> {
         args.extend(params.paths.clone());
     }
 
-    let output = Command::new("git")
-        .current_dir(&params.repo_path)
+    let output = crate::git_cmd::in_dir_async(&params.repo_path)
         .args(&args)
         .output()
         .await?;
@@ -1421,8 +1384,7 @@ pub async fn get_git_log(params: GitLogParams) -> Result<String> {
 pub async fn git_status(repo_path: &Path) -> Result<String> {
     // Force --untracked-files=normal so the output does not depend on a
     // user's global status.showUntrackedFiles setting.
-    let output = Command::new("git")
-        .current_dir(repo_path)
+    let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["status", "--untracked-files=normal"])
         .output()
         .await?;
@@ -1449,8 +1411,7 @@ pub struct PatchMetadata {
 
 /// Resolve a git range (e.g. "HEAD~3..HEAD") to an ordered list of commit SHAs.
 pub async fn resolve_git_range(repo_path: &Path, range: &str) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .current_dir(repo_path)
+    let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["-c", "safe.bareRepository=all"])
         .args(["rev-list", "--reverse", range])
         .output()
@@ -1479,8 +1440,7 @@ pub async fn resolve_git_range(repo_path: &Path, range: &str) -> Result<Vec<Stri
 /// Extract patch metadata from a commit using `git show`.
 pub async fn extract_patch_metadata(repo_path: &Path, commit: &str) -> Result<PatchMetadata> {
     // Resolve parent to use as base_commit
-    let parent_output = Command::new("git")
-        .current_dir(repo_path)
+    let parent_output = crate::git_cmd::in_dir_async(repo_path)
         .args(["rev-parse", &format!("{}^", commit)])
         .output()
         .await?;
@@ -1501,8 +1461,7 @@ pub async fn extract_patch_metadata(repo_path: &Path, commit: &str) -> Result<Pa
 
     let format = "format:%an%n%ae%n%s%n%b%n---SASHIKO-END-HEADER---%n";
 
-    let output = Command::new("git")
-        .current_dir(repo_path)
+    let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["show", &format!("--format={}", format), commit])
         .output()
         .await?;
@@ -1554,8 +1513,7 @@ pub async fn extract_patch_metadata(repo_path: &Path, commit: &str) -> Result<Pa
 }
 
 pub async fn is_dirty(repo_path: &Path) -> Result<bool> {
-    let output = Command::new("git")
-        .current_dir(repo_path)
+    let output = crate::git_cmd::in_dir_async(repo_path)
         .args(["-c", "safe.bareRepository=all"])
         .args(["status", "--porcelain"])
         .output()
@@ -1596,8 +1554,7 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         let repo_path = temp_dir.path().to_path_buf();
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["init"])
             .output()
             .await?;
@@ -1624,26 +1581,22 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Init git repo
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["init"])
             .output()
             .await?;
 
         // Ensure we are on master
-        let _ = Command::new("git")
-            .current_dir(&repo_path)
+        let _ = crate::git_cmd::in_dir_async(&repo_path)
             .args(["branch", "-m", "master"])
             .output()
             .await;
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
             .await?;
@@ -1653,14 +1606,12 @@ mod tests {
         let mut file = File::create(&file_path)?;
         writeln!(file, "Hello World")?;
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "-m", "Initial commit"])
             .output()
             .await?;
@@ -1678,20 +1629,17 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Init git repo
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["init"])
             .output()
             .await?;
 
         // Configure user
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
             .await?;
@@ -1701,14 +1649,12 @@ mod tests {
         let mut file = File::create(&file_path)?;
         writeln!(file, "Hello World")?;
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "-m", "Initial commit"])
             .output()
             .await?;
@@ -1717,8 +1663,7 @@ mod tests {
         let mut file = std::fs::OpenOptions::new().append(true).open(&file_path)?;
         writeln!(file, "Change 1")?;
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "-am", "Second commit"])
             .output()
             .await?;
@@ -1754,26 +1699,22 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Init git repo
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["init"])
             .output()
             .await?;
 
         // Ensure we are on master
-        let _ = Command::new("git")
-            .current_dir(&repo_path)
+        let _ = crate::git_cmd::in_dir_async(&repo_path)
             .args(["branch", "-m", "master"])
             .output()
             .await;
 
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
             .await?;
@@ -1782,13 +1723,11 @@ mod tests {
         let file_path = repo_path.join("test.txt");
         let mut file = File::create(&file_path)?;
         writeln!(file, "Hello World")?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "-m", "Initial commit"])
             .output()
             .await?;
@@ -1818,23 +1757,19 @@ mod tests {
         let repo_path = temp_dir.path().to_path_buf();
 
         // Init git repo
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["init"])
             .output()
             .await?;
-        let _ = Command::new("git")
-            .current_dir(&repo_path)
+        let _ = crate::git_cmd::in_dir_async(&repo_path)
             .args(["branch", "-m", "master"])
             .output()
             .await;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["config", "user.name", "Test User"])
             .output()
             .await?;
@@ -1845,13 +1780,11 @@ mod tests {
             let mut file = File::create(&file_path)?;
             writeln!(file, "Initial content")?;
         }
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "-m", "Initial commit"])
             .output()
             .await?;
@@ -1859,8 +1792,7 @@ mod tests {
         let initial_hash = get_commit_hash(&repo_path, "HEAD").await?;
 
         // 2. Create a branch and add a commit
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["checkout", "-b", "feature"])
             .output()
             .await?;
@@ -1868,16 +1800,14 @@ mod tests {
             let mut file = std::fs::OpenOptions::new().append(true).open(&file_path)?;
             writeln!(file, "Feature content")?;
         }
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "-am", "Feature commit"])
             .output()
             .await?;
         let feature_hash = get_commit_hash(&repo_path, "HEAD").await?;
 
         // 3. Back to master and add a commit
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["checkout", "master"])
             .output()
             .await?;
@@ -1886,29 +1816,25 @@ mod tests {
             let mut file = File::create(&other_file)?;
             writeln!(file, "Other content")?;
         }
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["add", "."])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "-m", "Master commit"])
             .output()
             .await?;
         let master_hash = get_commit_hash(&repo_path, "HEAD").await?;
 
         // 4. Merge feature into master
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["merge", "feature", "--no-ff", "-m", "Merge commit"])
             .output()
             .await?;
         let merge_hash = get_commit_hash(&repo_path, "HEAD").await?;
 
         // 5. Create an empty commit
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["commit", "--allow-empty", "-m", "Empty commit"])
             .output()
             .await?;
@@ -1954,8 +1880,7 @@ mod tests {
         let repo_path = dir.path().to_path_buf();
 
         // Init local repo
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["init"])
             .output()
             .await?;
@@ -1995,8 +1920,7 @@ mod tests {
         let repo_path = dir.path().to_path_buf();
 
         // Init local repo
-        Command::new("git")
-            .current_dir(&repo_path)
+        crate::git_cmd::in_dir_async(&repo_path)
             .args(["init"])
             .output()
             .await?;
@@ -2024,35 +1948,30 @@ mod tests {
         let local_dir = tempfile::tempdir()?;
 
         // Init upstream remote repo with an initial commit on master
-        Command::new("git")
-            .current_dir(remote_dir.path())
+        crate::git_cmd::in_dir_async(remote_dir.path())
             .args(["init", "-b", "master"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(remote_dir.path())
+        crate::git_cmd::in_dir_async(remote_dir.path())
             .args(["config", "user.name", "Test"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(remote_dir.path())
+        crate::git_cmd::in_dir_async(remote_dir.path())
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
         std::fs::write(remote_dir.path().join("file.txt"), "v1")?;
-        Command::new("git")
-            .current_dir(remote_dir.path())
+        crate::git_cmd::in_dir_async(remote_dir.path())
             .args(["add", "file.txt"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(remote_dir.path())
+        crate::git_cmd::in_dir_async(remote_dir.path())
             .args(["commit", "-m", "commit 1"])
             .output()
             .await?;
 
         // Clone local repo from remote
-        Command::new("git")
+        crate::git_cmd::detached_async()
             .args([
                 "clone",
                 remote_dir.path().to_str().unwrap(),
@@ -2063,14 +1982,12 @@ mod tests {
 
         // Add a second commit to upstream
         std::fs::write(remote_dir.path().join("file.txt"), "v2")?;
-        Command::new("git")
-            .current_dir(remote_dir.path())
+        crate::git_cmd::in_dir_async(remote_dir.path())
             .args(["commit", "-am", "commit 2"])
             .output()
             .await?;
         let upstream_sha = String::from_utf8_lossy(
-            &Command::new("git")
-                .current_dir(remote_dir.path())
+            &crate::git_cmd::in_dir_async(remote_dir.path())
                 .args(["rev-parse", "master"])
                 .output()
                 .await?
@@ -2090,8 +2007,7 @@ mod tests {
 
         // Verify local branch 'master' was updated to upstream_sha
         let local_master_sha = String::from_utf8_lossy(
-            &Command::new("git")
-                .current_dir(local_dir.path())
+            &crate::git_cmd::in_dir_async(local_dir.path())
                 .args(["rev-parse", "refs/heads/master"])
                 .output()
                 .await?
@@ -2107,18 +2023,15 @@ mod tests {
     #[tokio::test]
     async fn test_git_find_file_rename() -> Result<()> {
         let repo_dir = TempDir::new()?;
-        Command::new("git")
-            .current_dir(repo_dir.path())
+        crate::git_cmd::in_dir_async(repo_dir.path())
             .args(["init"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(repo_dir.path())
+        crate::git_cmd::in_dir_async(repo_dir.path())
             .args(["config", "user.name", "Test"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(repo_dir.path())
+        crate::git_cmd::in_dir_async(repo_dir.path())
             .args(["config", "user.email", "test@example.com"])
             .output()
             .await?;
@@ -2128,25 +2041,21 @@ mod tests {
             repo_dir.path().join("old_driver.c"),
             "int old_fn() { return 0; }\n",
         )?;
-        Command::new("git")
-            .current_dir(repo_dir.path())
+        crate::git_cmd::in_dir_async(repo_dir.path())
             .args(["add", "old_driver.c"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(repo_dir.path())
+        crate::git_cmd::in_dir_async(repo_dir.path())
             .args(["commit", "-m", "add old_driver.c"])
             .output()
             .await?;
 
         // 2. Rename file via git mv and commit
-        Command::new("git")
-            .current_dir(repo_dir.path())
+        crate::git_cmd::in_dir_async(repo_dir.path())
             .args(["mv", "old_driver.c", "new_driver.c"])
             .output()
             .await?;
-        Command::new("git")
-            .current_dir(repo_dir.path())
+        crate::git_cmd::in_dir_async(repo_dir.path())
             .args(["commit", "-m", "rename to new_driver.c"])
             .output()
             .await?;

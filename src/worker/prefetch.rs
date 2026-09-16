@@ -64,8 +64,6 @@ pub fn parse_diff_ranges(diff: &str) -> HashMap<String, Vec<(usize, usize)>> {
     files
 }
 
-use tokio::process::Command;
-
 const MAX_PREFETCH_CHARS: usize = 200000;
 
 type LineRangeMap = BTreeMap<PathBuf, BTreeSet<(usize, usize)>>;
@@ -88,8 +86,7 @@ impl<'a> SourceSnapshot<'a> {
                 && target_sha.bytes().all(|b| b.is_ascii_hexdigit()),
             "Prefetch requires a full target commit SHA"
         );
-        let output = Command::new("git")
-            .current_dir(repository)
+        let output = crate::git_cmd::in_dir_async(repository)
             .args([
                 "rev-parse",
                 "--verify",
@@ -116,8 +113,7 @@ impl<'a> SourceSnapshot<'a> {
             return Ok(content.clone());
         }
         let object = format!("{}:{}", self.sha, path.display());
-        let output = Command::new("git")
-            .current_dir(self.repository)
+        let output = crate::git_cmd::in_dir_async(self.repository)
             .args(["show", &object])
             .kill_on_drop(true)
             .output()
@@ -198,9 +194,8 @@ pub async fn prefetch_context(repository: &Path, target_sha: &str, diff: &str) -
             .filter_map(|f| f.rsplit_once('/').map(|(dir, _)| dir))
             .collect();
 
-        let mut cmd = Command::new("git");
-        cmd.current_dir(repository)
-            .arg("grep")
+        let mut cmd = crate::git_cmd::in_dir_async(repository);
+        cmd.arg("grep")
             .arg("--full-name")
             .arg("--no-color")
             .arg("-z")

@@ -20,7 +20,6 @@ use crate::toolbox::utils::format_git_grep_output;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
-use tokio::process::Command;
 
 pub struct GitGrepTool;
 
@@ -86,8 +85,8 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             return Err(anyhow!("Invalid revision: {}", revision));
         }
 
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path).arg("grep");
+        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        cmd.arg("grep");
 
         if count_only {
             cmd.arg("-c");

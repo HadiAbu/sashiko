@@ -514,8 +514,7 @@ async fn review_single_patch(
 
         let mut patch_files = Vec::new();
         if let Some(sha) = patch_shas.get(&p.index) {
-            let output = tokio::process::Command::new("git")
-                .current_dir(&worktree.path)
+            let output = crate::git_cmd::in_dir_async(&worktree.path)
                 .args(["diff-tree", "--no-commit-id", "--name-only", "-r", sha])
                 .output()
                 .await;
@@ -1259,7 +1258,6 @@ mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
-    use std::process::Command;
     use std::sync::Arc;
 
     /// A provider that does nothing; the decoration tests only care about
@@ -1458,10 +1456,7 @@ mod tests {
     }
 
     fn git(repo_path: &Path, args: &[&str]) -> Result<()> {
-        let output = Command::new("git")
-            .current_dir(repo_path)
-            .args(args)
-            .output()?;
+        let output = crate::git_cmd::in_dir(repo_path).args(args).output()?;
         if !output.status.success() {
             return Err(anyhow!(
                 "git {:?} failed: {}",

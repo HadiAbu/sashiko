@@ -311,8 +311,8 @@ impl MaintainersIndex {
             "master:MAINTAINERS",
             "HEAD:MAINTAINERS",
         ] {
-            let output = std::process::Command::new("git")
-                .args(["-C", repo.to_str().unwrap_or("."), "show", git_ref])
+            let output = crate::git_cmd::in_dir(repo)
+                .args(["show", git_ref])
                 .output();
             if let Ok(out) = output
                 && out.status.success()

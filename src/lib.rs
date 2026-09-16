@@ -25,6 +25,7 @@ pub mod email_router;
 pub mod events;
 pub mod fetcher;
 pub mod forge;
+pub mod git_cmd;
 pub mod git_ops;
 pub mod ingestor;
 pub mod local_review;
