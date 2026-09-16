@@ -4980,6 +4980,7 @@ impl Database {
             };
             while let Ok(Some(row)) = rows.next().await {
                 let id: i64 = row.get(0)?;
+                let existing_author: String = row.get(2).unwrap_or_default();
                 let existing_subject: String = row.get(3)?;
                 let subject_index: u32 = row.get(4).unwrap_or(9999);
                 let existing_total: u32 = row.get(5).unwrap_or(1);
@@ -4999,18 +5000,24 @@ impl Database {
 
                 let is_placeholder =
                     existing_subject == "(placeholder)" || existing_status == "Fetching";
+                let is_synthetic_series = clid.ends_with("@sashiko.local");
 
                 let existing_version = crate::patch::parse_subject_version(&existing_subject);
                 let same_thread = existing_thread_id == Some(thread_id);
-                let versions_compatible = Self::versions_are_compatible(
-                    existing_version,
-                    subject_index,
-                    &existing_status,
-                    version,
-                    part_index,
-                    same_thread,
-                    false,
-                );
+                // A forge series is one pull request: its parts are commits
+                // whose subjects carry no version tag of their own, so the
+                // mail rules below have nothing to compare and would split
+                // the series into a row per commit.
+                let versions_compatible = is_synthetic_series
+                    || Self::versions_are_compatible(
+                        existing_version,
+                        subject_index,
+                        &existing_status,
+                        version,
+                        part_index,
+                        same_thread,
+                        false,
+                    );
 
                 let index_collision = if part_index == 0 {
                     false
@@ -5037,10 +5044,20 @@ impl Database {
                     total_parts
                 };
 
+                let final_author = if is_placeholder
+                    || part_index <= subject_index
+                    || existing_author.is_empty()
+                    || existing_author == "unknown"
+                {
+                    author
+                } else {
+                    existing_author.as_str()
+                };
+
                 // We proceed to update this record with the full metadata
                 self.conn.execute(
                     "UPDATE patchsets SET thread_id = ?, author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
-                    libsql::params![thread_id, author, final_total, parser_version, to, cc, id],
+                    libsql::params![thread_id, final_author, final_total, parser_version, to, cc, id],
                 ).await?;
 
                 if let Some(real_clid) = cover_letter_message_id {
@@ -5773,6 +5790,28 @@ impl Database {
                      WHERE id = ? AND NOT {CLOSED_TO_NEW_PARTS_SQL}"
                 ),
                 libsql::params![embargo_until, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_patchset_mr_metadata(
+        &self,
+        id: i64,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+        slug: Option<&str>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET
+                    mr_url = COALESCE(mr_url, ?),
+                    mr_title = COALESCE(mr_title, ?),
+                    mr_number = COALESCE(mr_number, ?),
+                    slug = COALESCE(slug, ?)
+                 WHERE id = ?",
+                libsql::params![mr_url, mr_title, mr_number, slug, id],
             )
             .await?;
         Ok(())
@@ -16622,5 +16661,139 @@ mod tests {
             err.to_string().contains("database project mismatch"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_pull_request_commits_grouped_into_single_patchset_series() {
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let placeholder_id = "mr-501-aaa..bbb@sashiko.local";
+        let pr_url = "https://github.com/sashiko-dev/sashiko/pull/501";
+        let pr_title = "Make sure logging output isn't erased";
+        let slug = "sashiko-501";
+
+        let placeholder_ps_id = db
+            .create_fetching_patchset(
+                placeholder_id,
+                "Fetching GitHub PR/MR: Make sure logging output isn't erased",
+                None,
+                None,
+                Some(pr_url),
+                Some(pr_title),
+                Some(501),
+                Some(slug),
+            )
+            .await
+            .unwrap();
+
+        let thread_id = db
+            .ensure_thread_for_message(placeholder_id, 1700000000)
+            .await
+            .unwrap();
+
+        // Ingest commit 1/2
+        let sha1 = "sha1111111111111111111111111111111111111";
+        db.create_message(
+            sha1,
+            thread_id,
+            Some(placeholder_id),
+            "Author One <one@example.com>",
+            "cli: commit one",
+            1700000001,
+            "body1",
+            "submitted",
+            "",
+            None,
+            Some("git-fetch"),
+        )
+        .await
+        .unwrap();
+
+        let ps_id_1 = db
+            .create_patchset(
+                thread_id,
+                Some(placeholder_id),
+                sha1,
+                "!501: Make sure logging output isn't erased",
+                "Author One <one@example.com>",
+                1700000001,
+                2,
+                1,
+                "submitted",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_id_1, placeholder_ps_id);
+        db.create_patch(ps_id_1, sha1, 1, "diff1").await.unwrap();
+
+        // Ingest commit 2/2 (even with a v2 tag in version or different author)
+        let sha2 = "sha2222222222222222222222222222222222222";
+        db.create_message(
+            sha2,
+            thread_id,
+            Some(placeholder_id),
+            "Author Two <two@example.com>",
+            "cli: commit two v2",
+            1700000002,
+            "body2",
+            "submitted",
+            "",
+            None,
+            Some("git-fetch"),
+        )
+        .await
+        .unwrap();
+
+        let ps_id_2 = db
+            .create_patchset(
+                thread_id,
+                Some(placeholder_id),
+                sha2,
+                "!501: Make sure logging output isn't erased",
+                "Author Two <two@example.com>",
+                1700000002,
+                2,
+                1,
+                "submitted",
+                "",
+                Some(2),
+                2,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_id_2, placeholder_ps_id);
+        db.create_patch(ps_id_2, sha2, 2, "diff2").await.unwrap();
+
+        let details = db
+            .get_patchset_details_by_slug(slug, None, None)
+            .await
+            .unwrap()
+            .expect("should find PR patchset by slug");
+        assert_eq!(details["id"].as_i64(), Some(placeholder_ps_id));
+        assert_eq!(details["total_parts"].as_i64(), Some(2));
+        assert_eq!(details["received_parts"].as_i64(), Some(2));
+        assert_eq!(
+            details["author"].as_str(),
+            Some("Author One <one@example.com>")
+        );
+        assert_eq!(details["patches"].as_array().unwrap().len(), 2);
     }
 }

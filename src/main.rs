@@ -2226,21 +2226,12 @@ async fn process_parsed_article(
         } else if group == "git-fetch"
             && let (Some(title), Some(number)) = (&mr_title, &mr_number)
         {
-            if metadata.total == 1 || metadata.index == 1 {
-                (
-                    format!("!{}: {}", number, title),
-                    metadata.author.clone(),
-                    metadata.total,
-                    is_strict_author(source, metadata.total),
-                )
-            } else {
-                (
-                    metadata.subject.clone(),
-                    metadata.author.clone(),
-                    metadata.total,
-                    is_strict_author(source, metadata.total),
-                )
-            }
+            (
+                format!("!{}: {}", number, title),
+                metadata.author.clone(),
+                metadata.total,
+                is_strict_author(source, metadata.total),
+            )
         } else {
             (
                 metadata.subject.clone(),
@@ -2289,6 +2280,30 @@ async fn process_parsed_article(
             .await
         {
             Ok(Some(patchset_id)) => {
+                if mr_url.is_some() || mr_title.is_some() || mr_number.is_some() {
+                    let slug = if let (Some(url), Some(num)) = (&mr_url, mr_number) {
+                        sashiko::forge::extract_repo_name_from_mr_url(url)
+                            .map(|repo| format!("{}-{}", repo, num))
+                    } else {
+                        None
+                    };
+                    if let Err(e) = worker_db
+                        .update_patchset_mr_metadata(
+                            patchset_id,
+                            mr_url.as_deref(),
+                            mr_title.as_deref(),
+                            mr_number,
+                            slug.as_deref(),
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to update MR metadata for patchset {}: {}",
+                            patchset_id, e
+                        );
+                    }
+                }
+
                 #[allow(clippy::collapsible_if)]
                 if let Some(until) = embargo_until {
                     if let Err(e) = worker_db

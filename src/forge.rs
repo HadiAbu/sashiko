@@ -411,18 +411,19 @@ pub fn extract_repo_name_from_url(url: &str) -> String {
         .to_string()
 }
 
-/// Extract repository name from a GitLab MR URL
+/// Extract repository name from a GitLab MR or GitHub PR URL
 pub fn extract_repo_name_from_mr_url(url: &str) -> Option<String> {
-    if let Some(before_sep) = url.split("/-/").next() {
-        let name = before_sep
-            .trim_end_matches('/')
-            .split('/')
-            .next_back()?
-            .to_string();
-        Some(name)
-    } else {
-        None
-    }
+    let before_sep = url
+        .split_once("/-/")
+        .or_else(|| url.split_once("/pull/"))
+        .map(|(prefix, _)| prefix)?;
+    let name = before_sep
+        .trim_end_matches('/')
+        .split('/')
+        .next_back()?
+        .trim_end_matches(".git")
+        .to_string();
+    if name.is_empty() { None } else { Some(name) }
 }
 
 /// Registry for forge providers
@@ -903,5 +904,21 @@ mod tests {
         headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
         let body = Bytes::from("{}");
         assert!(forge.validate_event(&headers, &body, None).is_ok());
+    }
+
+    #[test]
+    fn test_extract_repo_name_from_mr_url() {
+        assert_eq!(
+            extract_repo_name_from_mr_url("https://gitlab.com/org/repo/-/merge_requests/10"),
+            Some("repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_name_from_mr_url("https://github.com/sashiko-dev/sashiko/pull/501"),
+            Some("sashiko".to_string())
+        );
+        assert_eq!(
+            extract_repo_name_from_mr_url("https://example.com/not-a-pr"),
+            None
+        );
     }
 }
