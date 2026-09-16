@@ -141,4 +141,60 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_sashiko_prompt_bundle_integrity() {
+        let required_framing = [
+            "sashiko/review-core.md",
+            "sashiko/severity.md",
+            "sashiko/false-positive-guide.md",
+            "sashiko/prompt-injection.md",
+            "sashiko/github-summary-template.md",
+            "sashiko/subsystem/subsystem.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing framing file in bundle: {path}"
+            );
+        }
+
+        let subsystem_index = PROMPT_BUNDLE_FILES
+            .iter()
+            .find(|(p, _)| *p == "sashiko/subsystem/subsystem.md")
+            .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+            .expect("sashiko/subsystem/subsystem.md must be valid UTF-8");
+
+        let mut referenced_guides = Vec::new();
+        for line in subsystem_index.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('|') && trimmed.ends_with('|') {
+                let cols: Vec<&str> = trimmed.split('|').map(str::trim).collect();
+                // Markdown table row: ["", "Component/Pattern", "Triggers", "File", ""]
+                if cols.len() >= 4 {
+                    let file_col = cols[cols.len() - 2];
+                    if file_col.ends_with(".md") && !file_col.contains(' ') {
+                        referenced_guides.push(file_col);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            !referenced_guides.is_empty(),
+            "should parse referenced guides from subsystem.md"
+        );
+
+        for guide in referenced_guides {
+            let in_subsystem = format!("sashiko/subsystem/{guide}");
+            let in_patterns = format!("sashiko/patterns/{guide}");
+            let found = PROMPT_BUNDLE_FILES
+                .iter()
+                .any(|(p, _)| *p == in_subsystem || *p == in_patterns);
+            assert!(
+                found,
+                "guide {guide} referenced in sashiko/subsystem/subsystem.md not found in bundle under subsystem/ or patterns/"
+            );
+        }
+    }
 }

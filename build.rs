@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=third_party/prompts");
+    println!("cargo:rerun-if-changed=prompts");
 
     track_git_changes();
 
@@ -40,18 +41,45 @@ fn main() {
     println!("cargo:rustc-env=GIT_HASH={}", git_hash);
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let prompts_dir = manifest_dir.join("third_party/prompts");
+    let vendored_dir = manifest_dir.join("third_party/prompts");
+    let first_party_dir = manifest_dir.join("prompts");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let generated = out_dir.join("prompts_generated.rs");
 
-    let mut files = Vec::new();
-    collect_files(&prompts_dir, &prompts_dir, &mut files).unwrap();
+    // Both trees flatten into one bundle namespace, so a project directory
+    // appearing in both would have one copy silently win depending on
+    // collection order. Collect them separately to name the offender.
+    let vendored = collect_root(&vendored_dir);
+    let first_party = collect_root(&first_party_dir);
+
+    for (relative, _) in &first_party {
+        if vendored.iter().any(|(other, _)| other == relative) {
+            panic!(
+                "prompt {relative} exists in both third_party/prompts and prompts; \
+                 they share one bundle namespace, so one would silently shadow the other"
+            );
+        }
+    }
+
+    let mut files = vendored;
+    files.extend(first_party.iter().cloned());
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let revision = fs::read_to_string(prompts_dir.join("REVISION"))
+    // The vendored tree stamps its own revision, and the bundle is installed
+    // into a directory named after it. That alone would pin the first-party
+    // tree to the vendored tree's release cadence: editing a first-party
+    // prompt would leave the installed copy untouched, because the revision
+    // directory already exists and is marked complete. Folding the
+    // first-party content into the revision makes an edit produce a new
+    // directory, which is what makes the edit take effect.
+    let vendored_revision = fs::read_to_string(vendored_dir.join("REVISION"))
         .unwrap_or_else(|_| "unknown".to_string())
         .trim()
         .to_string();
+    let revision = format!(
+        "{vendored_revision}-{:016x}",
+        content_fingerprint(&first_party)
+    );
 
     let mut generated_bytes = Vec::new();
     writeln!(
@@ -83,6 +111,37 @@ fn main() {
     if should_write {
         fs::write(&generated, &generated_bytes).unwrap();
     }
+}
+
+/// Every file under a prompt root, as (bundle path, source path).
+fn collect_root(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut files = Vec::new();
+    collect_files(root, root, &mut files).unwrap_or_else(|e| {
+        panic!(
+            "failed to read prompt root {}: {e}. If this is the vendored tree, \
+             the submodule may not be checked out",
+            root.display()
+        )
+    });
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
+/// A value that changes whenever any collected file's path or content changes.
+///
+/// Only inequality matters: a collision would leave an edited prompt
+/// uninstalled, and a spurious change merely reinstalls the bundle.
+fn content_fingerprint(files: &[(String, PathBuf)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (relative, absolute) in files {
+        relative.hash(&mut hasher);
+        fs::read(absolute)
+            .unwrap_or_else(|e| panic!("failed to read prompt {}: {e}", absolute.display()))
+            .hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn track_git_changes() {
