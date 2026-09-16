@@ -2227,7 +2227,7 @@ async fn process_parsed_article(
             && let (Some(title), Some(number)) = (&mr_title, &mr_number)
         {
             (
-                format!("!{}: {}", number, title),
+                format_mr_subject(mr_url.as_deref(), *number, title),
                 metadata.author.clone(),
                 metadata.total,
                 is_strict_author(source, metadata.total),
@@ -2537,6 +2537,15 @@ fn is_strict_author(source: MessageSource, total_parts: u32) -> bool {
         MessageSource::ApiFetchThread if total_parts > 1 => false,
         _ => true,
     }
+}
+
+fn format_mr_subject(mr_url: Option<&str>, number: i64, title: &str) -> String {
+    let prefix = if mr_url.is_some_and(|u| u.contains("/-/merge_requests/")) {
+        "!"
+    } else {
+        "#"
+    };
+    format!("{}{}: {}", prefix, number, title)
 }
 
 fn identify_subsystems(
@@ -3073,5 +3082,29 @@ mod tests {
 
         assert!(is_strict_author(MessageSource::ApiInject, 1)); // Strict for singleton
         assert!(!is_strict_author(MessageSource::ApiInject, 6)); // Lenient for series
+    }
+
+    #[test]
+    fn test_format_mr_subject() {
+        assert_eq!(
+            format_mr_subject(
+                Some("https://github.com/sashiko-dev/sashiko/pull/502"),
+                502,
+                "Fix PR display prefix"
+            ),
+            "#502: Fix PR display prefix"
+        );
+        assert_eq!(
+            format_mr_subject(None, 502, "Fix PR display prefix"),
+            "#502: Fix PR display prefix"
+        );
+        assert_eq!(
+            format_mr_subject(
+                Some("https://gitlab.com/example/repo/-/merge_requests/502"),
+                502,
+                "Fix MR display prefix"
+            ),
+            "!502: Fix MR display prefix"
+        );
     }
 }
