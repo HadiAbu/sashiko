@@ -3906,9 +3906,12 @@
             let summaryHtml = '';
             if (summaryText) {
                 summaryHtml = `
-                    <div style="margin-top:10px;">
-                        <div class="review-meta-label" style="margin-bottom:4px;">Summary:</div>
-                        <div style="color: var(--text-color); line-height: 1.45; white-space: pre-wrap;">${escapeHtml(summaryText)}</div>
+                    <div style="margin-top:8px;">
+                        <button class="toggle-btn" onclick="toggleCollapsible('summary-${uniqueId}', this)">▼ Summary</button>
+                        <div id="summary-${uniqueId}" class="collapsible open" style="position: relative;">
+                            <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
+                            <div class="log-inline-block">${escapeHtml(summaryText, true, false)}</div>
+                        </div>
                     </div>
                 `;
             }
