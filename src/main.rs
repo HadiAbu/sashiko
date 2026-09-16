@@ -301,6 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stages,
             } => {
                 return handle_review_command(
+                    project,
                     input.clone(),
                     baseline.clone(),
                     settings.clone(),
@@ -333,6 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }));
 
                 let result = run_worker_from_stdin(WorkerOptions {
+                    project,
                     settings_path: None,
                     baseline: baseline.clone(),
                     repo: repo.clone(),
@@ -1233,6 +1235,7 @@ fn get_terminal_width() -> usize {
 }
 
 struct ProgressState {
+    project: ProjectId,
     patches: std::collections::BTreeMap<i64, PatchState>,
     printed_lines: usize,
     total_turns: usize,
@@ -1242,8 +1245,8 @@ struct ProgressState {
 
 /// Display label for a stage. Held in the stage tables so that adding a stage
 /// needs no edit here.
-fn stage_short_name(stage: &str) -> &'static str {
-    sashiko::workflows::linux_patch_review::stage_short_label(stage).unwrap_or("Unknown")
+fn stage_short_name(project: ProjectId, stage: &str) -> &'static str {
+    sashiko::workflows::stage_short_label(project, stage).unwrap_or("Unknown")
 }
 
 struct TruncatingWriter {
@@ -1333,7 +1336,7 @@ fn render_progress(state: &mut ProgressState) {
                     stages_with_turns.sort_by_key(|a| std::cmp::Reverse(a.1));
 
                     let (top_stage, top_turn) = stages_with_turns[0];
-                    let stage_name = stage_short_name(top_stage);
+                    let stage_name = stage_short_name(state.project, top_stage);
                     let stage_str = if top_turn > 0 {
                         format!("{} (turn {})", stage_name, top_turn)
                     } else {
@@ -1403,8 +1406,7 @@ fn render_progress(state: &mut ProgressState) {
                     // Nothing resolved yet: assume every stage will run, which
                     // is what the fan-out settles on when the planner is not
                     // narrowing it.
-                    sashiko::workflows::linux_patch_review::ANALYSIS_STAGES.len()
-                        + sashiko::workflows::linux_patch_review::CONSOLIDATION_STAGES.len()
+                    sashiko::workflows::default_stage_count(state.project)
                 } else {
                     p.planned_stages.len()
                 }
@@ -1458,6 +1460,7 @@ fn calculate_progress_metrics(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_review_command(
+    project: ProjectId,
     input: String,
     baseline: Option<String>,
     settings_path: Option<PathBuf>,
@@ -1482,7 +1485,8 @@ async fn handle_review_command(
     };
 
     let repo_path = current_git_toplevel()?;
-    if sashiko::maintainers::get_global_maintainers().is_none()
+    if project.uses_maintainers()
+        && sashiko::maintainers::get_global_maintainers().is_none()
         && let Ok(idx) = sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&repo_path)
     {
         sashiko::maintainers::init_global_maintainers(Arc::new(idx));
@@ -1512,6 +1516,7 @@ async fn handle_review_command(
     }
 
     let progress_state = std::sync::Arc::new(std::sync::Mutex::new(ProgressState {
+        project,
         patches: std::collections::BTreeMap::new(),
         printed_lines: 0,
         total_turns: 0,
@@ -1644,6 +1649,7 @@ async fn handle_review_command(
         repo_path,
         input.clone(),
         ReviewOptions {
+            project,
             baseline,
             settings_path,
             prompts,

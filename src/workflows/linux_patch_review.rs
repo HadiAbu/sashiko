@@ -468,21 +468,7 @@ pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
                 .selected_prompts
                 .into_iter()
                 .filter(|name| !is_stage_exclusive_guide(name))
-                .filter(|name| {
-                    // These names become file paths under the prompt tree and
-                    // their contents are inlined into every stage's system
-                    // prompt. The model chooses them, and a patch from a public
-                    // list can steer that choice, so anything that is not a
-                    // plain file name is dropped rather than resolved.
-                    let plain = !name.is_empty()
-                        && !name.contains('/')
-                        && !name.contains('\\')
-                        && !name.contains("..");
-                    if !plain {
-                        tracing::warn!("Ignoring prescreen guide with a path in its name: {name}");
-                    }
-                    plain
-                })
+                .filter(|name| crate::workflows::guard::sanitize_guide_name(name))
                 .collect();
             state.selected_guides = prompts;
         })
@@ -724,14 +710,7 @@ fn with_series_context(
     })
 }
 
-fn normalize_stage_name(name: &str) -> String {
-    let lower = name.trim().to_ascii_lowercase().replace('_', "-");
-    if let Some(stripped) = lower.strip_prefix("stage-") {
-        stripped.to_string()
-    } else {
-        lower
-    }
-}
+use crate::workflows::guard::normalize_stage_name;
 
 pub fn consolidation_stage_by_name(name: &str) -> Option<&'static ConsolidationStage> {
     let normalized = normalize_stage_name(name);

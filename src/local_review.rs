@@ -35,6 +35,7 @@ use tracing::{error, info};
 
 #[derive(Clone, Debug)]
 pub struct WorkerOptions {
+    pub project: crate::project::ProjectId,
     pub settings_path: Option<PathBuf>,
     pub baseline: Option<String>,
     pub repo: Option<PathBuf>,
@@ -54,6 +55,7 @@ pub struct WorkerOptions {
 impl Default for WorkerOptions {
     fn default() -> Self {
         Self {
+            project: crate::project::ProjectId::Linux,
             settings_path: None,
             baseline: None,
             repo: None,
@@ -74,6 +76,7 @@ impl Default for WorkerOptions {
 
 #[derive(Clone, Debug)]
 pub struct ReviewOptions {
+    pub project: crate::project::ProjectId,
     pub baseline: Option<String>,
     pub settings_path: Option<PathBuf>,
     pub prompts: PathBuf,
@@ -86,6 +89,7 @@ pub struct ReviewOptions {
 impl Default for ReviewOptions {
     fn default() -> Self {
         Self {
+            project: crate::project::ProjectId::Linux,
             baseline: None,
             settings_path: None,
             prompts: PathBuf::from("third_party/prompts/kernel"),
@@ -253,6 +257,7 @@ pub async fn run_git_review(
     run_worker(
         review_input,
         WorkerOptions {
+            project: options.project,
             settings_path: options
                 .settings_path
                 .or_else(|| Some(Settings::local_review_path())),
@@ -556,6 +561,7 @@ async fn review_single_patch(
             std::sync::Arc::new(tools),
             prompts,
             WorkerConfig {
+                project: options.project,
                 max_input_tokens: ai.max_input_tokens,
                 max_interactions: ai.max_interactions,
                 temperature: ai.temperature,

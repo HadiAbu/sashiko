@@ -47,9 +47,13 @@ impl ClassifyAiError for ReviewError {
     }
 }
 
+use crate::project::ProjectId;
 use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use crate::workflows::linux_patch_review::{
     LinuxPatchReviewState, build_linux_patch_review_workflow_with_options, linux_system_prompt,
+};
+use crate::workflows::sashiko_patch_review::{
+    build_sashiko_patch_review_workflow_with_options, sashiko_system_prompt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -80,7 +84,9 @@ pub struct ReviewInput {
     pub patches: Vec<PatchInput>,
 }
 
+#[derive(Clone, Debug)]
 pub struct WorkerConfig {
+    pub project: ProjectId,
     pub max_input_tokens: usize,
     pub max_interactions: usize,
     pub temperature: f32,
@@ -156,6 +162,7 @@ impl PromptRegistry {
 }
 
 pub struct Worker {
+    project: ProjectId,
     provider: Arc<dyn AiProvider>,
     tools: Arc<ToolBox>,
     prompts: PromptRegistry,
@@ -177,6 +184,7 @@ impl Worker {
         config: WorkerConfig,
     ) -> Self {
         Self {
+            project: config.project,
             provider,
             tools,
             prompts,
@@ -338,7 +346,10 @@ impl Worker {
         };
 
         if self.global_history.is_empty() {
-            let sys_template = linux_system_prompt(true);
+            let sys_template = match self.project {
+                ProjectId::Linux => linux_system_prompt(true),
+                ProjectId::Sashiko => sashiko_system_prompt(true),
+            };
             let rendered_sys = sys_template.render_for_log(&state);
             self.global_history.push(AiMessage {
                 role: crate::ai::AiRole::System,
@@ -350,8 +361,16 @@ impl Worker {
             });
         }
 
-        let workflow =
-            build_linux_patch_review_workflow_with_options(self.max_interactions, self.temperature);
+        let workflow = match self.project {
+            ProjectId::Linux => build_linux_patch_review_workflow_with_options(
+                self.max_interactions,
+                self.temperature,
+            ),
+            ProjectId::Sashiko => build_sashiko_patch_review_workflow_with_options(
+                self.max_interactions,
+                self.temperature,
+            ),
+        };
         let env = WorkflowEnv {
             provider: self.provider.clone(),
             tools: self.tools.clone(),
@@ -359,6 +378,7 @@ impl Worker {
             context_tag: self.context_tag.clone(),
         };
 
+        let project = self.project;
         let event_cb = move |event: WorkflowEvent| {
             if let Some(progress_cb) = progress {
                 match event {
@@ -367,7 +387,7 @@ impl Worker {
                             progress_cb(WorkerProgressEvent::PreScreenStarted);
                         } else if stage_name == "planning" {
                             progress_cb(WorkerProgressEvent::PlanningStarted);
-                        } else if is_counted_stage(stage_name) {
+                        } else if crate::workflows::is_counted_stage(project, stage_name) {
                             progress_cb(WorkerProgressEvent::StageStarted {
                                 stage: stage_name.to_string(),
                             });
@@ -375,11 +395,14 @@ impl Worker {
                     }
                     WorkflowEvent::ParallelResolved { stage_names } => {
                         progress_cb(WorkerProgressEvent::ReviewStarted {
-                            planned_stages: planned_stages_from(&stage_names),
+                            planned_stages: crate::workflows::planned_stages_from(
+                                project,
+                                &stage_names,
+                            ),
                         });
                     }
                     WorkflowEvent::StageFinished { stage_name, .. } => {
-                        if is_counted_stage(stage_name) {
+                        if crate::workflows::is_counted_stage(project, stage_name) {
                             progress_cb(WorkerProgressEvent::StageFinished {
                                 stage: stage_name.to_string(),
                             });
@@ -389,7 +412,7 @@ impl Worker {
                         stage_name,
                         turn,
                         max_turns,
-                    } if is_counted_stage(stage_name) => {
+                    } if crate::workflows::is_counted_stage(project, stage_name) => {
                         progress_cb(WorkerProgressEvent::StageTurn {
                             stage: stage_name.to_string(),
                             turn,
@@ -440,35 +463,6 @@ impl Worker {
             tokens_cached: outcome.tokens_cached,
         })
     }
-}
-
-/// Whether a stage counts towards the progress display.
-///
-/// Exactly the set `planned_stages_from()` totals, both reading the stage
-/// tables: the analysis stages and the consolidation stages that follow them.
-/// A stage counted in the total has to report finishing, or the bar stops
-/// short of the work it did.
-fn is_counted_stage(name: &str) -> bool {
-    crate::workflows::linux_patch_review::stage_short_label(name).is_some()
-}
-
-/// The stages a review will run: the analysis stages the fan-out resolved, then
-/// the four that always follow them. Nothing resolved means nothing planned,
-/// not a bare tail.
-fn planned_stages_from(stage_names: &[&'static str]) -> Vec<String> {
-    let mut planned: Vec<String> = stage_names
-        .iter()
-        .filter(|n| crate::workflows::linux_patch_review::analysis_stage_by_name(n).is_some())
-        .map(|n| n.to_string())
-        .collect();
-    if !planned.is_empty() {
-        planned.extend(
-            crate::workflows::linux_patch_review::CONSOLIDATION_STAGES
-                .iter()
-                .map(|s| s.name.to_string()),
-        );
-    }
-    planned
 }
 
 pub fn calculate_series_range(
@@ -637,7 +631,10 @@ mod tests {
     #[test]
     fn test_planned_stages_follow_the_resolved_fan_out() {
         assert_eq!(
-            planned_stages_from(&["goal", "implementation", "locking"]),
+            crate::workflows::planned_stages_from(
+                ProjectId::Linux,
+                &["goal", "implementation", "locking"]
+            ),
             [
                 "goal",
                 "implementation",
@@ -648,25 +645,58 @@ mod tests {
                 "report"
             ]
         );
-        assert_eq!(planned_stages_from(&[]), Vec::<String>::new());
+        assert_eq!(
+            crate::workflows::planned_stages_from(
+                ProjectId::Sashiko,
+                &["goal", "implementation", "concurrency", "llm-pipeline"]
+            ),
+            [
+                "goal",
+                "implementation",
+                "concurrency",
+                "llm-pipeline",
+                "deduplication",
+                "conflict-resolution",
+                "verification",
+                "report"
+            ]
+        );
+        assert_eq!(
+            crate::workflows::planned_stages_from(ProjectId::Linux, &[]),
+            Vec::<String>::new()
+        );
         // Only analysis stages come through the fan-out.
-        assert_eq!(planned_stages_from(&["planning"]), Vec::<String>::new());
+        assert_eq!(
+            crate::workflows::planned_stages_from(ProjectId::Linux, &["planning"]),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn test_every_planned_stage_reports_its_progress() {
-        // The display divides finished stages by planned ones, so a stage
-        // counted in the total that never reports finishing strands the bar
-        // short of 100%. Consolidation stages are the ones easily missed:
-        // they are planned, but they are not analysis stages.
-        for stage in planned_stages_from(&["goal", "locking"]) {
-            assert!(is_counted_stage(&stage), "{stage} is counted but silent");
+        for stage in crate::workflows::planned_stages_from(ProjectId::Linux, &["goal", "locking"]) {
+            assert!(
+                crate::workflows::is_counted_stage(ProjectId::Linux, &stage),
+                "{stage} is counted but silent"
+            );
+        }
+        for stage in
+            crate::workflows::planned_stages_from(ProjectId::Sashiko, &["goal", "llm-pipeline"])
+        {
+            assert!(
+                crate::workflows::is_counted_stage(ProjectId::Sashiko, &stage),
+                "{stage} is counted but silent"
+            );
         }
 
-        // The two that report through events of their own, and are not part
-        // of that total.
-        assert!(!is_counted_stage("pre-screen"));
-        assert!(!is_counted_stage("planning"));
+        assert!(!crate::workflows::is_counted_stage(
+            ProjectId::Linux,
+            "pre-screen"
+        ));
+        assert!(!crate::workflows::is_counted_stage(
+            ProjectId::Sashiko,
+            "planning"
+        ));
     }
 
     #[test]
@@ -965,6 +995,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            project: ProjectId::Linux,
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,
@@ -1111,6 +1142,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            project: ProjectId::Linux,
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,
@@ -1145,6 +1177,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            project: ProjectId::Linux,
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,
@@ -1183,6 +1216,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            project: ProjectId::Linux,
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,
@@ -1280,6 +1314,7 @@ mod tests {
         let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
         let prompts = PromptRegistry::new(prompts_dir);
         let config = WorkerConfig {
+            project: ProjectId::Linux,
             max_input_tokens: 10000,
             max_interactions: 3,
             temperature: 0.0,

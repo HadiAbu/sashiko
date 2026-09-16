@@ -82,6 +82,7 @@ async fn review_requests_use_target_prefetch_or_explicit_failure() {
             Arc::new(tools),
             PromptRegistry::new(prompts.clone()),
             WorkerConfig {
+                project: crate::project::ProjectId::Linux,
                 max_input_tokens: 100_000,
                 max_interactions: 3,
                 temperature: 0.0,
