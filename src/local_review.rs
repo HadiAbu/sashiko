@@ -700,6 +700,7 @@ async fn review_single_patch(
 /// worker reviews can hand them to the standalone Linux bug pipeline for
 /// verification, deduplication, and database tracking.
 fn build_review_output(
+    summary: String,
     findings: Vec<Value>,
     concerns: Vec<Value>,
     dismissed_concerns: Vec<Value>,
@@ -707,6 +708,7 @@ fn build_review_output(
     dismissed_concerns_count: u64,
 ) -> Value {
     json!({
+        "summary": summary,
         "findings": findings,
         "concerns": concerns,
         "dismissed_concerns": dismissed_concerns,
@@ -946,6 +948,7 @@ async fn run_worker_in_worktree(
     }
 
     // Aggregate findings, inline reviews, history, input context, and concern counts
+    let mut combined_summary = String::new();
     let mut combined_findings = Vec::new();
     let mut combined_concerns = Vec::new();
     let mut combined_dismissed_concerns = Vec::new();
@@ -968,6 +971,18 @@ async fn run_worker_in_worktree(
             .unwrap_or_default();
 
         if let Some(review) = res.get("review") {
+            if let Some(summary) = review.get("summary").and_then(|v| v.as_str())
+                && !summary.trim().is_empty()
+            {
+                if !combined_summary.is_empty() {
+                    combined_summary.push_str("\n\n");
+                }
+                if patches_to_review.len() > 1 {
+                    combined_summary.push_str(&format!("Patch [{}]: {}", p_idx, summary.trim()));
+                } else {
+                    combined_summary.push_str(summary.trim());
+                }
+            }
             if let Some(findings) = review.get("findings").and_then(|v| v.as_array()) {
                 for f in findings {
                     let mut finding_val = f.clone();
@@ -1032,6 +1047,7 @@ async fn run_worker_in_worktree(
     }
 
     let review_output = build_review_output(
+        combined_summary,
         combined_findings,
         combined_concerns,
         combined_dismissed_concerns,
@@ -1842,6 +1858,7 @@ mod tests {
     #[test]
     fn test_local_review_output_preserves_preexisting_concerns() {
         let output = build_review_output(
+            "Adds dev-queue routing heuristic.".to_string(),
             vec![json!({"problem": "new regression"})],
             vec![json!({"problem": "preexisting bug"})],
             vec![],
@@ -1849,8 +1866,9 @@ mod tests {
             0,
         );
 
-        // Pre-existing candidates must be preserved so daemon-spawned worker reviews
-        // can hand them to the standalone Linux bug pipeline.
+        // Pre-existing candidates and summary must be preserved so daemon-spawned worker reviews
+        // store the summary and hand concerns to the standalone Linux bug pipeline.
+        assert_eq!(output["summary"], "Adds dev-queue routing heuristic.");
         assert_eq!(output["concerns"].as_array().unwrap().len(), 1);
         assert_eq!(output["concerns_count"], 3);
         assert_eq!(output["findings"].as_array().unwrap().len(), 1);
