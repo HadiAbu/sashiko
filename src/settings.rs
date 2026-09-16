@@ -16,6 +16,8 @@ use config::{Config, ConfigError, Environment, File};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+use crate::project::ProjectId;
+
 /// The name of the file holding the server's local operator token.
 ///
 /// The leading dot keeps it out of a casual listing of the state directory,
@@ -42,6 +44,15 @@ pub struct SubsystemsSettings {
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct ProjectSettings {
+    /// The project this configuration file is for.
+    ///
+    /// Optional, and absent means "any": a configuration written before
+    /// projects existed cannot be expected to name one. When it is present it
+    /// is checked against the selected project, because a configuration that
+    /// names a project and is used for a different one is pointing at the
+    /// wrong database.
+    #[serde(default)]
+    pub kind: Option<ProjectId>,
     #[serde(default)]
     pub name: String,
     #[serde(default)]

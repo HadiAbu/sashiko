@@ -33,6 +33,7 @@ pub mod maintainers;
 pub mod nntp;
 pub mod patch;
 pub mod patchwork;
+pub mod project;
 pub mod prompt_bundle;
 pub mod reviewer;
 pub mod settings;

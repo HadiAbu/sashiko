@@ -65,13 +65,18 @@ independent workflow with its own state type, its own stage tables and its own
 graph shape. `linux_patch_review.rs` is not refactored and not touched.
 
 ```
+src/project.rs                ProjectId (new)
 src/workflows/
-  mod.rs                      ProjectId + dispatch (new)
+  mod.rs                      review dispatch on ProjectId (new)
   linux_patch_review.rs       unchanged
   linux_bug.rs                unchanged
   sashiko_patch_review.rs     new, independent
   guard.rs                    two shared leaf helpers (see below)
 ```
+
+`ProjectId` sits at the top level rather than under `workflows` because it is
+not only a workflow selector: `settings`, `prompt_bundle` and startup all need
+it, and `settings` must not depend on `workflows`.
 
 The cost of forking is duplication; the mitigation is to bound it to prose and
 graph structure, and to *not* duplicate the two pure functions whose
