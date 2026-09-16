@@ -123,9 +123,15 @@ Target Commit:
 // Stage Instructions
 // ---------------------------------------------------------------------------
 
-const STAGE_GOAL_INSTRUCTION: &str = r#"# Analyze commit main goal, architecture, and commit message quality
+const STAGE_GOAL_INSTRUCTION: &str = r#"# Analyze commit main goal, architecture, high-level engineering, and commit message quality
 
-You are a principal engineer evaluating the high-level intent, architectural soundness, and commit message quality of a proposed Sashiko commit. Enforce Sashiko's strict priority hierarchy: User Experience (UX) > Data Integrity > Security > Everything else.
+You are a principal engineer evaluating the high-level intent, architectural soundness, engineering necessity, and commit message quality of a proposed Sashiko commit. Enforce Sashiko's strict priority hierarchy: User Experience (UX) > Data Integrity > Security > Everything else.
+- High-Level Engineering & Problem/Solution Audit (Mandatory):
+  1. Problem Clarity: Is it clear what concrete problem the commit solves? Flag commits where the motivation is vague, circular, or unintelligible.
+  2. No Unrelated Changes (Single Responsibility): Does the commit contain unrelated changes, drive-by edits, or mixed concerns? It must NOT — each commit must implement one consistent, self-sufficient change. Flag commits that bundle unrelated changes that should be split into separate commits.
+  3. Problem Validity & Worth: Is the problem real and worth solving? Flag over-engineered solutions to hypothetical or non-existent problems, or changes whose complexity outweighs their benefit.
+  4. Solution Optimality & Alternatives: Is the chosen solution the best engineering approach, or are there obviously simpler, safer, or more idiomatic alternatives? If a clearly superior alternative exists, raise a concern explaining why.
+  5. Validation Data & Test Procedure: Is there concrete data provided (benchmarks, measurements, before/after metrics) or a clear test procedure described that confirms the problem is solved? Note: this requirement applies to the patchset as a whole rather than every preparatory commit; when series context is present, verify that validation data or test procedures are attached to the main or most relevant patch in the patchset, and flag the main patch if missing when warranted.
 - Global UX & Regressions: If the change can affect the user experience globally (CLI ergonomics, review output clarity/false-positive rate, progress display, or web UI/API behavior), apply maximum scrutiny and reject regressions.
 - Benchmark Backing for Review-Wide Changes: If the change meaningfully affects all reviews across the board (e.g. global prompts, stage instructions, workflow graph structure, planner logic, or verification/deduplication rules), verify whether it is backed up by benchmark evaluation data (`benchmarks/`). Flag review-affecting changes that lack benchmark validation or risk degrading detection rate or precision.
 - Architectural Boundaries: Check whether the change violates instance isolation, leaks project-specific assumptions into generic engines, or introduces subtle regressions in daemon/worker coordination.
@@ -283,7 +289,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         guides: &[],
         uses_commit_log: true,
         optional: false,
-        wants_series_context: false,
+        wants_series_context: true,
     },
     AnalysisStage {
         name: "implementation",

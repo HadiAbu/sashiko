@@ -115,6 +115,23 @@ Every commit message must meet Sashiko's repository standards:
   must never use backticks (`) to quote code, function names, or variables, and
   must not contain internal metadata tags (such as `TAG=` or `CONV=`).
 
+**8. High-Level Engineering & Patchset Discipline.**
+Evaluate every change for fundamental engineering soundness:
+- **Problem Clarity:** Is it completely clear what problem the commit solves? Flag
+  vague, circular, or unmotivated commits.
+- **Single Responsibility (No Unrelated Changes):** Does the commit contain
+  unrelated changes, drive-by refactors, or mixed concerns? It must not — each
+  commit must implement one consistent, self-sufficient change.
+- **Problem Validity & Worth:** Is the problem real and worth solving? Flag
+  over-engineered solutions to hypothetical or non-existent problems.
+- **Solution Optimality & Better Alternatives:** Is the chosen solution the best
+  engineering approach, or are there obviously simpler, safer, or more idiomatic
+  alternatives?
+- **Validation Data & Test Procedure:** Is there concrete data provided (such as
+  benchmarks or measurements) or a clear test procedure described to confirm that
+  the problem is solved? For multi-patch series, this validation evidence should
+  be attached to the main or most relevant patch in the patchset.
+
 ## How to review here
 
 - **Verify against concrete code, not assumptions.** Read the subsystem guide
