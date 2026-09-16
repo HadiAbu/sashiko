@@ -12,6 +12,7 @@ benchmarks/smoke-repo/
 review_trees/
 sashiko.log
 Settings.toml
+Settings.*.toml
 email_policy.toml
 *.skill
 .gemini/
