@@ -125,11 +125,10 @@ Target Commit:
 
 const STAGE_GOAL_INSTRUCTION: &str = r#"# Analyze commit main goal and architecture
 
-You are a principal engineer evaluating the high-level intent and architectural soundness of a proposed Sashiko commit. Analyze the commit message and the conceptual change. Focus on the big picture:
-- Does the change violate Sashiko's architectural boundaries (e.g. leaking project-specific assumptions into generic engines, breaking instance isolation, or coupling unrelated subsystems)?
-- Are there simpler, safer, or more idiomatic Rust designs that achieve the same goal?
-- Does the change introduce subtle regressions in CLI UX, daemon lifecycle, or worker subprocess coordination?
-If the core concept or architecture is flawed, raise a concern with concrete reasoning."#;
+You are a principal engineer evaluating the high-level intent and architectural soundness of a proposed Sashiko commit. Enforce Sashiko's strict priority hierarchy: User Experience (UX) > Data Integrity > Security > Everything else.
+- Global UX & Regressions: If the change can affect the user experience globally (CLI ergonomics, review output clarity/false-positive rate, progress display, or web UI/API behavior), apply maximum scrutiny and reject regressions.
+- Benchmark Backing for Review-Wide Changes: If the change meaningfully affects all reviews across the board (e.g. global prompts, stage instructions, workflow graph structure, planner logic, or verification/deduplication rules), verify whether it is backed up by benchmark evaluation data (`benchmarks/`). Flag review-affecting changes that lack benchmark validation or risk degrading detection rate or precision.
+- Architectural Boundaries: Check whether the change violates instance isolation, leaks project-specific assumptions into generic engines, or introduces subtle regressions in daemon/worker coordination."#;
 
 const STAGE_IMPLEMENTATION_INSTRUCTION: &str = r#"# Verify implementation against intent
 
@@ -156,11 +155,9 @@ Audit all async execution, locking, child process management, and shared state a
 
 const STAGE_PERSISTENCE_INSTRUCTION: &str = r#"# Audit database schema, queries, and transactions
 
-Audit all SQLite/libsql operations in `src/db.rs` and schema migrations in `src/migrations/`:
-- Verify that write transactions are kept short and never held across network I/O, LLM turns, or subprocess execution (preventing `SQLITE_BUSY` stalls).
-- Check for TOCTOU races when claiming tasks or updating state: state transitions should use atomic `UPDATE ... WHERE status = ...` or `RETURNING` rather than separate `SELECT` then `UPDATE`.
-- Verify that migrations are idempotent or strictly ordered, backwards-compatible with existing data, and preserve foreign-key/invariant integrity.
-- Ensure queries that return lists for APIs or workers include explicit `LIMIT` clauses or pagination."#;
+Data integrity matters second only to UX. Audit all SQLite/libsql operations in `src/db.rs` and schema migrations in `src/migrations/` against two mandatory questions:
+1. Will it work with an existing/old database? Verify that schema changes are strictly additive, migrations run atomically inside transactions (`PRAGMA user_version`), and existing rows/queries remain valid on upgrade without data loss.
+2. Will it scale? Verify that queries on high-cardinality tables (`patches`, `messages`, `reviews`, `findings`, `ai_interactions`) are backed by indexes, list queries include explicit `LIMIT` clauses, write transactions are kept short (never held across network I/O or LLM calls), and task claims use atomic `UPDATE ... WHERE status = ...` rather than TOCTOU `SELECT` then `UPDATE`."#;
 
 const STAGE_LLM_PIPELINE_INSTRUCTION: &str = r#"# Audit LLM workflow engine, stages, and AI providers
 
@@ -172,18 +169,19 @@ Audit changes to `src/workflow/`, `src/workflows/`, `src/worker/prompts.rs`, and
 
 const STAGE_SECURITY_INSTRUCTION: &str = r#"# Audit security boundaries and untrusted input handling
 
-Sashiko processes untrusted patches, commit messages, email headers, git trees, and webhook payloads. Audit for security vulnerabilities:
+Security of Sashiko matters a lot — flag all potential security issues immediately. Sashiko processes untrusted patches, commit messages, email headers, git trees, and webhook payloads:
 - Prompt injection: verify untrusted patch/commit content or LLM-selected guide names cannot escape XML/markdown framing or traverse directories (`sanitize_guide_name`).
 - Toolbox path traversal and command injection: verify `validate_path` confines all file reads to the worktree root, and verify `git` CLI invocations pass `--` before file paths or refs so user strings cannot be interpreted as git flags (e.g. `--upload-pack` or `--output`).
 - Forge and webhook security: verify HMAC signature checks use constant-time comparison before payload processing, and verify `is_safe_repo_url` prevents SSRF or local file cloning.
 - API authorization: verify axum routes enforce authentication and capability checks (`[server.acl]`, `read_only` mode)."#;
 
-const STAGE_INTERFACES_COMPAT_INSTRUCTION: &str = r#"# Audit CLI, configuration, and API compatibility
+const STAGE_INTERFACES_COMPAT_INSTRUCTION: &str = r#"# Audit CLI, configuration, email safety, and API compatibility
 
-Audit external interfaces, configuration schemas, and cross-process contracts:
+Audit external interfaces, configuration schemas, email delivery, and cross-process contracts:
+- Email Safety (CRITICAL): Be EXTRA careful with any change touching email routing (`src/email_router.rs`), policy (`src/email_policy.rs`), or delivery (`src/worker/email.rs`). Emails sent to public mailing lists are preserved forever and can destroy Sashiko's reputation in a few hours. Flag any risk of widening recipients, bypassing `dry_run` or embargo rules, causing bot reply loops, or sending malformed/duplicate messages.
 - Settings (`src/settings.rs`): since `Settings` structs use `#[serde(deny_unknown_fields)]`, verify any new or renamed field has a sensible `#[serde(default)]` and is documented in `docs/examples/Settings.example.toml`.
 - Subprocess CLI flags: when the daemon spawns worker subprocesses (`sashiko review` or `sashiko worker`), verify all relevant global flags (`--project`, `--settings`, etc.) are forwarded across the process boundary.
-- REST API and email policy: verify API response shapes remain backwards-compatible for existing clients and UI views, and verify email routing respects `dry_run` and embargo rules."#;
+- REST API & UX: verify API response shapes remain backwards-compatible and global user-facing behavior does not regress."#;
 
 const STAGE_TESTS_INSTRUCTION: &str = r#"# Audit test coverage and determinism
 

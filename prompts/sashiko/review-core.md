@@ -54,51 +54,63 @@ Output and state:
 | `src/auth.rs`, `src/bug_access.rs` | Identity and capabilities |
 | `src/project.rs` | Which codebase this instance reviews |
 
-## What makes this codebase distinctive
+## Core Priorities (Checked on Every Change)
 
-Four properties shape almost every real defect here.
+Every review must evaluate the change against this strict priority order:
 
-**1. It processes untrusted input by design.** Patches arrive from public
-mailing lists and pull requests. That content reaches a git worktree, a set of
-tools, and an LLM prompt. Any path where it can influence *which files are
-read*, *which commands are run*, or *what instructions the model follows* is a
-security boundary, not an implementation detail.
+**1. User Experience (UX) Above All.**
+Only the user experience is more important than data integrity. If a change can
+affect the user experience globally — CLI behavior, review output quality or
+false-positive rate, progress reporting, or web UI/API responsiveness — apply
+maximum scrutiny and avoid regressions.
 
-**2. Its side effects are public and irreversible.** Mail to a kernel mailing
-list cannot be recalled. A comment on a pull request is visible immediately.
-Anything that widens recipients, defeats `dry_run`, or bypasses the embargo is
-the most serious class of bug in the tree.
+**2. Data Integrity and Database Evolution.**
+Data integrity matters the most after UX: never lose reviews, patchsets,
+findings, or state transitions. Whenever a change touches database queries or
+schema format (`src/db.rs`, `src/migrations/`), you MUST verify two things:
+- *Will it work with an existing/old database?* Migrations must be additive,
+  transactional, and preserve all existing rows and invariants on upgrade.
+- *Will it scale?* Queries on growing tables (`patches`, `messages`, `reviews`,
+  `findings`, `ai_interactions`) must use indexes, bound results with `LIMIT`,
+  and keep write transactions short to prevent `SQLITE_BUSY` stalls.
 
-**3. Its worst failure mode is silence.** A review that produces no findings
-looks exactly like a clean patch. A prompt file that stops resolving, a stage
-whose reducer drops its output, an early exit on the wrong condition — none of
-these throw an error. They just quietly stop finding bugs. Treat anything that
-could make the pipeline produce less, without failing, as high severity.
+**3. Email Safety and Reputation.**
+Be **EXTRA careful** with emails (`src/email_policy.rs`, `src/email_router.rs`,
+`src/worker/email.rs`). Emails sent to public mailing lists (`lore.kernel.org`)
+are preserved forever and can destroy Sashiko's reputation in a few hours. Any
+bug that widens recipients, weakens `dry_run` or embargo enforcement, triggers
+bot reply loops, or sends duplicate/malformed mail is a Critical/High hazard.
 
-**4. It is non-deterministic where it meets the model, and must be strict
-everywhere else.** The LLM will return malformed JSON, hallucinate stage names
-and invent file paths. The Rust around it is what makes that safe: validators,
-enum-typed state, and the rule that model output is never trusted as a path or
-an identifier. A change that loosens that boundary is a defect even if nothing
-breaks today.
+**4. Security of Sashiko.**
+Security matters a lot — flag all potential security issues immediately. Sashiko
+ingests untrusted patches, commit messages, git repositories, and webhooks by
+design. Any path where untrusted input can influence *which files are read*
+(`validate_path`), *which commands or flags are run* (`git` CLI `--`), *which
+prompts are loaded* (`sanitize_guide_name`), or bypass API/webhook
+authentication is a security boundary.
+
+**5. Benchmark Backing for Global Review Changes.**
+Any change that might meaningfully affect all reviews across the board — such as
+global prompts (`review-core.md`, `severity.md`), stage instructions, workflow
+graph structure, planner rules, or verification/deduplication logic — must be
+backed up by benchmark data (`benchmarks/`). Flag global review changes that
+lack benchmark validation or risk silent regressions in detection rate or
+precision.
+
+**6. Zero Regressions and No Silent Failures.**
+Avoid regressions in CLI flags, `Settings.toml` parsing, or API contracts.
+Sashiko's worst failure mode is silence: a review that produces no findings
+looks identical to a clean patch. Treat any bug that quietly drops stage outputs,
+skips validation, or swallows errors without failing as high severity.
 
 ## How to review here
 
-- **Verify against the code, not against your priors about Rust services.**
-  This codebase has specific contracts. Read the module guide for the area the
-  diff touches and check the diff against it. If the diff contradicts a guide,
-  either the diff is wrong or the guide is stale — say which you think it is.
-
-- **Do not give the code the benefit of the doubt.** If a diff removes a check,
-  do not assume a caller still performs it. Find the caller. If you cannot
-  prove the failure mode is impossible, the concern stands.
-
-- **`cargo` and `clippy` have already run.** Formatting, unused imports, naming,
-  ordinary lints and anything the type checker catches are not findings. You are
-  here for what a compiler cannot see: a missing capability check, a lock held
-  across an await, a migration that breaks the running binary, a stage whose
-  output nothing consumes, a prompt that no longer matches its schema.
-
-- **Prefer one proven finding to three speculative ones.** The reader of this
-  review is the person who wrote the patch. Every false positive spends their
-  trust.
+- **Verify against concrete code, not assumptions.** Read the subsystem guide
+  for the area the diff touches and check every invariant. Do not give code the
+  benefit of the doubt: if a check is removed or weakened, verify the caller
+  with tools rather than assuming safety.
+- **`cargo` and `clippy` have already run.** Formatting, unused imports, and
+  ordinary compiler/clippy lints are not findings. Focus on architectural,
+  behavioral, concurrency, persistence, and security defects.
+- **Prefer one proven finding to three speculative ones.** Every false positive
+  spends the author's trust.
