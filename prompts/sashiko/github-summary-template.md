@@ -25,13 +25,16 @@ Produce a plain-text inline review report based on the findings provided.
   Do not omit any finding.
 - **Order findings by severity** from highest (`[CRITICAL]`) to lowest
   (`[LOW]`).
+- **Empty line between findings.** Separate individual findings with a single
+  empty line so each finding stands out clearly.
 
 ## Exact Output Structure
 
 When findings are present, output ONLY a bulleted list where every bullet starts
-with `- [<SEVERITY>]`:
+with `- [<SEVERITY>]` and individual findings are separated by an empty line:
 
 - [<SEVERITY>] <short, conscious problem description naming file and symbol>
+
 - [<SEVERITY>] <short, conscious problem description naming file and symbol>
 
 Where `<SEVERITY>` is strictly one of `CRITICAL`, `HIGH`, `MEDIUM`, or `LOW` in
@@ -47,12 +50,15 @@ No issues found.
 - [CRITICAL] In src/worker/sync.rs (GitSyncWorker::sync_all_remotes), holding
   the synchronous std::sync::MutexGuard across the async fetch_remote() call
   can deadlock Tokio worker threads when multiple remotes sync concurrently.
+
 - [HIGH] In src/worker/sync.rs (GitSyncWorker::sync_all_remotes), unredacted
   git fetch stderr is logged via warn! and error! when remote URLs fail,
   leaking embedded authentication tokens into application logs.
+
 - [MEDIUM] In src/api.rs (forge_webhook), the placeholder cover letter message
   ID omits the @sashiko.local domain suffix expected by resolve_root_msg_id(),
   causing git fetch ingestion to create a duplicate patchset row.
+
 - [LOW] Commit message body contains lines exceeding 72 characters and quotes
   function names in backticks.
 

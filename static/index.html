@@ -2390,11 +2390,16 @@
                     // Parse severity if this is a potential comment candidate
                     let severity = null;
                     let displayLine = line;
+                    let isBulletSeverity = false;
                     if (type === 'TEXT' && renderAiComments) {
                         const severityMatch = line.match(/\[Severity:\s*(Critical|High|Medium|Low)\]/i);
+                        const bulletMatch = line.match(/^\s*-\s*\[(Critical|High|Medium|Low)\]/i);
                         if (severityMatch) {
                             severity = severityMatch[1].toLowerCase();
                             displayLine = line.replace(/\[Severity:\s*(Critical|High|Medium|Low)\]/i, '').trim();
+                        } else if (bulletMatch) {
+                            severity = bulletMatch[1].toLowerCase();
+                            isBulletSeverity = true;
                         }
                     }
 
@@ -2406,7 +2411,7 @@
                          else if (content.startsWith('-') && !content.startsWith('---') && content.trim() !== '--') cls += ' diff-removed';
                     }
 
-                    return { line: displayLine, type, cls, severity };
+                    return { line: displayLine, type, cls, severity, isBulletSeverity };
                 });
 
                 // Pass 2: Group into logical blocks and propagate severity
@@ -2429,6 +2434,9 @@
                     if (item.type === 'TEXT') {
                         if (item.severity) {
                             flushCurrentBlock();
+                            if (item.isBulletSeverity && blocks.length > 0 && blocks[blocks.length - 1].type === 'COMMENT') {
+                                blocks.push({ type: 'EMPTY', item: { line: '', type: 'EMPTY', cls: 'diff-line', severity: null } });
+                            }
                         }
                         if (!currentBlock) {
                             currentBlock = { type: 'COMMENT', items: [], severity: null };
@@ -3663,7 +3671,7 @@
                                             <button class="toggle-btn" onclick="toggleCollapsible('${cardId}', this)">▶ Inline Review</button>
                                             <div id="${cardId}" class="collapsible" style="position:relative; margin-top:6px;">
                                                 <button class="copy-btn" style="position: absolute; top: 5px; right: 5px; z-index: 10;" onclick="copyToClipboard(this.nextElementSibling)">Copy</button>
-                                                <div class="log-inline-block">${escapeHtml(b.description || b.inline_review, true, false)}</div>
+                                                <div class="log-inline-block">${escapeHtml(b.description || b.inline_review, true, true)}</div>
                                             </div>
                                         </div>
                                     ` : ''}

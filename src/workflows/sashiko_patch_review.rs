@@ -541,9 +541,44 @@ fn validate_github_summary_format(
     Ok(())
 }
 
+pub fn format_sashiko_inline_findings(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "No issues found." {
+        return trimmed.to_string();
+    }
+
+    let mut out_lines: Vec<&str> = Vec::new();
+    for line in trimmed.lines() {
+        let l = line.trim_start();
+        let is_bullet_severity = l.starts_with("- [CRITICAL]")
+            || l.starts_with("- [HIGH]")
+            || l.starts_with("- [MEDIUM]")
+            || l.starts_with("- [LOW]")
+            || l.starts_with("- [critical]")
+            || l.starts_with("- [high]")
+            || l.starts_with("- [medium]")
+            || l.starts_with("- [low]");
+
+        if is_bullet_severity
+            && !out_lines.is_empty()
+            && !out_lines.last().unwrap().trim().is_empty()
+        {
+            out_lines.push("");
+        }
+        if line.trim().is_empty() {
+            if out_lines.last().is_some_and(|prev| !prev.trim().is_empty()) {
+                out_lines.push("");
+            }
+        } else {
+            out_lines.push(line.trim_end());
+        }
+    }
+    out_lines.join("\n")
+}
+
 fn format_github_summary_feedback(violation: &str) -> String {
     format!(
-        "\n\nPrevious attempt was rejected: {}. Follow `github-summary-template.md`: return strictly plain text without backticks, markdown headings, or 'Summary:'/'Findings:' headers; wrap prose lines at 78 characters; and list every finding as a bullet starting with '- [<SEVERITY>]'.",
+        "\n\nPrevious attempt was rejected: {}. Follow `github-summary-template.md`: return strictly plain text without backticks, markdown headings, or 'Summary:'/'Findings:' headers; wrap prose lines at 78 characters; separate individual findings with an empty line; and list every finding as a bullet starting with '- [<SEVERITY>]'.",
         violation
     )
 }
@@ -978,7 +1013,7 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
         })
         .skip_if(|s| s.findings.is_empty())
         .reduce(|state, out: String| {
-            state.review_inline = out;
+            state.review_inline = format_sashiko_inline_findings(&out);
         })
         .build()
 }
@@ -1157,5 +1192,17 @@ mod tests {
         let wf = build_sashiko_patch_review_workflow();
         assert_eq!(wf.name, "sashiko_patch_review");
         assert_eq!(wf.steps.len(), 7);
+    }
+
+    #[test]
+    fn test_format_sashiko_inline_findings_inserts_empty_lines() {
+        let raw = "- [HIGH] First finding line one\n  first finding continuation.\n- [MEDIUM] Second finding line one\n  second finding continuation.\n- [LOW] Third finding.";
+        let formatted = format_sashiko_inline_findings(raw);
+        assert_eq!(
+            formatted,
+            "- [HIGH] First finding line one\n  first finding continuation.\n\n- [MEDIUM] Second finding line one\n  second finding continuation.\n\n- [LOW] Third finding."
+        );
+        // Idempotent when already separated by empty lines
+        assert_eq!(format_sashiko_inline_findings(&formatted), formatted);
     }
 }
