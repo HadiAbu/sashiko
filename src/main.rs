@@ -417,26 +417,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Database
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
+    db.ensure_project_stamp(project).await?;
 
-    // Load and initialize authoritative immutable MAINTAINERS index from top-of-trunk
-    let linux_repo_path = std::path::PathBuf::from(&settings.git.repository_path);
-    let maintainers_index = match sashiko::maintainers::MaintainersIndex::from_top_of_trunk(
-        &linux_repo_path,
-    ) {
-        Ok(idx) => {
-            info!(
-                "Successfully parsed and indexed {} MAINTAINERS sections from top-of-trunk of Linus's tree",
-                idx.len()
-            );
-            Arc::new(idx)
+    // Load and initialize authoritative immutable MAINTAINERS index when the
+    // reviewed project uses kernel MAINTAINERS.
+    let maintainers_index = if project.uses_maintainers() {
+        let linux_repo_path = std::path::PathBuf::from(&settings.git.repository_path);
+        match sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&linux_repo_path) {
+            Ok(idx) => {
+                info!(
+                    "Successfully parsed and indexed {} MAINTAINERS sections from top-of-trunk of Linus's tree",
+                    idx.len()
+                );
+                Arc::new(idx)
+            }
+            Err(e) => {
+                warn!(
+                    "Failed to load MAINTAINERS from top-of-trunk: {}. Using empty index.",
+                    e
+                );
+                Arc::new(sashiko::maintainers::MaintainersIndex::new())
+            }
         }
-        Err(e) => {
-            warn!(
-                "Failed to load MAINTAINERS from top-of-trunk: {}. Using empty index.",
-                e
-            );
-            Arc::new(sashiko::maintainers::MaintainersIndex::new())
-        }
+    } else {
+        info!("Project {project} does not use kernel MAINTAINERS; skipping index.");
+        Arc::new(sashiko::maintainers::MaintainersIndex::new())
     };
     sashiko::maintainers::init_global_maintainers(maintainers_index);
 
@@ -842,7 +847,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start Ingestor (feeds raw_tx)
-    let ingestor_handle = if !(settings.forge.enabled && settings.forge.disable_nntp) {
+    let ingestor_handle = if should_start_nntp_ingestor(&settings) {
         let ingestor = Ingestor::new(
             settings.clone(),
             db.clone(),
@@ -856,7 +861,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         })
     } else {
-        info!("Forge integration is enabled. Lore/NNTP ingestor is disabled.");
+        info!("Lore/NNTP ingestor is disabled (no NNTP config or disabled by forge).");
         tokio::spawn(async move {
             std::future::pending::<()>().await;
         })
@@ -2605,6 +2610,10 @@ fn identify_subsystems_from_paths(
     subsystems
 }
 
+fn should_start_nntp_ingestor(settings: &Settings) -> bool {
+    settings.has_nntp_config() && !(settings.forge.enabled && settings.forge.disable_nntp)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2989,8 +2998,7 @@ mod tests {
         let mut settings = Settings::new().unwrap();
         settings.forge.enabled = true;
         settings.forge.disable_nntp = false;
-        let should_start_ingestor = !(settings.forge.enabled && settings.forge.disable_nntp);
-        assert!(should_start_ingestor);
+        assert!(should_start_nntp_ingestor(&settings));
     }
 
     #[test]
@@ -2998,8 +3006,15 @@ mod tests {
         let mut settings = Settings::new().unwrap();
         settings.forge.enabled = true;
         settings.forge.disable_nntp = true; // This is the default
-        let should_start_ingestor = !(settings.forge.enabled && settings.forge.disable_nntp);
-        assert!(!should_start_ingestor);
+        assert!(!should_start_nntp_ingestor(&settings));
+    }
+
+    #[test]
+    fn test_nntp_ingestor_disabled_when_nntp_config_omitted() {
+        let mut settings = Settings::new().unwrap();
+        settings.nntp.server = String::new();
+        settings.forge.enabled = false;
+        assert!(!should_start_nntp_ingestor(&settings));
     }
 
     #[test]

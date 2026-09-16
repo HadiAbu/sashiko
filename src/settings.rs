@@ -104,8 +104,23 @@ pub struct DatabaseSettings {
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct NntpSettings {
+    #[serde(default)]
     pub server: String,
+    #[serde(default = "default_nntp_port")]
     pub port: u16,
+}
+
+fn default_nntp_port() -> u16 {
+    119
+}
+
+impl Default for NntpSettings {
+    fn default() -> Self {
+        Self {
+            server: String::new(),
+            port: default_nntp_port(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -126,11 +141,11 @@ fn default_dry_run() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct MailingListsSettings {
-    #[serde(deserialize_with = "deserialize_string_or_vec")]
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub track: Vec<String>,
 }
 
@@ -774,13 +789,22 @@ pub struct Settings {
     #[serde(default = "default_forge")]
     pub forge: ForgeSettings,
     pub database: DatabaseSettings,
+    #[serde(default)]
     pub nntp: NntpSettings,
     pub smtp: Option<SmtpSettings>,
+    #[serde(default)]
     pub mailing_lists: MailingListsSettings,
     pub ai: AiSettings,
     pub server: ServerSettings,
     pub git: GitSettings,
     pub review: ReviewSettings,
+}
+
+impl Settings {
+    /// Whether NNTP server and tracked mailing lists are configured.
+    pub fn has_nntp_config(&self) -> bool {
+        !self.nntp.server.trim().is_empty() && !self.mailing_lists.track.is_empty()
+    }
 }
 
 fn default_subsystems() -> SubsystemsSettings {

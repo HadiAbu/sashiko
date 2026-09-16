@@ -1506,7 +1506,15 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 7.");
+        if current_version < 8 {
+            info!("Applying database migration version 8 (meta table)...");
+            self.conn
+                .execute_batch(include_str!("migrations/008_meta_table.sql"))
+                .await?;
+            self.conn.execute("PRAGMA user_version = 8", ()).await?;
+        }
+
+        info!("Database schema is up to date at version 8.");
 
         Ok(())
     }
@@ -1540,6 +1548,34 @@ impl Database {
         // patches. Refusing to start the server over that would cost more
         // than the handful of rows left behind.
         warn!("Repair of borrowed series names did not settle in {MAX_PASSES} passes.");
+        Ok(())
+    }
+
+    /// Ensures the database is stamped for `project`, preventing two instances
+    /// configured for different projects from sharing the same SQLite database.
+    pub async fn ensure_project_stamp(&self, project: crate::project::ProjectId) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query("SELECT value FROM meta WHERE key = 'project'", ())
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let existing: String = row.get(0)?;
+            if existing != project.as_str() {
+                anyhow::bail!(
+                    "database project mismatch: database is stamped for project '{}', but this instance is configured for project '{}'. Each project instance must use its own database file.",
+                    existing,
+                    project
+                );
+            }
+            return Ok(());
+        }
+
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('project', ?1)",
+                libsql::params![project.as_str()],
+            )
+            .await?;
         Ok(())
     }
 
@@ -16557,5 +16593,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_project_stamp_idempotent_and_rejects_mismatch() {
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        // First stamp with Sashiko succeeds
+        db.ensure_project_stamp(crate::project::ProjectId::Sashiko)
+            .await
+            .unwrap();
+        // Repeating the same stamp is idempotent
+        db.ensure_project_stamp(crate::project::ProjectId::Sashiko)
+            .await
+            .unwrap();
+
+        // Attempting to open the database with Linux project fails clearly
+        let err = db
+            .ensure_project_stamp(crate::project::ProjectId::Linux)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("database project mismatch"),
+            "unexpected error: {err}"
+        );
     }
 }
