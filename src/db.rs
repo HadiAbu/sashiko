@@ -5795,6 +5795,96 @@ impl Database {
         Ok(())
     }
 
+    pub async fn get_mr_version_for_commit_range(
+        &self,
+        mr_number: i64,
+        root_msg_id: &str,
+    ) -> Result<u32> {
+        let candidates = Self::get_msgid_candidates(root_msg_id);
+        for clid in &candidates {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT id, subject FROM patchsets WHERE cover_letter_message_id = ?",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Ok(Some(row)) = rows.next().await {
+                let existing_id: i64 = row.get(0)?;
+                let existing_subject: String = row.get(1).unwrap_or_default();
+                if let Some(v) = crate::patch::parse_subject_version(&existing_subject)
+                    && v > 0
+                {
+                    return Ok(v);
+                }
+                let mut count_rows = self
+                    .conn
+                    .query(
+                        "SELECT COUNT(*) FROM patchsets WHERE mr_number = ? AND id < ?",
+                        libsql::params![mr_number, existing_id],
+                    )
+                    .await?;
+                let older_count: i64 = if let Ok(Some(crow)) = count_rows.next().await {
+                    crow.get(0).unwrap_or(0)
+                } else {
+                    0
+                };
+                return Ok((older_count + 1) as u32);
+            }
+        }
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patchsets WHERE mr_number = ?",
+                libsql::params![mr_number],
+            )
+            .await?;
+        let count: i64 = if let Ok(Some(row)) = rows.next().await {
+            row.get(0).unwrap_or(0)
+        } else {
+            0
+        };
+        Ok((count + 1) as u32)
+    }
+
+    async fn rotate_mr_slug(&self, slug: &str, exclude_id: Option<i64>) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, subject FROM patchsets WHERE slug = ?",
+                libsql::params![slug],
+            )
+            .await?;
+        if let Ok(Some(row)) = rows.next().await {
+            let old_id: i64 = row.get(0)?;
+            if Some(old_id) == exclude_id {
+                return Ok(());
+            }
+            let old_subject: String = row.get(1).unwrap_or_default();
+            let old_ver = crate::patch::parse_subject_version(&old_subject).unwrap_or(1);
+            let candidate_slug = format!("{}-v{}", slug, old_ver);
+            let res = self
+                .conn
+                .execute(
+                    "UPDATE patchsets SET slug = ? WHERE id = ?",
+                    libsql::params![candidate_slug, old_id],
+                )
+                .await;
+            if res.is_err() {
+                let fallback_slug = format!("{}-v{}-{}", slug, old_ver, old_id);
+                let _ = self
+                    .conn
+                    .execute(
+                        "UPDATE patchsets SET slug = ? WHERE id = ?",
+                        libsql::params![fallback_slug, old_id],
+                    )
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn update_patchset_mr_metadata(
         &self,
         id: i64,
@@ -5803,13 +5893,16 @@ impl Database {
         mr_number: Option<i64>,
         slug: Option<&str>,
     ) -> Result<()> {
+        if let Some(s) = slug {
+            self.rotate_mr_slug(s, Some(id)).await?;
+        }
         self.conn
             .execute(
                 "UPDATE patchsets SET
                     mr_url = COALESCE(mr_url, ?),
                     mr_title = COALESCE(mr_title, ?),
                     mr_number = COALESCE(mr_number, ?),
-                    slug = COALESCE(slug, ?)
+                    slug = COALESCE(?, slug)
                  WHERE id = ?",
                 libsql::params![mr_url, mr_title, mr_number, slug, id],
             )
@@ -7204,6 +7297,23 @@ impl Database {
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
 
+        let mr_ver = if let Some(num) = mr_number {
+            Some(
+                self.get_mr_version_for_commit_range(num, root_msg_id)
+                    .await
+                    .unwrap_or(1),
+            )
+        } else {
+            None
+        };
+
+        let effective_subject =
+            if let (Some(num), Some(title), Some(ver)) = (mr_number, mr_title, mr_ver) {
+                crate::forge::format_mr_subject(mr_url, num, ver, title)
+            } else {
+                subject.to_string()
+            };
+
         // 1. Check if it already exists
         for clid in clid_candidates {
             let mut rows = self
@@ -7226,9 +7336,12 @@ impl Database {
                     || status == "Failed To Apply"
                     || status == "FailedToApply"
                 {
+                    if let Some(s) = slug {
+                        self.rotate_mr_slug(s, Some(id)).await?;
+                    }
                     self.conn.execute(
-                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
-                        libsql::params![skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
+                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
+                        libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
                     ).await?;
                 }
                 return Ok(id);
@@ -7238,12 +7351,16 @@ impl Database {
         // 2. Ensure a placeholder thread and message exist to satisfy Foreign Key constraints
         let thread_id = self.ensure_thread_for_message(root_msg_id, now).await?;
 
+        if let Some(s) = slug {
+            self.rotate_mr_slug(s, None).await?;
+        }
+
         // 3. Create the fetching patchset
         let mut rows = self.conn
             .query(
                 "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug)
                      VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, root_msg_id, subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug],
+                libsql::params![thread_id, root_msg_id, effective_subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug],
             )
             .await?;
 
@@ -16795,5 +16912,117 @@ mod tests {
             Some("Author One <one@example.com>")
         );
         assert_eq!(details["patches"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_pull_request_update_increments_version_and_rotates_slug() {
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let mr_number = 513;
+        let slug = "sashiko-513";
+        let title = "baseline: route iwl-net and iwl-next series to dev-queue";
+        let mr_url = "https://github.com/sashiko-dev/sashiko/pull/513";
+
+        let clid_v1 = "mr-513-shaAAAA..shaBBBB@sashiko.local";
+        let ps_v1 = db
+            .create_fetching_patchset(
+                clid_v1,
+                "Fetching PR #513",
+                None,
+                None,
+                Some(mr_url),
+                Some(title),
+                Some(mr_number),
+                Some(slug),
+            )
+            .await
+            .unwrap();
+
+        let details_v1 = db
+            .get_patchset_details_by_slug(slug, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details_v1["id"].as_i64(), Some(ps_v1));
+        assert_eq!(
+            details_v1["subject"].as_str(),
+            Some("#513: baseline: route iwl-net and iwl-next series to dev-queue")
+        );
+        assert_eq!(
+            crate::patch::parse_subject_version(details_v1["subject"].as_str().unwrap())
+                .unwrap_or(1),
+            1
+        );
+
+        // Re-submitting the exact same commit range should reuse v1 and not increment
+        let ps_v1_repeat = db
+            .create_fetching_patchset(
+                clid_v1,
+                "Fetching PR #513",
+                None,
+                None,
+                Some(mr_url),
+                Some(title),
+                Some(mr_number),
+                Some(slug),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ps_v1_repeat, ps_v1);
+        assert_eq!(
+            db.get_mr_version_for_commit_range(mr_number, clid_v1)
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Now PR #513 is updated with new commits (new head shaCCCC)
+        let clid_v2 = "mr-513-shaAAAA..shaCCCC@sashiko.local";
+        let ps_v2 = db
+            .create_fetching_patchset(
+                clid_v2,
+                "Fetching PR #513",
+                None,
+                None,
+                Some(mr_url),
+                Some(title),
+                Some(mr_number),
+                Some(slug),
+            )
+            .await
+            .unwrap();
+        assert_ne!(ps_v2, ps_v1);
+
+        // Latest slug ("sashiko-513") now points to v2
+        let details_v2 = db
+            .get_patchset_details_by_slug(slug, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details_v2["id"].as_i64(), Some(ps_v2));
+        assert_eq!(
+            details_v2["subject"].as_str(),
+            Some("#513 [v2]: baseline: route iwl-net and iwl-next series to dev-queue")
+        );
+        assert_eq!(
+            crate::patch::parse_subject_version(details_v2["subject"].as_str().unwrap()),
+            Some(2)
+        );
+
+        // Older v1 patchset rotated to "sashiko-513-v1"
+        let rotated_v1 = db
+            .get_patchset_details_by_slug("sashiko-513-v1", None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rotated_v1["id"].as_i64(), Some(ps_v1));
+        assert_eq!(
+            rotated_v1["subject"].as_str(),
+            Some("#513: baseline: route iwl-net and iwl-next series to dev-queue")
+        );
     }
 }

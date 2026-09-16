@@ -2208,7 +2208,7 @@ async fn process_parsed_article(
     };
 
     if metadata.is_patch_or_cover {
-        let (subject, author, total_parts, strict_author) = if is_git_import {
+        let (subject, author, total_parts, strict_author, effective_version) = if is_git_import {
             let range = group
                 .strip_prefix("git-import:")
                 .and_then(|s| s.split_once(':').map(|(_, r)| r))
@@ -2222,15 +2222,21 @@ async fn process_parsed_article(
                     metadata.total
                 },
                 false,
+                metadata.version,
             )
         } else if group == "git-fetch"
             && let (Some(title), Some(number)) = (&mr_title, &mr_number)
         {
+            let mr_ver = worker_db
+                .get_mr_version_for_commit_range(*number, &root_msg_id)
+                .await
+                .unwrap_or(1);
             (
-                format_mr_subject(mr_url.as_deref(), *number, title),
+                sashiko::forge::format_mr_subject(mr_url.as_deref(), *number, mr_ver, title),
                 metadata.author.clone(),
                 metadata.total,
                 is_strict_author(source, metadata.total),
+                Some(mr_ver),
             )
         } else {
             (
@@ -2238,6 +2244,7 @@ async fn process_parsed_article(
                 metadata.author.clone(),
                 metadata.total,
                 is_strict_author(source, metadata.total),
+                metadata.version,
             )
         };
 
@@ -2270,7 +2277,7 @@ async fn process_parsed_article(
                 PARSER_VERSION,
                 &metadata.to,
                 &metadata.cc,
-                metadata.version,
+                effective_version,
                 metadata.index,
                 baseline_id,
                 strict_author,
@@ -2537,15 +2544,6 @@ fn is_strict_author(source: MessageSource, total_parts: u32) -> bool {
         MessageSource::ApiFetchThread if total_parts > 1 => false,
         _ => true,
     }
-}
-
-fn format_mr_subject(mr_url: Option<&str>, number: i64, title: &str) -> String {
-    let prefix = if mr_url.is_some_and(|u| u.contains("/-/merge_requests/")) {
-        "!"
-    } else {
-        "#"
-    };
-    format!("{}{}: {}", prefix, number, title)
 }
 
 fn identify_subsystems(
@@ -3087,21 +3085,23 @@ mod tests {
     #[test]
     fn test_format_mr_subject() {
         assert_eq!(
-            format_mr_subject(
+            sashiko::forge::format_mr_subject(
                 Some("https://github.com/sashiko-dev/sashiko/pull/502"),
                 502,
+                1,
                 "Fix PR display prefix"
             ),
             "#502: Fix PR display prefix"
         );
         assert_eq!(
-            format_mr_subject(None, 502, "Fix PR display prefix"),
+            sashiko::forge::format_mr_subject(None, 502, 1, "Fix PR display prefix"),
             "#502: Fix PR display prefix"
         );
         assert_eq!(
-            format_mr_subject(
+            sashiko::forge::format_mr_subject(
                 Some("https://gitlab.com/example/repo/-/merge_requests/502"),
                 502,
+                1,
                 "Fix MR display prefix"
             ),
             "!502: Fix MR display prefix"

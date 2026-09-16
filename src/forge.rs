@@ -462,9 +462,87 @@ impl Default for ForgeRegistry {
     }
 }
 
+/// Format a pull request / merge request subject line with `#` (or `!` for GitLab)
+/// and an optional `[vN]` revision tag when `version >= 2`.
+pub fn format_mr_subject(mr_url: Option<&str>, number: i64, version: u32, title: &str) -> String {
+    let prefix = match mr_url {
+        Some(url) if url.contains("gitlab") => "!",
+        _ => "#",
+    };
+    let clean_title = strip_existing_mr_prefix(title, number);
+    if version >= 2 {
+        format!("{}{} [v{}]: {}", prefix, number, version, clean_title)
+    } else {
+        format!("{}{}: {}", prefix, number, clean_title)
+    }
+}
+
+fn strip_existing_mr_prefix(title: &str, number: i64) -> &str {
+    let trimmed = title.trim();
+    for pfx in ['#', '!'] {
+        let base = format!("{}{}", pfx, number);
+        if let Some(rest) = trimmed.strip_prefix(&base) {
+            let rest = rest.trim_start();
+            if let Some(after_v) = rest.strip_prefix("[v")
+                && let Some((_, after_bracket)) = after_v.split_once(']')
+            {
+                return after_bracket
+                    .trim_start()
+                    .strip_prefix(':')
+                    .unwrap_or(after_bracket)
+                    .trim_start();
+            }
+            if let Some(after_colon) = rest.strip_prefix(':') {
+                return after_colon.trim_start();
+            }
+        }
+    }
+    trimmed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_mr_subject_versions() {
+        assert_eq!(
+            format_mr_subject(
+                Some("https://github.com/sashiko-dev/sashiko/pull/513"),
+                513,
+                1,
+                "baseline: route iwl-net and iwl-next series to dev-queue"
+            ),
+            "#513: baseline: route iwl-net and iwl-next series to dev-queue"
+        );
+        assert_eq!(
+            format_mr_subject(
+                Some("https://github.com/sashiko-dev/sashiko/pull/513"),
+                513,
+                5,
+                "baseline: route iwl-net and iwl-next series to dev-queue"
+            ),
+            "#513 [v5]: baseline: route iwl-net and iwl-next series to dev-queue"
+        );
+        assert_eq!(
+            format_mr_subject(
+                Some("https://github.com/sashiko-dev/sashiko/pull/513"),
+                513,
+                2,
+                "#513: baseline: route iwl-net and iwl-next series to dev-queue"
+            ),
+            "#513 [v2]: baseline: route iwl-net and iwl-next series to dev-queue"
+        );
+        assert_eq!(
+            format_mr_subject(
+                Some("https://gitlab.com/org/repo/-/merge_requests/42"),
+                42,
+                3,
+                "fix race condition"
+            ),
+            "!42 [v3]: fix race condition"
+        );
+    }
 
     #[test]
     fn test_is_valid_git_sha_40_char() {
