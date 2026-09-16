@@ -1489,7 +1489,16 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 6.");
+        if current_version < 7 {
+            info!("Applying database migration version 7 (fold shadow cover rows)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!("migrations/007_fold_shadow_cover_rows.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 7", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 7.");
 
         Ok(())
     }
@@ -13132,6 +13141,93 @@ mod tests {
         run_borrowed_name_repair(&db).await;
         assert_eq!(series_identity(&db, 2).await, own_patch);
     }
+
+
+    /// Migration 7 folds an empty Incomplete cover-letter row into its
+    /// Reviewed sibling series when every patch of that series has an
+    /// email_outbox row, and leaves rows without an outbox entry untouched.
+    #[tokio::test]
+    async fn test_migration_folds_shadow_cover_rows() {
+        let db = setup_db().await;
+        let cover = "cover-0-of-1@example.com";
+        let patch = "patch-1-of-1@example.com";
+        let subj = "[PATCH v2 0/1] mm: memcg: fix";
+
+        let thread_id = db.create_thread(cover, subj, 1000).await.unwrap();
+        ensure_message(&db, thread_id, cover).await;
+        ensure_message(&db, thread_id, patch).await;
+
+        // Real row: Reviewed, has the patch, named after patch 1/1.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts, embargo_until)
+                 VALUES (10, ?, ?, ?, 0, 'An Author', 1000, 'Reviewed', 1, 1, NULL)",
+                libsql::params![thread_id, patch, subj],
+            )
+            .await
+            .unwrap();
+        let patch_id = db.create_patch(10, patch, 1, "diff").await.unwrap();
+
+        // Empty shadow row: Incomplete, 0 patches, holds the cover letter id.
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (11, ?, ?, ?, 0, 'An Author', 1005, 'Incomplete', 1, 0)",
+                libsql::params![thread_id, cover, subj],
+            )
+            .await
+            .unwrap();
+
+        let fold = include_str!("migrations/007_fold_shadow_cover_rows.sql");
+
+        // Without an email_outbox row, migration 7 must refuse to touch it.
+        db.conn.execute_batch(fold).await.unwrap();
+        assert_eq!(series_identity(&db, 10).await, patch);
+
+        // Once the patch has an email_outbox entry, migration 7 folds row 11 into row 10.
+        db.insert_email_outbox(patch_id, "Sent", "[]", "[]", subj, patch, patch, "body")
+            .await
+            .unwrap();
+        db.conn.execute_batch(fold).await.unwrap();
+
+        assert_eq!(
+            series_identity(&db, 10).await,
+            cover,
+            "the Reviewed series takes the cover letter's message id"
+        );
+        assert_eq!(
+            db.find_patchset_id_by_msgid(cover).await.unwrap(),
+            Some(10),
+            "the cover letter URL now resolves to the Reviewed series"
+        );
+
+        // If another empty Incomplete row exists in the same thread with the same subject,
+        // migration 7 must not overwrite row 10 now that row 10 holds a cover letter id
+        // rather than one of its own patch ids.
+        let stray_cover = "stray-cover-0-of-1@example.com";
+        ensure_message(&db, thread_id, stray_cover).await;
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject,
+                                        subject_index, author, date, status, total_parts,
+                                        received_parts)
+                 VALUES (12, ?, ?, ?, 0, 'An Author', 1010, 'Incomplete', 1, 0)",
+                libsql::params![thread_id, stray_cover, subj],
+            )
+            .await
+            .unwrap();
+        db.conn.execute_batch(fold).await.unwrap();
+        assert_eq!(
+            series_identity(&db, 10).await,
+            cover,
+            "migration 7 must not overwrite a series that already has its own cover letter"
+        );
+    }
+
 
     /// Verify that has_patchset_by_msgid detects patchsets by bare SHA
     /// for synthetic @sashiko.local cover letters and for patches in the patches table.
