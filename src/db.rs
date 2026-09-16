@@ -18,7 +18,15 @@ use anyhow::{Result, bail};
 use libsql::Builder;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::str::FromStr;
 use tracing::{info, warn};
+
+/// The SQL form of [`Database::is_closed_to_new_parts`], for the statements
+/// that have to ask the question of a row they are updating. The two must
+/// answer alike, which a test below checks.
+const CLOSED_TO_NEW_PARTS_SQL: &str = "(status = 'Cancelled'
+      OR (status IN ('Reviewed', 'Failed', 'Failed To Apply')
+          AND received_parts >= total_parts))";
 
 pub struct Database {
     pub conn: libsql::Connection,
@@ -4630,6 +4638,96 @@ impl Database {
             && crate::patch::authors_match(&candidate_author, author))
     }
 
+    /// Determine whether an incoming message's version tag is compatible with an
+    /// existing candidate patchset.
+    fn versions_are_compatible(
+        existing_version: Option<u32>,
+        existing_subject_index: u32,
+        existing_status: &str,
+        new_version: Option<u32>,
+        new_part_index: u32,
+        same_thread: bool,
+        same_batch_or_reply: bool,
+    ) -> bool {
+        let v_old = existing_version.unwrap_or(1);
+        let v_new = new_version.unwrap_or(1);
+        if v_old == v_new {
+            return true;
+        }
+
+        // Two explicit, different version tags (e.g. v1 vs v2, or v5 vs v6)
+        // never belong to the same patchset.
+        if existing_version.is_some() && new_version.is_some() {
+            return false;
+        }
+
+        // If the existing series has an explicit version (e.g. [PATCH v6 00/33])
+        // and an incoming patch (part_index > 0) in the same thread omitted the
+        // version tag ([PATCH 01/33]), allow it to merge into the series.
+        if existing_version.is_some() && new_version.is_none() {
+            return new_part_index > 0 && same_thread;
+        }
+
+        // Conversely, if unversioned patches arrived first (existing_version is None,
+        // existing_subject_index > 0) and an explicit versioned cover letter or patch
+        // arrives from the same git send-email batch (or direct reply to the cover letter),
+        // allow them to merge.
+        if existing_version.is_none() && new_version.is_some() {
+            return existing_subject_index > 0
+                && (existing_status == "Incomplete"
+                    || existing_status == "Fetching"
+                    || (new_part_index == 0 && existing_status == "Pending"))
+                && same_batch_or_reply;
+        }
+
+        false
+    }
+
+    /// Classify a series identity (`cover_letter_message_id`) on `patchset_id`.
+    /// Returns `Ok(None)` if `msg_id` is a cover letter (part 0), or `Ok(Some(part_index))`
+    /// if `msg_id` is a patch (part > 0).
+    async fn identity_part_index(&self, patchset_id: i64, msg_id: &str) -> Result<Option<u32>> {
+        if let Some(idx) = self.patch_part_index(patchset_id, msg_id).await? {
+            if idx == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(idx));
+        }
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT subject FROM messages WHERE message_id = ?",
+                libsql::params![msg_id],
+            )
+            .await?;
+        if let Ok(Some(row)) = rows.next().await {
+            let subj: String = row.get(0).unwrap_or_default();
+            let (idx, _total) = crate::patch::parse_subject_index(&subj);
+            if idx == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(idx));
+        }
+
+        let mut ps_rows = self
+            .conn
+            .query(
+                "SELECT subject_index FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if let Ok(Some(row)) = ps_rows.next().await {
+            let subj_idx: u32 = row.get(0).unwrap_or(9999);
+            if subj_idx == 0 {
+                return Ok(None);
+            }
+            return Ok(Some(subj_idx));
+        }
+
+        Ok(Some(9999))
+    }
+
     /// Name a patchset after one of its own messages.
     ///
     /// A series is named by its cover letter, and by its lowest-numbered part
@@ -4642,13 +4740,9 @@ impl Database {
         &self,
         patchset_id: i64,
         identity: &str,
-        own_part_index: Option<u32>,
+        part_index: u32,
+        is_own_part_id: bool,
     ) -> Result<()> {
-        let Some(part_index) = own_part_index else {
-            self.set_series_identity(patchset_id, identity).await?;
-            return Ok(());
-        };
-
         let mut rows = self
             .conn
             .query(
@@ -4657,19 +4751,52 @@ impl Database {
             )
             .await?;
         let current: Option<String> = match rows.next().await {
-            Ok(Some(row)) => row.get(0).ok(),
+            Ok(Some(row)) => row.get::<Option<String>>(0).ok().flatten(),
             _ => None,
         };
 
+        if current.as_deref() == Some(identity) {
+            return Ok(());
+        }
+
+        // Never adopt an identity that is already claimed as the cover letter
+        // of another patchset row.
+        let mut owner_rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND id != ? LIMIT 1",
+                libsql::params![identity, patchset_id],
+            )
+            .await?;
+        if owner_rows.next().await.ok().flatten().is_some() {
+            return Ok(());
+        }
+
         let replace = match current.as_deref() {
             None => true,
-            Some(current) if current == identity => false,
             // A placeholder id stands in until a real message shows up.
-            Some(current) if current.ends_with("@sashiko.local") => true,
-            Some(current) => self
-                .patch_part_index(patchset_id, current)
-                .await?
-                .is_some_and(|current_index| current_index > part_index),
+            Some(curr) if curr.ends_with("@sashiko.local") => !identity.ends_with("@sashiko.local"),
+            Some(curr) => {
+                let curr_part_idx = self.identity_part_index(patchset_id, curr).await?;
+                match curr_part_idx {
+                    None => {
+                        // Once a series has its own 0/N cover letter (and it is not
+                        // a placeholder), no subsequent message may overwrite it.
+                        false
+                    }
+                    Some(curr_idx) => {
+                        if !is_own_part_id || part_index == 0 {
+                            // The incoming identity is a cover letter (either part_index == 0
+                            // or an unclaimed parent cover letter from In-Reply-To).
+                            true
+                        } else {
+                            // Both current and incoming are patch message IDs; the lower
+                            // part index wins.
+                            curr_idx > part_index
+                        }
+                    }
+                }
+            }
         };
 
         if replace {
@@ -4704,6 +4831,55 @@ impl Database {
         }
     }
 
+    /// Report whether a patchset already holds `message_id`, as its cover
+    /// letter or as one of its patches.
+    ///
+    /// A message id is stored in the form it arrived in, so every form it
+    /// could be stored under is tried. A message that is already part of a
+    /// series has to be recognised as one: a series that has been reviewed
+    /// takes no further parts, and a re-delivery that reads as a new message
+    /// would be answered with a second series rather than the first one.
+    async fn patchset_holds_message(&self, patchset_id: i64, message_id: &str) -> Result<bool> {
+        for candidate in Self::get_msgid_candidates(message_id) {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patchsets
+                      WHERE id = ? AND cover_letter_message_id = ?
+                     UNION ALL
+                     SELECT 1 FROM patches
+                      WHERE patchset_id = ? AND message_id = ?
+                     LIMIT 1",
+                    libsql::params![patchset_id, candidate.clone(), patchset_id, candidate],
+                )
+                .await?;
+            if rows.next().await.ok().flatten().is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Report whether a patchset has reached a state that a message it does
+    /// not already hold must not change.
+    ///
+    /// Cancelled is a decision about the series as a whole, and a part that
+    /// turns up afterwards must not undo it. The remaining terminal states
+    /// describe the parts the series has: one that is still short of them is
+    /// waiting, and the part it is waiting for belongs to it.
+    ///
+    /// A status the review pipeline does not define, such as the Fetching a
+    /// fetch leaves behind, is not terminal.
+    fn is_closed_to_new_parts(status: &str, received_parts: u32, total_parts: u32) -> bool {
+        match ReviewStatus::from_str(status) {
+            Ok(ReviewStatus::Cancelled) => true,
+            Ok(ReviewStatus::Reviewed | ReviewStatus::Failed | ReviewStatus::FailedToApply) => {
+                received_parts >= total_parts
+            }
+            _ => false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_patchset(
         &self,
@@ -4731,8 +4907,7 @@ impl Database {
         // message is that part when the caller passed its own id. Such a name
         // yields to a lower-numbered part; every other name is a cover letter
         // or a placeholder and stands.
-        let identity_from_own_part =
-            (cover_letter_message_id == Some(message_id) && part_index > 0).then_some(part_index);
+        let is_own_part_id = cover_letter_message_id == Some(message_id) && part_index > 0;
 
         // 1. Try to find by cover_letter_message_id first (handles placeholders from API/Fetcher)
         let mut clid_candidates = Vec::new();
@@ -4754,9 +4929,9 @@ impl Database {
             // When using the @sashiko.local fallback, scope the query
             // to the same thread to avoid cross-patchset contamination.
             let query = if scope_to_thread {
-                "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ? AND thread_id = ?"
+                "SELECT id, date, author, subject, subject_index, total_parts, status, thread_id, received_parts FROM patchsets WHERE cover_letter_message_id = ? AND thread_id = ?"
             } else {
-                "SELECT id, date, author, subject, subject_index, total_parts, status FROM patchsets WHERE cover_letter_message_id = ?"
+                "SELECT id, date, author, subject, subject_index, total_parts, status, thread_id, received_parts FROM patchsets WHERE cover_letter_message_id = ?"
             };
             let mut rows = if scope_to_thread {
                 self.conn
@@ -4770,15 +4945,36 @@ impl Database {
             while let Ok(Some(row)) = rows.next().await {
                 let id: i64 = row.get(0)?;
                 let existing_subject: String = row.get(3)?;
+                let subject_index: u32 = row.get(4).unwrap_or(9999);
+                let existing_total: u32 = row.get(5).unwrap_or(1);
                 let existing_status: String = row.get(6).unwrap_or_else(|_| "Unknown".to_string());
+                let existing_thread_id: Option<i64> = row.get(7).ok();
+                let existing_received: u32 = row.get(8).unwrap_or(0);
+
+                let is_duplicate = self.patchset_holds_message(id, message_id).await?;
+
+                if Self::is_closed_to_new_parts(&existing_status, existing_received, existing_total)
+                {
+                    if is_duplicate {
+                        return Ok(Some(id));
+                    }
+                    continue;
+                }
 
                 let is_placeholder =
                     existing_subject == "(placeholder)" || existing_status == "Fetching";
 
                 let existing_version = crate::patch::parse_subject_version(&existing_subject);
-                let v_new = version.unwrap_or(1);
-                let v_old = existing_version.unwrap_or(1);
-                let versions_compatible = v_new == v_old;
+                let same_thread = existing_thread_id == Some(thread_id);
+                let versions_compatible = Self::versions_are_compatible(
+                    existing_version,
+                    subject_index,
+                    &existing_status,
+                    version,
+                    part_index,
+                    same_thread,
+                    false,
+                );
 
                 let index_collision = if part_index == 0 {
                     false
@@ -4797,10 +4993,6 @@ impl Database {
                     continue;
                 }
 
-                // Found it! Use this ID. We'll update its fields below.
-                let subject_index: u32 = row.get(4).unwrap_or(9999);
-                let existing_total: u32 = row.get(5).unwrap_or(1);
-
                 // Prevent downgrading a series to a singleton if we already have multiple parts.
                 // This handles cases where a singleton root (1/1) overwrites a series (N/N) inferred from replies.
                 let final_total = if total_parts == 1 && existing_total > 1 {
@@ -4816,7 +5008,7 @@ impl Database {
                 ).await?;
 
                 if let Some(real_clid) = cover_letter_message_id {
-                    self.adopt_series_identity(id, real_clid, identity_from_own_part)
+                    self.adopt_series_identity(id, real_clid, part_index, is_own_part_id)
                         .await?;
                 }
 
@@ -4856,13 +5048,23 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, date, author, subject, subject_index, total_parts, received_parts, cover_letter_message_id, thread_id, baseline_id, baseline_part_index FROM patchsets
-                 WHERE thread_id = ? OR (author = ? AND date BETWEEN ? AND ?)",
+                "SELECT id, date, author, subject, subject_index, total_parts, received_parts, cover_letter_message_id, thread_id, baseline_id, baseline_part_index, status FROM patchsets
+                 WHERE thread_id = ? OR (author = ? AND date BETWEEN ? AND ?)
+                 ORDER BY id ASC",
                 libsql::params![thread_id, author, window_start, window_end],
             )
             .await?;
 
-        let mut matches = Vec::new();
+        struct CandidateMatch {
+            id: i64,
+            subject: String,
+            subject_index: u32,
+            cover_id: Option<String>,
+            baseline_id: Option<i64>,
+            baseline_part: Option<u32>,
+        }
+
+        let mut matches: Vec<CandidateMatch> = Vec::new();
 
         while let Ok(Some(row)) = rows.next().await {
             let id: i64 = row.get(0)?;
@@ -4876,33 +5078,11 @@ impl Database {
             let existing_thread_id: Option<i64> = row.get(8).ok();
             let existing_baseline_id: Option<i64> = row.get(9).ok();
             let existing_baseline_part: Option<u32> = row.get(10).ok();
+            let existing_status: String = row.get(11).unwrap_or_else(|_| "Unknown".to_string());
 
-            // Check if this message is already part of this patchset (Duplicate processing)
-            // 1. Check if it is the cover letter.
-            let is_cover_duplicate = existing_cover_id.as_deref() == Some(message_id);
-
-            // 2. Check if it is an existing patch.
-            let is_patch_duplicate = if !is_cover_duplicate {
-                let mut p_rows = self
-                    .conn
-                    .query(
-                        "SELECT 1 FROM patches WHERE patchset_id = ? AND message_id = ?",
-                        libsql::params![id, message_id],
-                    )
-                    .await?;
-                p_rows.next().await.ok().flatten().is_some()
-            } else {
-                false
-            };
-
-            let is_duplicate = is_cover_duplicate || is_patch_duplicate;
-
-            // If the patchset is already full, do not merge more patches into it,
-            // UNLESS it is a duplicate of a message already in the set.
-            // This prevents merging unrelated patchsets that happen to look similar (same author/size).
-            if existing_received >= existing_total && !is_duplicate && part_index != 0 {
-                continue;
-            }
+            // A message that this patchset already holds is being processed
+            // again, rather than arriving for the first time.
+            let is_duplicate = self.patchset_holds_message(id, message_id).await?;
 
             // Parse version from existing subject
             let existing_version = crate::patch::parse_subject_version(&existing_subject);
@@ -4951,17 +5131,77 @@ impl Database {
             let msgid_prefix_match = existing_msgid_prefix.as_deref() == Some(new_msgid_prefix)
                 && new_msgid_prefix.len() > 10;
 
-            // Matching logic:
-            // 1. Author matches OR it's a multi-part series with matching total_parts (trusting thread context)
-            //    BUT strict_author enforces strict author matching (for Email/NNTP).
-            // 2. Time must be close (within 24 hours / 86400s)
-            // 3. Total parts must match
-            // 4. Versions must match (treating None as v1)
-            // 5. For singletons (total=1), Subject must match (fuzzy) to avoid merging unrelated patches
+            let patches_reply_to_new_cover = if part_index == 0 && existing_subject_index > 0 {
+                let mut p_rows = self
+                    .conn
+                    .query(
+                        "SELECT 1 FROM patches p JOIN messages m ON m.message_id = p.message_id WHERE p.patchset_id = ? AND m.in_reply_to = ? LIMIT 1",
+                        libsql::params![id, message_id],
+                    )
+                    .await?;
+                p_rows.next().await.ok().flatten().is_some()
+            } else {
+                false
+            };
 
-            let v_new = version.unwrap_or(1);
-            let v_old = existing_version.unwrap_or(1);
-            let versions_compatible = v_new == v_old;
+            let same_thread = existing_thread_id == Some(thread_id);
+            let versions_compatible = Self::versions_are_compatible(
+                existing_version,
+                existing_subject_index,
+                &existing_status,
+                version,
+                part_index,
+                same_thread,
+                msgid_prefix_match || patches_reply_to_new_cover,
+            );
+
+            // Relaxed author check logic
+            let author_match = crate::patch::authors_match(&existing_author, author);
+            let series_match = (total_parts > 1 && total_parts == existing_total)
+                || existing_total == 1
+                || total_parts == 1;
+
+            let author_or_series_match = if strict_author {
+                author_match
+            } else {
+                author_match || series_match
+            };
+
+            if Self::is_closed_to_new_parts(&existing_status, existing_received, existing_total) {
+                if is_duplicate {
+                    return Ok(Some(id));
+                }
+                let is_late_own_cover = part_index == 0
+                    && existing_subject_index > 0
+                    && (patches_reply_to_new_cover || msgid_prefix_match)
+                    && versions_compatible
+                    && author_or_series_match
+                    && !index_collision;
+                if is_late_own_cover {
+                    if let Some(clid) = cover_letter_message_id {
+                        self.adopt_series_identity(id, clid, 0, false).await?;
+                    }
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET subject = ?, subject_index = 0 WHERE id = ? AND subject_index > 0",
+                            libsql::params![subject, id],
+                        )
+                        .await?;
+                    return Ok(Some(id));
+                }
+                continue;
+            }
+
+            // If the patchset is already full, do not merge more patches into it,
+            // UNLESS it is a duplicate of a message already in the set, or it is
+            // the 0/N cover letter arriving for an incomplete/pending series that
+            // has no cover letter yet (existing_subject_index > 0).
+            if existing_received >= existing_total
+                && !is_duplicate
+                && (part_index != 0 || existing_subject_index == 0)
+            {
+                continue;
+            }
 
             let is_singleton = total_parts == 1;
             // For singletons, we require the subject to be somewhat similar to avoid merging unrelated patches.
@@ -4990,20 +5230,7 @@ impl Database {
                 }
             };
 
-            // Relaxed author check logic
-            let author_match = crate::patch::authors_match(&existing_author, author);
-            let series_match = (total_parts > 1 && total_parts == existing_total)
-                || existing_total == 1
-                || total_parts == 1;
-
-            let author_or_series_match = if strict_author {
-                author_match
-            } else {
-                author_match || series_match
-            };
-
             // Prefix matching (to separate different series from same author)
-            let same_thread = existing_thread_id == Some(thread_id);
             let prefix_match = if same_thread {
                 true // Trust thread
             } else {
@@ -5019,38 +5246,78 @@ impl Database {
 
             if author_or_series_match
                 && (!strict_author || (date - existing_date).abs() < 86400)
-                && (versions_compatible || same_thread)
+                && versions_compatible
                 && (total_parts == existing_total || existing_total == 1 || total_parts == 1)
                 && subject_match
                 && prefix_match
                 && thread_compatible
                 && !index_collision
             {
-                matches.push((
+                matches.push(CandidateMatch {
                     id,
-                    existing_subject_index,
-                    existing_baseline_id,
-                    existing_baseline_part,
-                ));
+                    subject: existing_subject,
+                    subject_index: existing_subject_index,
+                    cover_id: existing_cover_id,
+                    baseline_id: existing_baseline_id,
+                    baseline_part: existing_baseline_part,
+                });
             }
         }
 
         if !matches.is_empty() {
-            // Sort matches to pick the "best" one to keep (e.g. oldest ID or one with lowest subject index)
-            // Let's keep the one with the lowest ID (created first)
-            matches.sort_by_key(|k| k.0);
+            // Keep the row with the lowest ID (created first) as the primary target
+            matches.sort_by_key(|k| k.id);
 
-            let target_id = matches[0].0;
-            let mut current_subject_index = matches[0].1;
+            let target_id = matches[0].id;
+            let mut current_subject_index = matches[0].subject_index;
+            let mut best_merged_subject: Option<(u32, String)> = None;
+            let mut merged_cover_ids: Vec<String> = Vec::new();
 
             // If we have multiple matches, merge others into target_id
             if matches.len() > 1 {
                 let tx = self.conn.transaction().await?;
-                for (merge_from_id, merge_subject_index, merge_baseline_id, merge_baseline_part) in
-                    matches.iter().skip(1)
-                {
-                    let merge_from_id = *merge_from_id;
+                for merge_from in matches.iter().skip(1) {
+                    let merge_from_id = merge_from.id;
                     info!("Merging patchset {} into {}", merge_from_id, target_id);
+
+                    // Re-point any bugs referencing duplicate patches before deleting them
+                    tx.execute(
+                        "UPDATE bugs
+                            SET discovered_in_patch_id = (
+                                    SELECT tp.id
+                                      FROM patches tp
+                                      JOIN patches mp ON mp.message_id = tp.message_id
+                                     WHERE tp.patchset_id = ?
+                                       AND mp.id = bugs.discovered_in_patch_id
+                                )
+                          WHERE discovered_in_patch_id IN (
+                                    SELECT mp.id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
+                                )",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    tx.execute(
+                        "UPDATE reviews
+                            SET patch_id = (
+                                    SELECT tp.id
+                                      FROM patches tp
+                                      JOIN patches mp ON mp.message_id = tp.message_id
+                                     WHERE tp.patchset_id = ?
+                                       AND mp.id = reviews.patch_id
+                                )
+                          WHERE patch_id IN (
+                                    SELECT mp.id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
+                                )",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
 
                     // Reassign patches: first remove duplicates that already exist on target_id
                     // to prevent unique constraint conflicts and lingering foreign key references.
@@ -5063,6 +5330,13 @@ impl Database {
                     // Reassign remaining patches
                     tx.execute(
                         "UPDATE OR IGNORE patches SET patchset_id = ? WHERE patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+
+                    // Reassign bugs discovered in merge_from_id
+                    tx.execute(
+                        "UPDATE bugs SET discovered_in_patchset_id = ? WHERE discovered_in_patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
@@ -5087,15 +5361,21 @@ impl Database {
                     )
                     .await?;
 
-                    // If the merged patchset had a better subject index, track it
-                    if *merge_subject_index < current_subject_index {
-                        current_subject_index = *merge_subject_index;
+                    // Track the best subject across merged rows
+                    if merge_from.subject_index < current_subject_index {
+                        current_subject_index = merge_from.subject_index;
+                        best_merged_subject =
+                            Some((merge_from.subject_index, merge_from.subject.clone()));
+                    }
+
+                    if let Some(ref m_clid) = merge_from.cover_id {
+                        merged_cover_ids.push(m_clid.clone());
                     }
 
                     // A baseline from a lower-numbered part than the target's
                     // is lost when the row is deleted below, with no part left
                     // to supply it again.
-                    if let Some(bid) = *merge_baseline_id {
+                    if let Some(bid) = merge_from.baseline_id {
                         tx.execute(
                             "UPDATE patchsets SET baseline_id = ?, baseline_part_index = ?
                              WHERE id = ?
@@ -5104,9 +5384,9 @@ impl Database {
                                     OR ? <= baseline_part_index)",
                             libsql::params![
                                 bid,
-                                *merge_baseline_part,
+                                merge_from.baseline_part,
                                 target_id,
-                                *merge_baseline_part
+                                merge_from.baseline_part
                             ],
                         )
                         .await?;
@@ -5119,7 +5399,29 @@ impl Database {
                     )
                     .await?;
                 }
+
+                if let Some((merged_idx, ref merged_subj)) = best_merged_subject {
+                    tx.execute(
+                        "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
+                        libsql::params![merged_subj.as_str(), merged_idx, target_id],
+                    )
+                    .await?;
+                }
+
                 tx.commit().await?;
+
+                // Adopt the best series identity across all merged rows now that
+                // redundant rows have been deleted and all patches are attached to target_id.
+                for m_clid in merged_cover_ids {
+                    let m_part_idx = self.identity_part_index(target_id, &m_clid).await?;
+                    self.adopt_series_identity(
+                        target_id,
+                        &m_clid,
+                        m_part_idx.unwrap_or(0),
+                        m_part_idx.is_some(),
+                    )
+                    .await?;
+                }
             }
 
             // Update the target patchset
@@ -5140,30 +5442,20 @@ impl Database {
                     .await?;
             }
 
-            // Conditionally update subject
-            // Note: We check against the best index found among all merged sets OR the new part_index
+            // Adopt identity before updating subject_index so adopt_series_identity
+            // sees whether target_id already had a 0/N cover letter prior to this message.
+            if let Some(clid) = cover_letter_message_id {
+                self.adopt_series_identity(target_id, clid, part_index, is_own_part_id)
+                    .await?;
+            }
+
+            // Conditionally update subject if the newly arrived message has an even better index
             if part_index < current_subject_index {
                 self.conn
                     .execute(
                         "UPDATE patchsets SET subject = ?, subject_index = ? WHERE id = ?",
                         libsql::params![subject, part_index, target_id],
                     )
-                    .await?;
-            } else if matches.len() > 1 {
-                // If we merged, we might need to update the subject index of the target to the best one we found.
-                // But we don't have the subject string from the merged one easily available here.
-                // However, the existing target subject is likely fine unless part_index is better.
-                // Update subject_index to be correct if a better one was merged.
-                // Actually, if matches[i].1 was better, we should have used its subject.
-                // But that's complicated. Assuming the target (oldest) usually has the cover letter or we eventually find it.
-                // Simplification: We only update if CURRENT patch is better.
-                // If we merged a patchset that HAD the cover letter, we ideally want that subject.
-                // But we lost it.
-                // TODO: Optimize merge subject selection. For now, this is better than duplicates.
-            }
-
-            if let Some(clid) = cover_letter_message_id {
-                self.adopt_series_identity(target_id, clid, identity_from_own_part)
                     .await?;
             }
 
@@ -5188,12 +5480,55 @@ impl Database {
             return Ok(Some(target_id));
         }
 
-        // No match found, create new patchset
+        // No match found, create new patchset.
+        // Never insert a new patchset claiming a cover_letter_message_id that is
+        // already owned by another patchset row; fall back to this message's own ID.
+        let mut final_cover_id = cover_letter_message_id.map(|s| s.to_string());
+        if let Some(ref clid) = final_cover_id {
+            let mut owner_rows = self
+                .conn
+                .query(
+                    "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? LIMIT 1",
+                    libsql::params![clid.as_str()],
+                )
+                .await?;
+            if owner_rows.next().await.ok().flatten().is_some() {
+                if clid != message_id {
+                    let mut self_owner = self
+                        .conn
+                        .query(
+                            "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? LIMIT 1",
+                            libsql::params![message_id],
+                        )
+                        .await?;
+                    if self_owner.next().await.ok().flatten().is_none() {
+                        info!(
+                            "Message {} belongs to a series named {}, which another patchset holds; naming the new series after itself",
+                            message_id, clid
+                        );
+                        final_cover_id = Some(message_id.to_string());
+                    } else {
+                        warn!(
+                            "Both {} and this message's own id are held by other patchsets; the new series is left without a name and is reachable only through its patches",
+                            clid
+                        );
+                        final_cover_id = None;
+                    }
+                } else {
+                    warn!(
+                        "Message id {} is held by another patchset; the new series is left without a name and is reachable only through its patches",
+                        clid
+                    );
+                    final_cover_id = None;
+                }
+            }
+        }
+
         let mut rows = self.conn
             .query(
                 "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters)
                  VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, cover_letter_message_id, subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
+                libsql::params![thread_id, final_cover_id.as_deref(), subject, author, date, total_parts, parser_version, to, cc, part_index, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
             )
             .await?;
 
@@ -5379,6 +5714,28 @@ impl Database {
         self.conn
             .execute(
                 "UPDATE patchsets SET embargo_until = ? WHERE id = ?",
+                libsql::params![embargo_until, id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Embargo a patchset, unless it is one a message can no longer change.
+    ///
+    /// A series that has been reviewed has had its embargo decided already,
+    /// and an embargo placed on it afterwards would hold back nothing while
+    /// showing the series as Embargoed.
+    pub async fn set_patchset_embargo_until_if_non_terminal(
+        &self,
+        id: i64,
+        embargo_until: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE patchsets SET embargo_until = ?
+                     WHERE id = ? AND NOT {CLOSED_TO_NEW_PARTS_SQL}"
+                ),
                 libsql::params![embargo_until, id],
             )
             .await?;
@@ -13142,7 +13499,6 @@ mod tests {
         assert_eq!(series_identity(&db, 2).await, own_patch);
     }
 
-
     /// Migration 7 folds an empty Incomplete cover-letter row into its
     /// Reviewed sibling series when every patch of that series has an
     /// email_outbox row, and leaves rows without an outbox entry untouched.
@@ -13227,7 +13583,6 @@ mod tests {
             "migration 7 must not overwrite a series that already has its own cover letter"
         );
     }
-
 
     /// Verify that has_patchset_by_msgid detects patchsets by bare SHA
     /// for synthetic @sashiko.local cover letters and for patches in the patches table.
@@ -15357,5 +15712,850 @@ mod tests {
         // Check dedicated enrichment query method
         let enrichments = db.get_bug_enrichments(bug_id).await.unwrap();
         assert_eq!(enrichments.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn test_patch_replying_to_earlier_cover_does_not_overwrite_own_cover() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("v1_cover", "Sensor fixes", 1000)
+            .await
+            .unwrap();
+        let author = "Sensor Dev <dev@example.com>";
+
+        // 1. Ingest v1 cover letter and patches
+        for (msg_id, subj, ts) in [
+            ("v1_cover", "[PATCH 0/2] hwmon: sensor fixes", 1000),
+            ("v1_p1", "[PATCH 1/2] hwmon: part 1", 1001),
+            ("v1_p2", "[PATCH 2/2] hwmon: part 2", 1002),
+            ("v2_cover", "[PATCH v2 0/2] hwmon: sensor fixes", 2000),
+            ("v2_p1", "[PATCH v2 1/2] hwmon: part 1", 2001),
+            ("v2_p2", "[PATCH v2 2/2] hwmon: fix validation", 2100),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let ps_v1 = db
+            .create_patchset(
+                thread_id,
+                Some("v1_cover"),
+                "v1_cover",
+                "[PATCH 0/2] hwmon: sensor fixes",
+                author,
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_v1, "v1_p1", 1, "diff1").await.unwrap();
+        db.create_patch(ps_v1, "v1_p2", 2, "diff2").await.unwrap();
+
+        // 2. Ingest v2 cover letter and patch 1 in the same thread
+        let ps_v2 = db
+            .create_patchset(
+                thread_id,
+                Some("v2_cover"),
+                "v2_cover",
+                "[PATCH v2 0/2] hwmon: sensor fixes",
+                author,
+                2000,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(ps_v1, ps_v2);
+        db.create_patch(ps_v2, "v2_p1", 1, "diff1_v2")
+            .await
+            .unwrap();
+
+        // 3. v2 patch 2 arrives with In-Reply-To pointing to v1_cover
+        let ps_v2_p2 = db
+            .create_patchset(
+                thread_id,
+                Some("v1_cover"),
+                "v2_p2",
+                "[PATCH v2 2/2] hwmon: fix validation",
+                author,
+                2100,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_v2_p2, ps_v2);
+
+        // Verify v2 kept its own cover_letter_message_id ("v2_cover")
+        let det_v2 = db
+            .get_patchset_details(ps_v2, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det_v2["message_id"], "v2_cover");
+        assert_eq!(
+            db.find_patchset_id_by_msgid("v2_cover").await.unwrap(),
+            Some(ps_v2)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_v2_in_same_thread_does_not_merge_into_incomplete_v1() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("v1_root", "Series Thread", 10000)
+            .await
+            .unwrap();
+        let author = "Kernel Dev <kdev@example.com>";
+
+        for (msg_id, subj, ts) in [
+            ("v1_0", "[PATCH 0/2] Series", 10000),
+            ("v1_1", "[PATCH 1/2] Part 1", 10001),
+            ("v2_0", "[PATCH v2 0/2] Series", 11000),
+            ("v2_2", "[PATCH v2 2/2] Part 2", 11010),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // 1. Incomplete v1 (missing part 2/2)
+        let ps_v1 = db
+            .create_patchset(
+                thread_id,
+                Some("v1_0"),
+                "v1_0",
+                "[PATCH 0/2] Series",
+                author,
+                10000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_v1, "v1_1", 1, "diff1").await.unwrap();
+
+        // 2. v2 posted in the same thread
+        let ps_v2_0 = db
+            .create_patchset(
+                thread_id,
+                Some("v2_0"),
+                "v2_0",
+                "[PATCH v2 0/2] Series",
+                author,
+                11000,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(ps_v1, ps_v2_0);
+
+        // 3. v2 part 2 arrives; must attach to v2 and NEVER merge into incomplete v1
+        let ps_v2_2 = db
+            .create_patchset(
+                thread_id,
+                Some("v2_2"),
+                "v2_2",
+                "[PATCH v2 2/2] Part 2",
+                author,
+                11010,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_v2_2, ps_v2_0);
+        assert_ne!(ps_v2_2, ps_v1);
+    }
+
+    #[tokio::test]
+    async fn test_cover_letter_does_not_hijack_reviewed_coverless_series() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("p1_msg", "Coverless Series", 5000)
+            .await
+            .unwrap();
+        let author = "Author <a@example.com>";
+
+        for (msg_id, subj, ts) in [
+            ("p1_msg", "[PATCH 1/2] Part 1", 5000),
+            ("p2_msg", "[PATCH 2/2] Part 2", 5001),
+            ("new_cover", "[PATCH v2 0/2] Cover", 6000),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // 1. Coverless v1 series (1/2 and 2/2), marked Reviewed
+        let ps_v1 = db
+            .create_patchset(
+                thread_id,
+                Some("p1_msg"),
+                "p1_msg",
+                "[PATCH 1/2] Part 1",
+                author,
+                5000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_v1, "p1_msg", 1, "diff1").await.unwrap();
+        db.create_patch(ps_v1, "p2_msg", 2, "diff2").await.unwrap();
+        db.update_patchset_status(ps_v1, "Reviewed").await.unwrap();
+
+        // 2. A cover letter arrives later in the same thread
+        let ps_new = db
+            .create_patchset(
+                thread_id,
+                Some("new_cover"),
+                "new_cover",
+                "[PATCH v2 0/2] Cover",
+                author,
+                6000,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(ps_v1, ps_new);
+
+        // Verify the Reviewed v1 series kept its original identity and subject
+        let det_v1 = db
+            .get_patchset_details(ps_v1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det_v1["message_id"], "p1_msg");
+        assert_eq!(det_v1["subject"], "[PATCH 1/2] Part 1");
+        assert_eq!(
+            db.find_patchset_id_by_msgid("new_cover").await.unwrap(),
+            Some(ps_new)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_match_merge_preserves_cover_letter_from_newer_row() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("merge_root", "Merge Cover Test", 10000)
+            .await
+            .unwrap();
+        let author = "Merger <m@example.com>";
+
+        for (msg_id, subj, ts) in [
+            ("msg_2", "[PATCH 2/3] Part 2", 10000),
+            ("msg_0", "[PATCH 0/3] The Cover Letter", 120000),
+            ("msg_1", "[PATCH 1/3] Part 1", 65000),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // 1. Part 2/3 arrives first at t=10000 -> creates row A (lowest id)
+        let ps_a = db
+            .create_patchset(
+                thread_id,
+                Some("msg_2"),
+                "msg_2",
+                "[PATCH 2/3] Part 2",
+                author,
+                10000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // 2. Cover letter 0/3 arrives at t=120000 (> 86400s gap) -> creates disjoint row B
+        let ps_b = db
+            .create_patchset(
+                thread_id,
+                Some("msg_0"),
+                "msg_0",
+                "[PATCH 0/3] The Cover Letter",
+                author,
+                120000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(ps_a, ps_b);
+
+        // 3. Part 1/3 arrives at bridging time t=65000 -> merges row B into row A
+        let ps_merged = db
+            .create_patchset(
+                thread_id,
+                Some("msg_1"),
+                "msg_1",
+                "[PATCH 1/3] Part 1",
+                author,
+                65000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_merged, ps_a);
+
+        // Surviving row A must have inherited the cover letter identity and subject from row B
+        let det = db
+            .get_patchset_details(ps_a, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["message_id"], "msg_0");
+        assert_eq!(det["subject"], "[PATCH 0/3] The Cover Letter");
+        assert_eq!(
+            db.find_patchset_id_by_msgid("msg_0").await.unwrap(),
+            Some(ps_a)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_late_cover_letter_attaches_to_reviewed_series_without_reopening() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("msg_0", "[PATCH 0/2] Cover Letter", 1000)
+            .await
+            .unwrap();
+
+        // Patches 1/2 and 2/2 arrive first, replying to cover letter msg_0
+        db.create_message(
+            "msg_1",
+            thread_id,
+            Some("msg_0"),
+            "Author <a@b.c>",
+            "[PATCH 1/2] Part 1",
+            1001,
+            "body 1",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg_1"),
+                "msg_1",
+                "[PATCH 1/2] Part 1",
+                "Author <a@b.c>",
+                1001,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_id, "msg_1", 1, "diff 1").await.unwrap();
+
+        db.create_message(
+            "msg_2",
+            thread_id,
+            Some("msg_0"),
+            "Author <a@b.c>",
+            "[PATCH 2/2] Part 2",
+            1002,
+            "body 2",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id_2 = db
+            .create_patchset(
+                thread_id,
+                Some("msg_2"),
+                "msg_2",
+                "[PATCH 2/2] Part 2",
+                "Author <a@b.c>",
+                1002,
+                2,
+                1,
+                "",
+                "",
+                None,
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_id, ps_id_2);
+        db.create_patch(ps_id, "msg_2", 2, "diff 2").await.unwrap();
+
+        // Mark series as Reviewed
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        // Late cover letter 0/2 arrives
+        db.create_message(
+            "msg_0",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH 0/2] Cover Letter",
+            2000,
+            "cover body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let cover_ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg_0"),
+                "msg_0",
+                "[PATCH 0/2] Cover Letter",
+                "Author <a@b.c>",
+                2000,
+                2,
+                0,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cover_ps_id, ps_id);
+
+        // Embargo update if non-terminal should be a no-op on Reviewed patchset
+        db.set_patchset_embargo_until_if_non_terminal(ps_id, 999999)
+            .await
+            .unwrap();
+
+        let det = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(det["message_id"], "msg_0");
+        assert_eq!(det["subject"], "[PATCH 0/2] Cover Letter");
+        assert_eq!(det["status"], "Reviewed");
+        assert!(det["embargo_until"].is_null());
+
+        // Ensure no extra shadow row was created
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM patchsets", ())
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_replacement_patch_does_not_collide_on_cover_letter_id() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("msg_0", "[PATCH 0/2] Series", 1000)
+            .await
+            .unwrap();
+        let author = "Author <a@b.c>";
+
+        for (msg_id, subj, ts) in [
+            ("msg_0", "[PATCH 0/2] Series", 1000),
+            ("msg_1", "[PATCH 1/2] Part 1", 1001),
+            ("msg_1_v2", "[PATCH 1/2] Part 1 replacement", 1050),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Cover letter 0/2 and patch 1/2 arrive
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg_0"),
+                "msg_0",
+                "[PATCH 0/2] Series",
+                author,
+                1000,
+                2,
+                0,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps_id, "msg_1", 1, "diff 1").await.unwrap();
+
+        // Replacement patch 1/2 arrives replying to msg_0 -> index_collision on part 1
+        let rep_ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg_0"),
+                "msg_1_v2",
+                "[PATCH 1/2] Part 1 replacement",
+                author,
+                1050,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(rep_ps_id, ps_id);
+
+        // Original patchset still owns msg_0; replacement patchset owns msg_1_v2
+        assert_eq!(
+            db.find_patchset_id_by_msgid("msg_0").await.unwrap(),
+            Some(ps_id)
+        );
+        let rep_det = db
+            .get_patchset_details(rep_ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rep_det["message_id"], "msg_1_v2");
+    }
+
+    #[tokio::test]
+    async fn test_multirow_merge_preserves_cover_letter_and_bug_provenance() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("msg_0", "[PATCH 0/3] Series", 1000)
+            .await
+            .unwrap();
+        let author = "Author <a@b.c>";
+
+        for (msg_id, subj, ts) in [
+            ("msg_1", "[PATCH 1/3] Part 1", 1000),
+            ("msg_0", "[PATCH 0/3] Cover", 100000),
+            ("msg_3", "[PATCH 3/3] Part 3", 55000),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // Row A created by patch 1/3 at t=1000 (named after msg_1, subject_index = 1)
+        let ps_a = db
+            .create_patchset(
+                thread_id,
+                Some("msg_1"),
+                "msg_1",
+                "[PATCH 1/3] Part 1",
+                author,
+                1000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let p1_a = db.create_patch(ps_a, "msg_1", 1, "diff 1").await.unwrap();
+
+        // Row B created at t=100000 by cover letter 0/3 (named after msg_0),
+        // then patch 2/3 and duplicate patch 1/3 are attached to Row B,
+        // and Row B's subject_index happens to be 2.
+        let ps_b = db
+            .create_patchset(
+                thread_id,
+                Some("msg_0"),
+                "msg_0",
+                "[PATCH 0/3] Cover",
+                author,
+                100000,
+                3,
+                0,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        // Force ps_b to have subject_index = 2 while retaining cover_letter_message_id = msg_0
+        db.conn
+            .execute(
+                "UPDATE patchsets SET subject_index = 2, subject = '[PATCH 2/3] Part 2' WHERE id = ?",
+                libsql::params![ps_b],
+            )
+            .await
+            .unwrap();
+        let p1_b = db.create_patch(ps_b, "msg_1", 1, "diff 1").await.unwrap();
+
+        // Attach a bug referencing ps_b and duplicate patch p1_b
+        db.conn
+            .execute(
+                "INSERT INTO bugs (bugid, title, reporter, reported_at, created_at, updated_at, discovered_in_patchset_id, discovered_in_patch_id)
+                 VALUES ('bug-merge-test', 'test bug', 'tester@example.com', 1000, 1000, 1000, ?, ?)",
+                libsql::params![ps_b, p1_b],
+            )
+            .await
+            .unwrap();
+
+        // Bridging patch 3/3 arrives at t=55000 -> merges ps_b into ps_a
+        let ps_merged = db
+            .create_patchset(
+                thread_id,
+                Some("msg_3"),
+                "msg_3",
+                "[PATCH 3/3] Part 3",
+                author,
+                55000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                3,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_merged, ps_a);
+
+        // ps_a should have adopted msg_0 cover letter from ps_b despite ps_b having subject_index = 2 > ps_a's 1
+        assert_eq!(
+            db.find_patchset_id_by_msgid("msg_0").await.unwrap(),
+            Some(ps_a)
+        );
+
+        // Bug provenance should now point to ps_a and surviving patch p1_a
+        let mut bug_rows = db
+            .conn
+            .query(
+                "SELECT discovered_in_patchset_id, discovered_in_patch_id FROM bugs WHERE bugid = 'bug-merge-test'",
+                (),
+            )
+            .await
+            .unwrap();
+        let bug_row = bug_rows.next().await.unwrap().unwrap();
+        let bug_ps_id: i64 = bug_row.get(0).unwrap();
+        let bug_patch_id: i64 = bug_row.get(1).unwrap();
+        assert_eq!(bug_ps_id, ps_a);
+        assert_eq!(bug_patch_id, p1_a);
+    }
+
+    /// A patchset that is closed to new parts has to look closed to the
+    /// statements that ask in SQL as well, or an embargo lands on a series
+    /// the merge scan has already stopped feeding.
+    #[tokio::test]
+    async fn test_closed_to_new_parts_agrees_with_its_sql_form() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("predicate@example.com", "A subject", 1000)
+            .await
+            .unwrap();
+
+        let statuses = [
+            "Incomplete",
+            "Pending",
+            "In Review",
+            "Cancelled",
+            "Skipped",
+            "Reviewed",
+            "Failed",
+            "Failed To Apply",
+            "Fetching",
+        ];
+
+        for (index, status) in statuses.iter().enumerate() {
+            for (received, total) in [(0_u32, 3_u32), (3, 3)] {
+                let id = 100 + (index as i64 * 10) + i64::from(received);
+                db.conn
+                    .execute(
+                        "INSERT INTO patchsets (id, thread_id, subject, author, date, status,
+                                                total_parts, received_parts)
+                         VALUES (?, ?, 'A subject', 'An Author', 1000, ?, ?, ?)",
+                        libsql::params![id, thread_id, *status, total, received],
+                    )
+                    .await
+                    .unwrap();
+
+                let mut rows = db
+                    .conn
+                    .query(
+                        &format!("SELECT {CLOSED_TO_NEW_PARTS_SQL} FROM patchsets WHERE id = ?"),
+                        libsql::params![id],
+                    )
+                    .await
+                    .unwrap();
+                let sql_says: bool =
+                    rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap() != 0;
+
+                assert_eq!(
+                    Database::is_closed_to_new_parts(status, received, total),
+                    sql_says,
+                    "the two forms of the predicate disagree about {status} at {received}/{total}"
+                );
+            }
+        }
     }
 }

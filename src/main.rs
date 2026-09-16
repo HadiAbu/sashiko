@@ -2235,7 +2235,7 @@ async fn process_parsed_article(
                 #[allow(clippy::collapsible_if)]
                 if let Some(until) = embargo_until {
                     if let Err(e) = worker_db
-                        .set_patchset_embargo_until(patchset_id, until)
+                        .set_patchset_embargo_until_if_non_terminal(patchset_id, until)
                         .await
                     {
                         error!(
