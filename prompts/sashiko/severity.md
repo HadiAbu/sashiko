@@ -92,6 +92,10 @@ never is.
     - Incorrect metrics, counts or progress reporting.
     - The commit message and the code disagreeing in a way that would mislead
       the next reader.
+    - Missing `Signed-off-by` trailer or using a cryptic nickname/handle instead
+      of a real human name.
+    - Missing or inadequate commit description (fails to explain *what* and
+      *why* for a non-trivial change).
     - Missing test coverage for behaviour the change introduces.
     - A performance regression a user would notice but work around.
 
@@ -103,10 +107,15 @@ never is.
 - **Examples**:
     - Typos in comments or user-facing strings.
     - Confusing naming, or a comment that no longer matches its code.
+    - Commit message formatting violations: body lines exceeding 72 characters,
+      backticks quoting code or symbols in the commit message, or internal
+      metadata tags (`TAG=`, `CONV=`).
     - Missing documentation.
     - Negligible performance differences.
 
-> Formatting, import ordering, and anything `cargo fmt` or `cargo clippy`
-> reports are not findings at all. They are caught deterministically by `make
-> lint` before a human ever sees them. Reporting them costs the reader
-> attention and gains nothing.
+> Rust source code formatting, import ordering, and anything `cargo fmt` or
+> `cargo clippy` reports on source files are not findings at all. They are
+> caught deterministically by `make lint` before a human ever sees them.
+> However, commit message issues (missing real-name `Signed-off-by`, missing
+> description of what/why, lines > 72 chars, backticks in commit message) are
+> NOT checked by `cargo fmt` and MUST be reported.

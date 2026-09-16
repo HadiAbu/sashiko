@@ -123,12 +123,16 @@ Target Commit:
 // Stage Instructions
 // ---------------------------------------------------------------------------
 
-const STAGE_GOAL_INSTRUCTION: &str = r#"# Analyze commit main goal and architecture
+const STAGE_GOAL_INSTRUCTION: &str = r#"# Analyze commit main goal, architecture, and commit message quality
 
-You are a principal engineer evaluating the high-level intent and architectural soundness of a proposed Sashiko commit. Enforce Sashiko's strict priority hierarchy: User Experience (UX) > Data Integrity > Security > Everything else.
+You are a principal engineer evaluating the high-level intent, architectural soundness, and commit message quality of a proposed Sashiko commit. Enforce Sashiko's strict priority hierarchy: User Experience (UX) > Data Integrity > Security > Everything else.
 - Global UX & Regressions: If the change can affect the user experience globally (CLI ergonomics, review output clarity/false-positive rate, progress display, or web UI/API behavior), apply maximum scrutiny and reject regressions.
 - Benchmark Backing for Review-Wide Changes: If the change meaningfully affects all reviews across the board (e.g. global prompts, stage instructions, workflow graph structure, planner logic, or verification/deduplication rules), verify whether it is backed up by benchmark evaluation data (`benchmarks/`). Flag review-affecting changes that lack benchmark validation or risk degrading detection rate or precision.
-- Architectural Boundaries: Check whether the change violates instance isolation, leaks project-specific assumptions into generic engines, or introduces subtle regressions in daemon/worker coordination."#;
+- Architectural Boundaries: Check whether the change violates instance isolation, leaks project-specific assumptions into generic engines, or introduces subtle regressions in daemon/worker coordination.
+- Commit Message Audit (Mandatory): Inspect the commit message header, body, and trailers in the patch:
+  1. Signed-off-by with Real Name: Verify a `Signed-off-by: Real Name <email>` trailer is present and uses a real human name (first and last name), NOT a single-word handle, cryptic nickname, username, or AI/bot placeholder.
+  2. Substantive Description (What & Why): Verify the commit body clearly explains both *what* changed and *why* it is needed (rationale/motivation). Flag missing bodies on non-trivial commits or descriptions that merely parrot the diff without explaining why.
+  3. Commit Message Formatting: Flag commit message body lines exceeding 72 characters, backticks (`) used to quote code/functions/variables/filenames in the commit message, or internal metadata tags (such as `TAG=` or `CONV=`)."#;
 
 const STAGE_IMPLEMENTATION_INSTRUCTION: &str = r#"# Verify implementation against intent
 

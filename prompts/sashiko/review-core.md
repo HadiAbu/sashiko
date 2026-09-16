@@ -103,14 +103,28 @@ Sashiko's worst failure mode is silence: a review that produces no findings
 looks identical to a clean patch. Treat any bug that quietly drops stage outputs,
 skips validation, or swallows errors without failing as high severity.
 
+**7. Commit Message Hygiene, Description, and Sign-Off.**
+Every commit message must meet Sashiko's repository standards:
+- **Real-Name Signed-off-by (DCO):** Every commit must include a
+  `Signed-off-by: Full Name <email>` trailer with the author's real human name
+  (not a cryptic nickname, single-word handle, username, or AI/bot placeholder).
+- **Clear Description (What & Why):** The commit body must explain both *what*
+  the change does and *why* it is necessary (motivation/rationale), rather than
+  having an empty body or merely repeating the diff.
+- **Formatting & Wrapping:** Commit message lines must not exceed 72 characters,
+  must never use backticks (`) to quote code, function names, or variables, and
+  must not contain internal metadata tags (such as `TAG=` or `CONV=`).
+
 ## How to review here
 
 - **Verify against concrete code, not assumptions.** Read the subsystem guide
   for the area the diff touches and check every invariant. Do not give code the
   benefit of the doubt: if a check is removed or weakened, verify the caller
   with tools rather than assuming safety.
-- **`cargo` and `clippy` have already run.** Formatting, unused imports, and
-  ordinary compiler/clippy lints are not findings. Focus on architectural,
-  behavioral, concurrency, persistence, and security defects.
+- **`cargo` and `clippy` have already run on Rust source code.** Rust source
+  formatting, unused imports, and compiler/clippy lints are not findings.
+  However, *commit message* defects (missing/nickname SOB, missing rationale,
+  lines > 72 chars, backticks in commit message) are NOT caught by `cargo fmt`
+  and MUST be reported.
 - **Prefer one proven finding to three speculative ones.** Every false positive
   spends the author's trust.

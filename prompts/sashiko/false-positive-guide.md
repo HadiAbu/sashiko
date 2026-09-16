@@ -21,9 +21,16 @@ no terminal state is a bug even if it has not stuck yet.
 
 ### 1. The linter already ran
 
-`make lint` runs `cargo clippy` and `cargo fmt` before any human sees the
-change. Do not report formatting, naming, import order, `needless_borrow`,
-missing `#[derive]`, redundant clones, or anything else clippy emits.
+`make lint` runs `cargo clippy` and `cargo fmt` on Rust source files before any
+human sees the change. Do not report source code formatting, naming, import
+order, `needless_borrow`, missing `#[derive]`, redundant clones, or anything
+else clippy emits on Rust source files.
+
+Note: `make lint` does NOT check commit messages. Commit message defects —
+such as missing or cryptic/nickname `Signed-off-by` trailers, missing
+explanation of *what* and *why*, lines exceeding 72 characters, backticks
+quoting code/symbols in the commit message, or internal metadata tags (`TAG=`,
+`CONV=`) — are valid findings and must NOT be dismissed as linter issues.
 
 - Bad: "Consider using `iter()` instead of `into_iter()` here."
 - Bad: "This `clone()` looks unnecessary."
