@@ -835,7 +835,8 @@ pub struct LocalReviewSettings {
 }
 impl Settings {
     pub fn new() -> Result<Self, ConfigError> {
-        Self::from_file("Settings")
+        let path = std::env::var("SASHIKO_CONFIG").unwrap_or_else(|_| "Settings".to_string());
+        Self::from_file(path)
     }
 
     /// Refuses a configuration that would mail sign-in links nobody can open.
