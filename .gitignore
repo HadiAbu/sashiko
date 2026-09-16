@@ -19,4 +19,5 @@ email_policy.toml
 .claude/
 benchmark_results*.json
 .sashiko-local-token
+.sashiko/
 
