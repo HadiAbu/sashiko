@@ -209,10 +209,11 @@ For each remaining concern, use the available Git and file tools to inspect the 
 - If concrete code proves the concern is a false positive, drop it.
 - For each verified issue, assign an accurate severity (`Critical`, `High`, `Medium`, or `Low`) strictly following `severity.md`, and formulate a concise bug title (`problem`) under 80 characters starting with a Sashiko component prefix (e.g. `workflow:`, `db:`, `reviewer:`, `toolbox:`, `api:`, `cli:`)."#;
 
-const STAGE_REPORT_INSTRUCTION: &str = r#"# Generate GitHub Pull Request review summary
+const STAGE_REPORT_INSTRUCTION: &str = r#"# Generate plain-text inline review report
 
-Generate the short Markdown summary body for this review following the exact rules and structure in `github-summary-template.md`.
-- Remember: individual anchored findings are posted separately as inline review comments by the Rust orchestrator. Do NOT repeat anchored findings in full here; provide the one-sentence summary of the change, the verdict line, any unanchored findings, and any pre-existing issues."#;
+Generate the plain-text inline review report following the exact formatting rules and structure in `github-summary-template.md`.
+- Include a brief 1-2 sentence summary of the change, the verdict line, and a plain list of ALL findings with their `[Severity: <Level>]` tags, file/symbol locations, and concise problem descriptions.
+- Do NOT use backticks, markdown code blocks, or markdown headings. Wrap all prose lines at 78 characters or fewer."#;
 
 const CONCERN_JSON_SCHEMA_EXAMPLE: &str = r#"Return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
 Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
@@ -459,33 +460,46 @@ fn format_concerns_feedback(violation: &str) -> String {
 
 fn validate_github_summary_format(
     content: &str,
-    _state: &SashikoPatchReviewState,
+    state: &SashikoPatchReviewState,
 ) -> Result<(), String> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return Err("The review summary cannot be empty.".to_string());
     }
-    if trimmed.starts_with("```") {
+    if trimmed.contains('`') {
         return Err(
-            "Do not wrap the entire summary in an outer markdown code block ('```'). Return raw GitHub-flavoured markdown."
+            "The report contains backticks ('`'). Use strictly plain text without backticks or markdown code blocks."
                 .to_string(),
         );
     }
     for line in trimmed.lines() {
         let l = line.trim_start();
-        if l.starts_with("# ") || l.starts_with("## ") {
+        if l.starts_with("# ") || l.starts_with("## ") || l.starts_with("### ") {
             return Err(
-                "Do not use heading levels above '###' in the pull request summary (found '# ' or '## '). Follow github-summary-template.md."
+                "Do not use markdown headings ('#') in the plain-text review report. Follow github-summary-template.md."
                     .to_string(),
             );
         }
+        if !line.starts_with("    ") && !line.starts_with('\t') && line.chars().count() > 84 {
+            return Err(format!(
+                "Line exceeds 78-character terminal width ({} chars): \"{}...\". Wrap all prose lines at 78 characters.",
+                line.chars().count(),
+                line.chars().take(40).collect::<String>()
+            ));
+        }
+    }
+    if !state.findings.is_empty() && !trimmed.contains("[Severity:") {
+        return Err(
+            "Findings were provided in state, but the report does not list them with '[Severity: <Level>]' tags. Include every finding."
+                .to_string(),
+        );
     }
     Ok(())
 }
 
 fn format_github_summary_feedback(violation: &str) -> String {
     format!(
-        "\n\nPrevious attempt was rejected: {}. Follow `github-summary-template.md`: return concise GitHub-flavoured markdown without outer code fences or headings above `###`.",
+        "\n\nPrevious attempt was rejected: {}. Follow `github-summary-template.md`: return strictly plain text without backticks or markdown headings, wrap prose lines at 78 characters, and list every finding with its '[Severity: <Level>]' tag.",
         violation
     )
 }
@@ -857,7 +871,7 @@ pub fn report_stage(max_turns: usize, temperature: f32) -> Stage<SashikoPatchRev
 Findings:
 {{{{findings}}}}
 
-Return raw GitHub-flavoured markdown output, not JSON."#
+Return strictly plain text output (no markdown, no backticks, wrapped at 78 characters), not JSON."#
             ))
             .include_file("github-summary-template.md")
             .with_var("findings", |s: &SashikoPatchReviewState| {
@@ -988,27 +1002,43 @@ mod tests {
 
     #[test]
     fn test_sashiko_github_summary_validator() {
-        let state = SashikoPatchReviewState::default();
+        let mut state = SashikoPatchReviewState::default();
         assert!(
             validate_github_summary_format(
-                "Adds `--project` support for multi-project reviews.\n\nNo issues found.",
+                "Adds project flag support for multi-project reviews.\n\nNo issues found.",
                 &state
             )
             .is_ok()
         );
-        assert!(
-            validate_github_summary_format("### Unanchored Findings\n\n1 finding: High.", &state)
-                .is_ok()
-        );
         assert!(validate_github_summary_format("   ", &state).is_err());
-        assert!(validate_github_summary_format("```markdown\nSummary\n```", &state).is_err());
+        assert!(validate_github_summary_format("Adds `backticks` here.", &state).is_err());
         assert!(
             validate_github_summary_format("# Top-level heading\nNo issues found.", &state)
                 .is_err()
         );
         assert!(
-            validate_github_summary_format("## Second-level heading\nNo issues found.", &state)
+            validate_github_summary_format("### Third-level heading\nNo issues found.", &state)
                 .is_err()
+        );
+        let long_line = "a".repeat(90);
+        assert!(validate_github_summary_format(&long_line, &state).is_err());
+
+        state
+            .findings
+            .push(json!({"severity": "High", "problem": "Test issue"}));
+        assert!(
+            validate_github_summary_format(
+                "Summary line.\n\n1 finding: highest severity High.",
+                &state
+            )
+            .is_err()
+        );
+        assert!(
+            validate_github_summary_format(
+                "Summary line.\n\n1 finding: highest severity High.\n\n[Severity: High]\nFile: src/main.rs (main)\n\nShort problem description.",
+                &state
+            )
+            .is_ok()
         );
     }
 

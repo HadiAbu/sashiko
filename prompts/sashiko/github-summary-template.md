@@ -1,76 +1,88 @@
-# Pull Request Summary Comment
+# Inline Review Report Template
 
-You are writing the summary that accompanies an automated review of a pull
-request. The individual findings are rendered separately, as inline comments
-anchored to the lines they concern — **you are not writing those**. You are
-writing the short body that sits above them.
+Produce a plain-text review report based on the findings provided.
 
-## What the summary is for
+## Text Formatting Rules (Strictly Enforced)
 
-A reader who has just been handed a list of inline comments needs three things
-from the top of the review: what the change appears to do, whether anything
-found is serious, and anything that could not be anchored to a line.
+- **Plain text only.** No markdown, no backticks (`), no markdown headings
+  (`#`), no bold/italics (`**` or `*`), and no fenced code blocks (` ``` `).
+  Never quote function names, variable names, types, or file paths in backticks.
+- **Wrap lines at 78 characters.** Every prose line, summary sentence, and
+  problem description must be hard-wrapped at 78 characters or fewer so the
+  report fits cleanly inside an 80-column terminal window.
+- **Indented code snippets only.** When illustrating a code path or call chain,
+  indent the snippet by 4 spaces on its own lines without backticks.
+- **Clear, concise paragraphs.** Never write long or dense paragraphs. Spread
+  information out into short, logical paragraphs separated by a blank line so it
+  is easy to read.
+- **NEVER EVER USE ALL CAPS.** Do not use ALL CAPS for labels, emphasis, or
+  headings. The only time uppercase words are acceptable is when referencing an
+  actual Rust constant or identifier defined in uppercase in the code.
+- **NEVER QUOTE LINE NUMBERS.** Line numbers shift across commits and worktrees
+  and are meaningless to the reader. Reference code locations strictly by file
+  path and function, method, or struct name, or by call chain
+  (for example:forge_webhook() -> create_fetching_patchset()).
+- **Factual and undramatic.** Keep wording technical, direct, and concise. Do
+  not add praise, filler, greetings, or sign-offs ("Thanks for the patch",
+  "Let me know if you have questions"). Never apologize or hedge the review.
+- **Include every finding.** You MUST include every finding passed to this stage
+  in the output list. Do not omit findings or assume they are rendered
+  elsewhere.
+- **Always end the report with a blank line.**
 
-## Format
+## Structure
 
-GitHub-flavoured markdown. No heading levels above `###`. No tables unless
-there are more than five findings.
+1. **Summary sentence(s)** (1-2 sentences, wrapped at 78 characters): State what
+   the change does in your own words.
 
-Structure, in order:
+2. **Verdict line** (separated by a blank line):
+   - If there are no findings:
+     No issues found.
+   - If there are findings:
+     N finding(s): highest severity <Level>.
 
-1. **One sentence** stating what the change does, in your own words. This is
-   how the author knows whether the review understood the patch. If the change
-   does something other than what its commit message claims, say so here.
+3. **Plain list of findings** (when findings are present):
+   For each finding, output the following block separated by blank lines:
 
-2. **A verdict line.** One of:
-   - `No issues found.` — when there are no findings at all.
-   - `N finding(s): <highest severity>.` — otherwise.
+   [Severity: <Level>]
+   File: <file_path> (<function_or_symbol>)
 
-3. **Unanchored findings**, if any. Findings whose location is not present in
-   this pull request's diff cannot become inline comments, so they appear here
-   in full: what the problem is, where it lives, and why it matters. Do not
-   omit them and do not summarise them into vagueness — for these, this text is
-   the entire report.
+   <Short, concise problem description wrapped at 78 characters. Explain what
+   is wrong, what condition triggers it, and why it matters. If helpful, include
+   a brief 4-space indented code snippet or call chain.>
 
-4. **Pre-existing issues**, if any were found, under a clear statement that
-   they were not introduced by this change.
+   Where <Level> is Critical, High, Medium, or Low. If a finding is flagged as
+   pre-existing, append (pre-existing) to the File line.
 
-## Rules
+## Example (findings present)
 
-- **Be brief.** Three to eight lines is right for most reviews. The findings
-  carry the detail; repeating them here wastes the reader's attention.
-- **Do not restate findings that became inline comments.** They are already on
-  the page.
-- **Name things exactly.** Function and file names as they appear in the code.
-- **No praise, no filler, no sign-off.** Do not open with "Thanks for the
-  patch" or close with "Let me know if you have questions". The footer is added
-  automatically.
-- **Do not invent line numbers.** If you do not know where something is, name
-  the function.
-- **Mark uncertainty as uncertainty.** If a finding is speculative, the word
-  "possible" or "appears" belongs in it. Do not state a maybe as a fact.
-- **Never apologise for the review or hedge the whole thing.** A review that
-  opens by doubting itself will be ignored, including the parts that are right.
+Adds a summary mechanism to the background sync worker that categorizes and
+aggregates git fetch outcomes into a single status log per sync cycle.
 
-## Example, findings present
+2 findings: highest severity Critical.
 
-```
-Adds a `--project` flag and routes prompt resolution through it.
+[Severity: Critical]
+File: src/worker/sync.rs (GitSyncWorker::run_cycle)
 
-2 findings: highest severity high.
+Holding the synchronous std::sync::MutexGuard across the async fetch_remote()
+call can deadlock Tokio worker threads when multiple remotes sync concurrently.
 
-One finding could not be anchored to this diff: `resolve_prompts_path` is now
-called with a project in `main.rs`, but the worker spawned from
-`Reviewer::run_review_tool_with_cmd` is not passed `--project`, so a non-default
-project silently reviews with the default project's prompts. The call site is
-unchanged by this patch and so has no line to comment on.
-```
+    let guard = self.state.lock().unwrap();
+    self.fetch_remote(remote).await?;
 
-## Example, nothing found
+Drop the mutex guard before awaiting fetch_remote() or use tokio::sync::Mutex
+if the lock must be held across await points.
 
-```
-Moves severity calibration text out of the stage instruction and into
-`severity.md`, with no behavioural change.
+[Severity: Medium]
+File: src/api.rs (forge_webhook)
+
+The placeholder cover letter message ID omits the @sashiko.local domain suffix
+expected by resolve_root_msg_id(), causing git fetch ingestion to create a
+second patchset row and leave the initial row stuck in Fetching status.
+
+## Example (no issues found)
+
+Moves severity calibration rules into severity.md with no behavioral changes
+to the review pipeline.
 
 No issues found.
-```
