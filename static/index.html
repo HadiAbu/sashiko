@@ -3790,9 +3790,9 @@
             
             // 1. Try to parse output for structured findings
             let parsedFindings = false;
+            let outputJson = null;
             try {
                 if (r.output) {
-                    let outputJson = null;
                     if (typeof r.output === 'string') {
                         outputJson = JSON.parse(r.output);
                     } else if (typeof r.output === 'object') {
@@ -3894,6 +3894,17 @@
             const tokensIn = Math.max(0, (r.tokens_in || 0) - tokensCached);
             const tokenStr = `In: ${tokensIn.toLocaleString()} &middot; Cached: ${tokensCached.toLocaleString()} &middot; Out: ${tokensOut.toLocaleString()}`;
 
+            const summaryText = (r.summary || (outputJson && outputJson.summary) || '').trim();
+            let summaryHtml = '';
+            if (summaryText) {
+                summaryHtml = `
+                    <div style="margin-top:10px;">
+                        <div class="review-meta-label" style="margin-bottom:4px;">Summary:</div>
+                        <div style="color: var(--text-color); line-height: 1.45; white-space: pre-wrap;">${escapeHtml(summaryText)}</div>
+                    </div>
+                `;
+            }
+
             let inlineHtml = '';
             const inlineReview = r.inline_review || r.description;
             if (inlineReview) {
@@ -3931,6 +3942,7 @@
                         `}
                     </div>
                     ${showDetails ? `
+                    ${summaryHtml}
                     ${inlineHtml}
                     <div style="margin-top: 24px; margin-bottom: 0;">
                         ${emailHtml}

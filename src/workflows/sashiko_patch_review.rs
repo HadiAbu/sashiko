@@ -216,8 +216,16 @@ For each remaining concern, use the available Git and file tools to inspect the 
 const STAGE_REPORT_INSTRUCTION: &str = r#"# Generate plain-text inline review report
 
 Generate the plain-text inline review report following the exact formatting rules and structure in `github-summary-template.md`.
-- Include a brief 1-2 sentence summary of the change, the verdict line, and a plain list of ALL findings with their `[Severity: <Level>]` tags, file/symbol locations, and concise problem descriptions.
-- Do NOT use backticks, markdown code blocks, or markdown headings. Wrap all prose lines at 78 characters or fewer."#;
+- Output ONLY a plain bulleted list of ALL findings ordered from highest severity to lowest (`- [CRITICAL] ...`, `- [HIGH] ...`, `- [MEDIUM] ...`, `- [LOW] ...`), or `No issues found.` if there are no findings.
+- Do NOT include `Summary:` or `Findings:` headers (the summary is generated and displayed separately in the UI).
+- Do NOT use backticks, markdown code blocks, or markdown headings. Wrap all lines at 78 characters or fewer."#;
+
+const STAGE_SUMMARY_INSTRUCTION: &str = r#"# Summarize the proposed change
+
+Provide a concise 1-2 sentence plain-text summary explaining what this commit/change does and why.
+- Use strictly plain text: no markdown, no backticks (`), no markdown headings (`#`), and no bullet points.
+- Wrap lines at 78 characters or fewer.
+- Summarize the change itself (do not list review findings or issues here)."#;
 
 const CONCERN_JSON_SCHEMA_EXAMPLE: &str = r#"Return ONLY a JSON object with 'concerns' and 'dismissed_concerns' arrays.
 Each object in the 'concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "preexisting", "locations".
@@ -384,8 +392,19 @@ pub static REPORT: ConsolidationStage = ConsolidationStage {
     wants_series_context: false,
 };
 
-pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] =
-    &[&DEDUPLICATION, &CONFLICT_RESOLUTION, &VERIFICATION, &REPORT];
+pub static SUMMARY: ConsolidationStage = ConsolidationStage {
+    name: "summary",
+    short: "Change Summary",
+    wants_series_context: false,
+};
+
+pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] = &[
+    &DEDUPLICATION,
+    &CONFLICT_RESOLUTION,
+    &VERIFICATION,
+    &REPORT,
+    &SUMMARY,
+];
 
 fn series_context_placeholder(wants: bool) -> &'static str {
     if wants {
@@ -468,7 +487,7 @@ fn validate_github_summary_format(
 ) -> Result<(), String> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        return Err("The review summary cannot be empty.".to_string());
+        return Err("The inline review report cannot be empty.".to_string());
     }
     if trimmed.contains('`') {
         return Err(
@@ -484,6 +503,12 @@ fn validate_github_summary_format(
                     .to_string(),
             );
         }
+        if l.starts_with("Summary:") || l.starts_with("Findings:") {
+            return Err(
+                "Do not include 'Summary:' or 'Findings:' headers in the inline review report. Output ONLY the plain bulleted list of findings (or 'No issues found.')."
+                    .to_string(),
+            );
+        }
         if !line.starts_with("    ") && !line.starts_with('\t') && line.chars().count() > 84 {
             return Err(format!(
                 "Line exceeds 78-character terminal width ({} chars): \"{}...\". Wrap all prose lines at 78 characters.",
@@ -492,18 +517,64 @@ fn validate_github_summary_format(
             ));
         }
     }
-    if !state.findings.is_empty() && !trimmed.contains("[Severity:") {
-        return Err(
-            "Findings were provided in state, but the report does not list them with '[Severity: <Level>]' tags. Include every finding."
-                .to_string(),
-        );
+    if !state.findings.is_empty() {
+        let has_severity_bullet = trimmed.lines().any(|line| {
+            let l = line.trim_start();
+            l.starts_with("- [CRITICAL]")
+                || l.starts_with("- [HIGH]")
+                || l.starts_with("- [MEDIUM]")
+                || l.starts_with("- [LOW]")
+        });
+        if !has_severity_bullet {
+            return Err(
+                "Findings were provided in state, but the report does not list them as bullets starting with '- [CRITICAL]', '- [HIGH]', '- [MEDIUM]', or '- [LOW]'. Include every finding."
+                    .to_string(),
+            );
+        }
     }
     Ok(())
 }
 
 fn format_github_summary_feedback(violation: &str) -> String {
     format!(
-        "\n\nPrevious attempt was rejected: {}. Follow `github-summary-template.md`: return strictly plain text without backticks or markdown headings, wrap prose lines at 78 characters, and list every finding with its '[Severity: <Level>]' tag.",
+        "\n\nPrevious attempt was rejected: {}. Follow `github-summary-template.md`: return strictly plain text without backticks, markdown headings, or 'Summary:'/'Findings:' headers; wrap prose lines at 78 characters; and list every finding as a bullet starting with '- [<SEVERITY>]'.",
+        violation
+    )
+}
+
+fn validate_summary_format(content: &str, _state: &SashikoPatchReviewState) -> Result<(), String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("The change summary cannot be empty.".to_string());
+    }
+    if trimmed.contains('`') {
+        return Err(
+            "The summary contains backticks ('`'). Use strictly plain text without backticks."
+                .to_string(),
+        );
+    }
+    for line in trimmed.lines() {
+        let l = line.trim_start();
+        if l.starts_with('#') || l.starts_with("Summary:") {
+            return Err(
+                "Do not use markdown headings ('#') or 'Summary:' prefixes in the summary."
+                    .to_string(),
+            );
+        }
+        if line.chars().count() > 84 {
+            return Err(format!(
+                "Line exceeds 78-character terminal width ({} chars): \"{}...\". Wrap lines at 78 characters.",
+                line.chars().count(),
+                line.chars().take(40).collect::<String>()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn format_summary_feedback(violation: &str) -> String {
+    format!(
+        "\n\nPrevious attempt was rejected: {}. Provide a concise 1-2 sentence plain-text summary without backticks, markdown headings, or 'Summary:' prefixes, wrapped at 78 characters.",
         violation
     )
 }
@@ -746,6 +817,7 @@ Aggregated Dismissed Concerns:
             temperature,
             ..Default::default()
         })
+        .skip_if(|s| s.all_concerns.is_empty())
         .reduce(|state, out: StageConcernsOutput| {
             state.deduplicated_concerns = out.concerns;
             state.deduplicated_dismissed_concerns = out.dismissed_concerns;
@@ -789,6 +861,7 @@ Return ONLY a JSON object with a 'concerns' array containing the remaining conce
             temperature,
             ..Default::default()
         })
+        .skip_if(|s| s.deduplicated_concerns.is_empty())
         .reduce(|state, out: ConflictResolutionOutput| {
             let mut new_concerns = Vec::new();
             let mut preexisting = Vec::new();
@@ -841,6 +914,7 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
             temperature,
             ..Default::default()
         })
+        .skip_if(|s| s.patch_concerns.is_empty())
         .reduce(|state, out: VerificationOutput| {
             let mut new_findings = Vec::new();
             for finding in out.findings {
@@ -896,8 +970,39 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
             },
             ..Default::default()
         })
+        .skip_if(|s| s.findings.is_empty())
         .reduce(|state, out: String| {
             state.review_inline = out;
+        })
+        .build()
+}
+
+pub fn summary_stage(
+    _max_turns: usize,
+    temperature: f32,
+) -> Stage<SashikoPatchReviewState, String> {
+    Stage::builder(SUMMARY.name)
+        .system_prompt(sashiko_system_prompt(true))
+        .user_prompt(PromptTemplate::<SashikoPatchReviewState>::new(
+            STAGE_SUMMARY_INSTRUCTION,
+        ))
+        .output_format(OutputFormat::text_with_validator(
+            validate_summary_format,
+            format_summary_feedback,
+        ))
+        .policy(StagePolicy {
+            tools: ToolScope::None,
+            max_turns: 1,
+            temperature,
+            recitation_policy: RecitationPolicy::FallbackToFreeForm {
+                reminder:
+                    "Summarize the change concisely in 1-2 sentences without quoting verbatim."
+                        .to_string(),
+            },
+            ..Default::default()
+        })
+        .reduce(|state, out: String| {
+            state.summary = out.trim().to_string();
         })
         .build()
 }
@@ -921,26 +1026,11 @@ pub fn build_sashiko_patch_review_workflow_with_options(
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),
             ParallelPolicy::BestEffort,
         )
-        .early_exit_if(
-            |s| s.all_concerns.is_empty(),
-            "No concerns raised in initial analysis stages",
-        )
         .stage(deduplication_stage(max_turns, temperature))
-        .early_exit_if(
-            |s| s.deduplicated_concerns.is_empty(),
-            "No concerns remaining after deduplication",
-        )
         .stage(conflict_resolution_stage(max_turns, temperature))
-        .early_exit_if(
-            |s| s.patch_concerns.is_empty(),
-            "No concerns remaining after conflict resolution",
-        )
         .stage(verification_stage(max_turns, temperature))
-        .early_exit_if(
-            |s| s.findings.is_empty(),
-            "No findings validated in verification stage",
-        )
         .stage(report_stage(max_turns, temperature))
+        .stage(summary_stage(max_turns, temperature))
         .build()
 }
 
@@ -998,22 +1088,18 @@ mod tests {
             Some("Interfaces & Compat")
         );
         assert_eq!(stage_short_label("report"), Some("Report Generation"));
+        assert_eq!(stage_short_label("summary"), Some("Change Summary"));
         assert!(is_known_stage("pre-screen"));
         assert!(is_known_stage("planning"));
         assert!(is_known_stage("persistence"));
+        assert!(is_known_stage("summary"));
         assert!(!is_known_stage("hardware"));
     }
 
     #[test]
     fn test_sashiko_github_summary_validator() {
         let mut state = SashikoPatchReviewState::default();
-        assert!(
-            validate_github_summary_format(
-                "Adds project flag support for multi-project reviews.\n\nNo issues found.",
-                &state
-            )
-            .is_ok()
-        );
+        assert!(validate_github_summary_format("No issues found.", &state).is_ok());
         assert!(validate_github_summary_format("   ", &state).is_err());
         assert!(validate_github_summary_format("Adds `backticks` here.", &state).is_err());
         assert!(
@@ -1024,6 +1110,13 @@ mod tests {
             validate_github_summary_format("### Third-level heading\nNo issues found.", &state)
                 .is_err()
         );
+        assert!(
+            validate_github_summary_format(
+                "Summary: Adds project support.\n\nFindings:\n- [HIGH] Test issue.",
+                &state
+            )
+            .is_err()
+        );
         let long_line = "a".repeat(90);
         assert!(validate_github_summary_format(&long_line, &state).is_err());
 
@@ -1031,25 +1124,32 @@ mod tests {
             .findings
             .push(json!({"severity": "High", "problem": "Test issue"}));
         assert!(
-            validate_github_summary_format(
-                "Summary line.\n\n1 finding: highest severity High.",
-                &state
-            )
-            .is_err()
+            validate_github_summary_format("1 finding: highest severity High.", &state).is_err()
         );
         assert!(
             validate_github_summary_format(
-                "Summary line.\n\n1 finding: highest severity High.\n\n[Severity: High]\nFile: src/main.rs (main)\n\nShort problem description.",
+                "- [HIGH] In src/main.rs (main), missing error check allows invalid state.",
                 &state
             )
             .is_ok()
         );
+
+        assert!(
+            validate_summary_format(
+                "Adds support for separate patch summary generation and UI display.",
+                &state
+            )
+            .is_ok()
+        );
+        assert!(validate_summary_format("   ", &state).is_err());
+        assert!(validate_summary_format("Uses `backticks` in summary.", &state).is_err());
+        assert!(validate_summary_format("Summary: prefixed summary.", &state).is_err());
     }
 
     #[test]
     fn test_build_sashiko_patch_review_workflow() {
         let wf = build_sashiko_patch_review_workflow();
         assert_eq!(wf.name, "sashiko_patch_review");
-        assert_eq!(wf.steps.len(), 10);
+        assert_eq!(wf.steps.len(), 7);
     }
 }

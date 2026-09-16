@@ -341,6 +341,7 @@ impl Worker {
             patch_concerns: Vec::new(),
             concerns: Vec::new(),
             findings: Vec::new(),
+            summary: String::new(),
             review_inline: String::new(),
             fixes: String::new(),
         };
@@ -442,6 +443,7 @@ impl Worker {
         };
 
         let final_output = json!({
+            "summary": state.summary,
             "findings": state.findings,
             "dismissed_concerns": dismissed_concerns,
             "concerns": state.concerns,
@@ -658,7 +660,8 @@ mod tests {
                 "deduplication",
                 "conflict-resolution",
                 "verification",
-                "report"
+                "report",
+                "summary"
             ]
         );
         assert_eq!(

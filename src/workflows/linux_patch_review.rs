@@ -72,6 +72,8 @@ pub struct LinuxPatchReviewState {
     /// Verified findings from the verification stage.
     pub findings: Vec<Value>,
 
+    /// Concise plain-text summary of the change generated at the end of review.
+    pub summary: String,
     /// Generated LKML plain-text review from the report stage.
     pub review_inline: String,
     /// Fix suggestions.
