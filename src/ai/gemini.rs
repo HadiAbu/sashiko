@@ -180,6 +180,32 @@ fn extract_gemini_error_reason(error_text: &str) -> Option<String> {
     None
 }
 
+fn summarize_gemini_error(status: reqwest::StatusCode, error_text: &str) -> String {
+    if error_text.contains("DECODE_PREEMPTED") {
+        return format!("{} (request preempted in decode queue)", status);
+    }
+    if error_text.contains("Overloaded prefill queue") {
+        return format!("{} (request preempted in prefill queue)", status);
+    }
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(error_text)
+        && let Some(err) = json.get("error")
+        && let Some(msg) = err.get("message").and_then(|m| m.as_str())
+    {
+        let first_line = msg.lines().next().unwrap_or(msg);
+        let clean = first_line
+            .split(" [type.googleapis.com/")
+            .next()
+            .unwrap_or(first_line)
+            .split(" (see ")
+            .next()
+            .unwrap_or(first_line)
+            .trim();
+        return format!("{}: {}", status, clean);
+    }
+    let first_line = error_text.lines().next().unwrap_or(error_text).trim();
+    format!("{}: {}", status, first_line)
+}
+
 #[derive(Debug)]
 pub enum GeminiError {
     QuotaExceeded(Duration),
@@ -588,12 +614,13 @@ impl GeminiClient {
             let retry_duration = retry_after_duration
                 .map(Duration::from_secs_f64)
                 .unwrap_or(Duration::from_secs(0));
-            tracing::warn!(
+            tracing::debug!(
                 "Gemini API Transient Error: status={}, body={}",
                 status,
                 error_text
             );
-            return Err(GeminiError::TransientError(retry_duration, error_text).into());
+            let summary = summarize_gemini_error(status, &error_text);
+            return Err(GeminiError::TransientError(retry_duration, summary).into());
         }
 
         let mut reason_str = String::new();
@@ -1532,5 +1559,49 @@ mod tests {
         ));
         assert!(matches!(gemini_req.contents[0].parts[1], Part::Text { .. }));
         Ok(())
+    }
+
+    #[test]
+    fn test_summarize_gemini_error() {
+        let preempted_json = json!({
+            "error": {
+                "code": 500,
+                "status": "500",
+                "message": "A retriable error could not be retried [jax.wiz.servo.ServoErrorDetail] { error_code: DECODE_PREEMPTED }\n=== Source Location Trace: ===\nfoo.cc:123"
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            summarize_gemini_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &preempted_json),
+            "500 Internal Server Error (request preempted in decode queue)"
+        );
+
+        let prefill_json = json!({
+            "error": {
+                "code": 500,
+                "status": "500",
+                "message": "Overloaded prefill queue. (see go/debugonly for details)\n=== Source Location Trace: ==="
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            summarize_gemini_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &prefill_json),
+            "500 Internal Server Error (request preempted in prefill queue)"
+        );
+
+        let go_link_json = json!({
+            "error": {
+                "code": 503,
+                "message": "Service temporarily overloaded (see go/internal-link for info)"
+            }
+        })
+        .to_string();
+
+        assert_eq!(
+            summarize_gemini_error(reqwest::StatusCode::SERVICE_UNAVAILABLE, &go_link_json),
+            "503 Service Unavailable: Service temporarily overloaded"
+        );
     }
 }
