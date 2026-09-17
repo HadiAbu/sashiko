@@ -6950,6 +6950,92 @@ impl Database {
         }
     }
 
+    /// Patchsets that have no MAINTAINERS attribution at all, in id order and
+    /// starting after `after_id`.
+    ///
+    /// Paged by id rather than by offset because the backfill writes as it
+    /// walks. An offset would shift underneath it as rows stop matching, and
+    /// the walk would skip patchsets. Resuming from the highest id already
+    /// seen cannot skip anything, and the worst it can do is revisit a
+    /// patchset, which the upsert makes harmless.
+    ///
+    /// A patchset that legitimately matches no section keeps coming back here,
+    /// which is why the caller pages by id and stamps completion rather than
+    /// looping until this returns nothing.
+    pub async fn patchsets_missing_maintainer_sections(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.id FROM patchsets p
+                 WHERE p.id > ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM patchset_maintainer_sections s
+                        WHERE s.patchset_id = p.id
+                   )
+                 ORDER BY p.id ASC
+                 LIMIT ?",
+                libsql::params![after_id, limit as i64],
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get(0)?);
+        }
+        Ok(ids)
+    }
+
+    /// Just the diffs of a patchset's parts.
+    ///
+    /// Deliberately not [`Database::get_patch_diffs`], which also collects
+    /// display metadata and stops at the first row it fails to read, returning
+    /// a prefix of the series with no error. A part dropped that way would
+    /// silently narrow the attribution of the series it belongs to, so this
+    /// reads the diffs alone and propagates failures instead.
+    pub async fn patch_diffs_only(&self, patchset_id: i64) -> Result<Vec<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT diff FROM patches WHERE patchset_id = ? ORDER BY part_index ASC",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut diffs = Vec::new();
+        while let Some(row) = rows.next().await? {
+            if let Some(diff) = crate::compression::get_compressed_string_opt(&row, 0)? {
+                diffs.push(diff);
+            }
+        }
+        Ok(diffs)
+    }
+
+    /// Reads an instance-wide marker.
+    pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query("SELECT value FROM meta WHERE key = ?", libsql::params![key])
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Writes an instance-wide marker, replacing any previous value.
+    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                libsql::params![key, value],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_patch_diffs(
         &self,
         patchset_id: i64,

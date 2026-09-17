@@ -17,6 +17,7 @@ pub mod access;
 pub mod ai;
 pub mod api;
 pub mod auth;
+pub mod backfill;
 pub mod baseline;
 pub mod compression;
 pub mod db;

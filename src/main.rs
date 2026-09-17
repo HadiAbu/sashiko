@@ -445,6 +445,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     sashiko::maintainers::init_global_maintainers(maintainers_index);
 
+    // Attributes series ingested before attribution existed. Best effort: a
+    // failure leaves those series readable by operators only, which is the
+    // direction access control should fail in, so it is not worth refusing to
+    // start over.
+    if let Err(e) = sashiko::backfill::backfill_patchset_maintainer_sections(&db).await {
+        warn!("Patchset MAINTAINERS attribution backfill failed: {e}");
+    }
+
     // Create internal task queues
     // raw_tx -> Parser -> parsed_tx -> DB Worker
     let (raw_tx, mut raw_rx) = mpsc::channel::<Event>(1000);

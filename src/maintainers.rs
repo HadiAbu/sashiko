@@ -575,6 +575,21 @@ pub fn get_global_maintainers() -> Option<Arc<MaintainersIndex>> {
     GLOBAL_MAINTAINERS.read().unwrap().clone()
 }
 
+/// Serializes tests that depend on the global index.
+///
+/// The index is process wide and the unit tests share one process, so a test
+/// that installs an index races both the test that clears it and any test that
+/// merely reads it. Every test that touches [`init_global_maintainers`],
+/// [`clear_global_maintainers`], or code that consults the index must hold
+/// this for its whole body.
+///
+/// Async aware, because most of those tests await between installing the index
+/// and asserting on what it produced. Blocking tests take it with
+/// `blocking_lock`, which is sound only because they have no runtime of their
+/// own to stall.
+#[cfg(test)]
+pub static GLOBAL_INDEX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The MAINTAINERS sections that own the files a diff touches.
 ///
 /// This is the one place that turns changed code into the people responsible
@@ -796,10 +811,12 @@ F:	*/
     }
 
     /// Also covers `sections_for_diff`, which reads the same global index.
-    /// Keeping both in one test keeps a single owner of that singleton; a
-    /// second test asserting against it would race this one.
     #[test]
     fn test_global_maintainers_lifecycle() {
+        let _guard = GLOBAL_INDEX_TEST_LOCK.blocking_lock();
+        // init only fills an empty slot, so start from one.
+        clear_global_maintainers();
+
         let index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
         let arc = Arc::new(index);
         init_global_maintainers(arc.clone());
