@@ -505,6 +505,226 @@ pub fn extract_repo_name_from_mr_url(url: &str) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+/// Extract the `"owner/repo"` slug from a GitHub PR or GitLab MR URL.
+pub fn extract_owner_repo_from_mr_url(url: &str) -> Option<String> {
+    let before_sep = url
+        .split_once("/-/")
+        .or_else(|| url.split_once("/pull/"))
+        .map(|(prefix, _)| prefix)?;
+    let after_scheme = before_sep
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(before_sep);
+    let (_, path) = after_scheme.split_once('/')?;
+    let slug = path.trim_matches('/').trim_end_matches(".git");
+    if slug.is_empty() || !slug.contains('/') {
+        None
+    } else {
+        Some(slug.to_string())
+    }
+}
+
+/// Summary and findings for one commit in a pull request series.
+#[derive(Debug, Clone)]
+pub struct PatchReviewSummaryItem {
+    pub part_index: usize,
+    pub total_parts: usize,
+    pub commit_id: Option<String>,
+    pub subject: String,
+    pub inline_review: Option<String>,
+}
+
+/// Maximum byte length of a GitHub issue/PR comment body (GitHub's hard limit
+/// is 65 536 bytes; leave safety margin for UTF-8 boundary and trailing link).
+const MAX_GITHUB_COMMENT_BYTES: usize = 60_000;
+
+/// Compose the markdown comment posted to a pull request thread when a review
+/// completes. Always produces a comment: clean pull requests receive a short
+/// confirmation with a link to the full review trace.
+pub fn compose_pr_review_comment(
+    version: Option<u32>,
+    total_commits: usize,
+    series_summary: Option<&str>,
+    patches: &[PatchReviewSummaryItem],
+    target_url: &str,
+) -> String {
+    let header = match version {
+        Some(v) if v > 1 => format!("### Sashiko review — v{}", v),
+        _ => "### Sashiko review".to_string(),
+    };
+
+    let commit_word = if total_commits == 1 {
+        "1 commit".to_string()
+    } else {
+        format!("{} commits", total_commits)
+    };
+
+    let patches_with_findings: Vec<&PatchReviewSummaryItem> = patches
+        .iter()
+        .filter(|p| {
+            p.inline_review
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty())
+        })
+        .collect();
+
+    if patches_with_findings.is_empty() {
+        return format!(
+            "{header}\n\n✓ **No issues found** across {commit_word}.\n\n[Full review log on sashiko.sashiko.dev]({target_url})\n"
+        );
+    }
+
+    let mut out = String::with_capacity(2048);
+    out.push_str(&header);
+    out.push_str("\n\n");
+
+    if let Some(summary) = series_summary.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str("<details>\n<summary>Series summary</summary>\n\n");
+        out.push_str(summary);
+        out.push_str("\n\n</details>\n\n");
+    }
+
+    for patch in patches_with_findings {
+        let short_sha = patch
+            .commit_id
+            .as_deref()
+            .filter(|s| s.len() >= 8)
+            .map(|s| &s[..8]);
+        let title_line = match short_sha {
+            Some(sha) => format!(
+                "#### Commit {}/{} — `{}` {}\n\n",
+                patch.part_index, patch.total_parts, sha, patch.subject
+            ),
+            None => format!(
+                "#### Commit {}/{} — {}\n\n",
+                patch.part_index, patch.total_parts, patch.subject
+            ),
+        };
+        out.push_str(&title_line);
+
+        if let Some(inline) = patch.inline_review.as_deref() {
+            out.push_str(inline.trim());
+            out.push_str("\n\n");
+        }
+    }
+
+    let footer = format!("[Full review and stage logs on sashiko.sashiko.dev]({target_url})\n");
+
+    if out.len() + footer.len() > MAX_GITHUB_COMMENT_BYTES {
+        let mut cut = MAX_GITHUB_COMMENT_BYTES.saturating_sub(footer.len() + 64);
+        while cut > 0 && !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("\n\n*(comment truncated; see full report below)*\n\n");
+    }
+
+    out.push_str(&footer);
+    out
+}
+
+/// Mint a short-lived RS256 JWT identifying a GitHub App (`iss = app_id`).
+pub fn mint_github_app_jwt(app_id: u64, pem: &str) -> Result<String, String> {
+    #[derive(serde::Serialize)]
+    struct Claims {
+        iat: i64,
+        exp: i64,
+        iss: String,
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims {
+        iat: now - 60,
+        exp: now + 540,
+        iss: app_id.to_string(),
+    };
+
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes())
+        .map_err(|e| format!("invalid GitHub App RSA private key: {}", e))?;
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    jsonwebtoken::encode(&header, &claims, &key)
+        .map_err(|e| format!("failed to sign GitHub App JWT: {}", e))
+}
+
+/// Exchange a GitHub App JWT for an installation access token.
+pub async fn exchange_github_installation_token(
+    client: &reqwest::Client,
+    api_base: &str,
+    installation_id: u64,
+    jwt: &str,
+) -> Result<String, String> {
+    let url = format!(
+        "{}/app/installations/{}/access_tokens",
+        api_base.trim_end_matches('/'),
+        installation_id
+    );
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", jwt))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "sashiko")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .await
+        .map_err(|e| format!("GitHub token request failed: {}", e))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        format!(
+            "invalid JSON from GitHub token endpoint ({}): {}",
+            status, e
+        )
+    })?;
+
+    if !status.is_success() {
+        let msg = body["message"].as_str().unwrap_or("unknown error");
+        return Err(format!(
+            "GitHub token exchange returned {}: {}",
+            status, msg
+        ));
+    }
+
+    body["token"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "GitHub token response missing 'token' field".to_string())
+}
+
+/// Post a comment to a GitHub pull request (via the issue comments endpoint).
+pub async fn post_github_pr_comment(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    pr_number: i64,
+    token: &str,
+    body: &str,
+) -> Result<u16, String> {
+    let url = format!(
+        "{}/repos/{}/issues/{}/comments",
+        api_base.trim_end_matches('/'),
+        repo,
+        pr_number
+    );
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "sashiko")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&serde_json::json!({ "body": body }))
+        .send()
+        .await
+        .map_err(|e| format!("GitHub comment POST failed: {}", e))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        Ok(status.as_u16())
+    } else {
+        let text = resp.text().await.unwrap_or_default();
+        Err(format!("GitHub returned {}: {}", status, text))
+    }
+}
+
 /// Registry for forge providers
 pub struct ForgeRegistry {
     providers: HashMap<String, Arc<dyn ForgeProvider>>,
@@ -1240,5 +1460,126 @@ mod tests {
             extract_repo_name_from_mr_url("https://example.com/not-a-pr"),
             None
         );
+    }
+
+    #[test]
+    fn test_extract_owner_repo_from_mr_url() {
+        assert_eq!(
+            extract_owner_repo_from_mr_url("https://github.com/sashiko-dev/sashiko/pull/501"),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+        assert_eq!(
+            extract_owner_repo_from_mr_url("https://gitlab.com/org/sub/repo/-/merge_requests/10"),
+            Some("org/sub/repo".to_string())
+        );
+        assert_eq!(
+            extract_owner_repo_from_mr_url("https://example.com/not-a-pr"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_clean() {
+        let patches = vec![
+            PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 2,
+                commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
+                subject: "first clean patch".to_string(),
+                inline_review: None,
+            },
+            PatchReviewSummaryItem {
+                part_index: 2,
+                total_parts: 2,
+                commit_id: Some("fedcba0987654321fedcba0987654321fedcba09".to_string()),
+                subject: "second clean patch".to_string(),
+                inline_review: Some("   ".to_string()),
+            },
+        ];
+        let body = compose_pr_review_comment(
+            Some(1),
+            2,
+            None,
+            &patches,
+            "https://sashiko.sashiko.dev/#/patchset/mr-501-abc..def",
+        );
+        assert!(body.starts_with("### Sashiko review\n\n"));
+        assert!(body.contains("✓ **No issues found** across 2 commits."));
+        assert!(
+            body.contains(
+                "[Full review log on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/mr-501-abc..def)"
+            )
+        );
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_with_findings_and_version() {
+        let patches = vec![
+            PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 2,
+                commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
+                subject: "clean commit".to_string(),
+                inline_review: None,
+            },
+            PatchReviewSummaryItem {
+                part_index: 2,
+                total_parts: 2,
+                commit_id: Some("fedcba0987654321fedcba0987654321fedcba09".to_string()),
+                subject: "commit with bug".to_string(),
+                inline_review: Some("Severity: HIGH\nMissing check on input buffer.".to_string()),
+            },
+        ];
+        let body = compose_pr_review_comment(
+            Some(3),
+            2,
+            Some("Series summary text here."),
+            &patches,
+            "https://sashiko.sashiko.dev/#/patchset/mr-501-v3",
+        );
+        assert!(body.starts_with("### Sashiko review — v3\n\n"));
+        assert!(body.contains("<details>\n<summary>Series summary</summary>\n\nSeries summary text here.\n\n</details>"));
+        assert!(!body.contains("clean commit"));
+        assert!(body.contains("#### Commit 2/2 — `fedcba09` commit with bug"));
+        assert!(body.contains("Severity: HIGH\nMissing check on input buffer."));
+        assert!(
+            body.contains(
+                "[Full review and stage logs on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/mr-501-v3)"
+            )
+        );
+    }
+
+    #[test]
+    fn test_mint_github_app_jwt_valid_rsa_key() {
+        let test_pem = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDpmekVGfs9pOaJ\n\
+Fwiha1czG7AKrJOV3vMY5TOTpUdS78e9K0x5aq7GiVesTQE+SWpL6Z+YJ34kfP7F\n\
+IMYJdyWe2i8nZIunMsZixNr9ljiGC19FZZeUelgWf5YyocJ3JfJfuqYnif0gZuUL\n\
+HevyBwEItFXMmj6ZGVCTvHHeo8g4eSqvwCcD7c1TfcRgHc/hy82+nALsuifyvxjo\n\
+vkXNKsJCm+W/FEhsXNxQ0Ros4H8BcDpJw1HI2XHJHcX+ouonEjTzMX7lzxdvbNp6\n\
+XbPf1ANJJPtq/KVjNFTUrrMeLdph0J0KDJtDK3bK/Uls+2VS12YKQHJs0ylq05l8\n\
+Bavic5wZAgMBAAECggEAGDKYkaur+h9iFK1NeDsVlfZg7pogfOkn/ATcqjH4CL/3\n\
+IWyiHVRPCm3LpnjLj4Isqp8RUxeJhN9rHKG1IeHfrxbMGk6F+38noa+L57IZ5M4P\n\
+blwvBB2wO5Ride2KUVadnAufjn+dYtqFu028KnP4nXLguF2kl638ShwTx4uQ/+21\n\
+M3SYoKl+FQCUs4kts1pYgzGa3NpV0LCJnfGz1eGwajO2saYLCBaimrX/hprexzmm\n\
+Th2ITsZab75tDaMKbpyVZIfN3wOCxthV9byXOIFndVaDmzrghzPBL1iGKWcMCnMT\n\
+onlB27jVXnrGlTGkVLH9qKQ7Z6Lyj9GV6xddx9oQSQKBgQD2ayKONlQGwzLUB8s5\n\
+eKRT6d/uhTl9WeNX0KXAsiYjDH8vXZqDR2YUPs3hSqABpQuH+EEeF8h/5BMmq/da\n\
+M9+sZyqsH/B27N5JbnhseOnYccd+4PsfRISEwkLa9DkKS2tQZy2A1lnLWo6TAe37\n\
+8bq2LXAPZiOeEEc7GCt0yVDpfwKBgQDyrzEDrQPJr/6MvHWi4qDumSYK2+fXNP1B\n\
+FqnP3L09C0TTvj1Ia5HLHJ/CeiHq6suC8D+QrDbiu01DbyACBeNq9y2fzv5cixZx\n\
+V58aNZd7w45SqmSieYgnCi+z/YN6VDkTNVp6Pyn4ZK/I8oxWAkWm1q8ZjAoxBaua\n\
+OQQKVAtWZwKBgQCSB8+Eo6GMGGWoza2bs2j+6ZxxR7ZYGMrnoZh455o+Lwu4UCpf\n\
+HhLacJWlq4nDL8HzpCVC5ilF0S2gP0zowdEN5F2ff5YLhDf/IF5xOf6q7FKjWES5\n\
+tOsrmcvw4cZj2WoRTfPjZCP2pQXVDNGx+wEBMVA1b/wvkcoEtUAbh6pRlQKBgQDe\n\
+uK2xA+4AAYcJvkPv0zGDCAaD3MHvHfB29ceuvpTmGxt1gJhZiG9rCsAMCW5rXESd\n\
+zMNpkMNmXiNQigHEGYdXObYjfiKu5+8W4iVgNmLp8NUDROHKwuKTgaO5+iXZ9MXU\n\
+vRhmLOXl0vII56CnpropnclhFsabquqMRVtR50PobQKBgBhRj6Wi9QDQ/6/kk5VG\n\
+2evCz2SRP0Mua25y3+gNDNcjfIVaiQdCd5lJMG3G9esdc3SJ2lbz+QQUbk1U5Jcz\n\
+NS77VgBQLugIAhcS11DAtF4vd29/Jc1kDsQQ30Or5ONNGjMe0x0WN+uGRzrmLI6U\n\
+bfBnKqGjJguuHd5ta5Vh5B51\n\
+-----END PRIVATE KEY-----";
+        let jwt = mint_github_app_jwt(4982337, test_pem).expect("should sign JWT");
+        assert_eq!(jwt.split('.').count(), 3);
     }
 }

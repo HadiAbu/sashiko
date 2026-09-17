@@ -75,6 +75,26 @@ impl ProjectSettings {
     }
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgePostMode {
+    #[default]
+    Off,
+    DryRun,
+    Live,
+}
+
+impl ForgePostMode {
+    pub fn outbox_status(self, embargoed: bool) -> &'static str {
+        match self {
+            ForgePostMode::Off => "Disabled",
+            ForgePostMode::DryRun => "Dry-Run",
+            ForgePostMode::Live if embargoed => "Embargoed",
+            ForgePostMode::Live => "Pending",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
@@ -86,6 +106,16 @@ pub struct ForgeSettings {
     pub provider: Option<String>,
     pub webhook_secret: Option<String>,
     pub api_token: Option<String>,
+    #[serde(default)]
+    pub post_mode: ForgePostMode,
+    #[serde(default)]
+    pub app_id: Option<u64>,
+    #[serde(default)]
+    pub installation_id: Option<u64>,
+    #[serde(default)]
+    pub app_private_key: Option<String>,
+    #[serde(default)]
+    pub app_private_key_path: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -831,6 +861,11 @@ fn default_forge() -> ForgeSettings {
         provider: None,
         webhook_secret: None,
         api_token: None,
+        post_mode: ForgePostMode::Off,
+        app_id: None,
+        installation_id: None,
+        app_private_key: None,
+        app_private_key_path: None,
     }
 }
 
