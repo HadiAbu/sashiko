@@ -13,7 +13,8 @@ configuration, and the one `test_production_settings_is_valid` parses),
 `docs/examples/Settings.example.toml` (embedded into the binary as
 `DEFAULT_SETTINGS` in `src/main.rs` and written verbatim by `sashiko init`),
 `docs/configuration.md` (the reference table), and the deployment manifests
-that set `SASHIKO__*` (`Dockerfile`, `sashiko.dev/base/app/sashiko-k8s.yaml`,
+that set `SASHIKO__*` (`Dockerfile`,
+`deployment/sashiko.dev/base/app/sashiko-k8s.yaml`,
 `scripts/docker-entrypoint.sh`).
 
 ## 1. The load path
@@ -327,7 +328,8 @@ Renaming or removing a key:
 
 - [ ] Every checked-in file that sets it is updated in the same commit:
       `Settings.toml`, `docs/examples/Settings.*.toml`,
-      `docs/configuration.md`, `sashiko.dev/base/app/sashiko-k8s.yaml`,
+      `docs/configuration.md`,
+      `deployment/sashiko.dev/base/app/sashiko-k8s.yaml`,
       `Dockerfile`, `scripts/docker-entrypoint.sh`, `README.md`.
 - [ ] The commit message says that deployments carrying the old key will fail
       to start. There is no compatibility shim; `deny_unknown_fields` forbids

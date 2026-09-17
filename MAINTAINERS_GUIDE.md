@@ -14,7 +14,7 @@ If you have questions, feedback, or need assistance, please reach out through th
 
 To request tracking for a new lore or NNTP mailing list, you can either:
 
-1.  **Submit a Pull Request:** Directly update the tracking configuration by adding your lore or NNTP details to the `SASHIKO__MAILING_LISTS__TRACK` environment variable in [`sashiko.dev/base/app/sashiko-k8s.yaml`](sashiko.dev/base/app/sashiko-k8s.yaml).
+1.  **Submit a Pull Request:** Directly update the tracking configuration by adding your lore or NNTP details to the `SASHIKO__MAILING_LISTS__TRACK` environment variable in [`deployment/sashiko.dev/base/app/sashiko-k8s.yaml`](deployment/sashiko.dev/base/app/sashiko-k8s.yaml).
 2.  **Send an Email:** Contact the Sashiko development mailing list (`sashiko@lists.linux.dev`) and `Cc: Roman Gushchin <roman.gushchin@linux.dev>` with your request.
 
 ## Adding Subsystem-Specific Prompts
@@ -72,4 +72,4 @@ reply_to_author = true
 cc_individuals = false
 ```
 
-**Configuration:** The email policies and delivery preferences are defined in the [`sashiko.dev/email_policy.toml`](sashiko.dev/email_policy.toml) file. To request a change to your configuration, please open a GitHub Issue or email the development mailing list (`sashiko@lists.linux.dev`).
+**Configuration:** The email policies and delivery preferences are defined in the [`deployment/sashiko.dev/email_policy.toml`](deployment/sashiko.dev/email_policy.toml) file. To request a change to your configuration, please open a GitHub Issue or email the development mailing list (`sashiko@lists.linux.dev`).

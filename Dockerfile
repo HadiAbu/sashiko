@@ -51,7 +51,7 @@ COPY --from=builder /usr/src/sashiko/target/release/sashiko-cli /usr/local/bin/s
 
 # Copy default settings and assets
 COPY Settings.toml /app/Settings.toml
-COPY sashiko.dev/email_policy.toml /app/email_policy.toml
+COPY deployment/sashiko.dev/email_policy.toml /app/email_policy.toml
 COPY third_party/prompts /app/third_party/prompts
 COPY static /app/static
 

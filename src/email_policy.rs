@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn test_production_policy_is_valid() {
-        let path = "sashiko.dev/email_policy.toml";
+        let path = "deployment/sashiko.dev/email_policy.toml";
         if std::path::Path::new(path).exists() {
             let _ = EmailPolicyConfig::load(path).expect("Production email policy failed to parse");
         }
