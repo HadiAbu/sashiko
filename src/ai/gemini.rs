@@ -757,8 +757,9 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
                 });
             }
             AiRole::Tool => {
-                // Gemini expects a 'function' role for tool responses.
-                // Consecutive tool responses must be merged into a single turn with multiple parts.
+                // Gemini expects a 'user' role for FunctionResponse parts.
+                // Consecutive tool responses and user messages must be merged into a single
+                // turn to preserve strict user/model turn alternation.
                 let part = Part::FunctionResponse {
                     function_response: FunctionResponse {
                         name: msg
@@ -771,13 +772,13 @@ fn translate_ai_request(request: AiRequest) -> Result<GenerateContentRequest> {
                     },
                 };
                 if let Some(last) = contents.last_mut()
-                    && last.role == "function"
+                    && last.role == "user"
                 {
                     last.parts.push(part);
                     continue;
                 }
                 contents.push(Content {
-                    role: "function".to_string(),
+                    role: "user".to_string(),
                     parts: vec![part],
                 });
             }
@@ -1305,7 +1306,7 @@ mod tests {
         let gemini_req = translate_ai_request(request)?;
 
         assert_eq!(gemini_req.contents.len(), 1);
-        assert_eq!(gemini_req.contents[0].role, "function");
+        assert_eq!(gemini_req.contents[0].role, "user");
         if let Part::FunctionResponse { function_response } = &gemini_req.contents[0].parts[0] {
             assert_eq!(function_response.name, "call_123");
             assert_eq!(function_response.response["result"], "success");
@@ -1404,7 +1405,7 @@ mod tests {
         assert_eq!(gemini_req.contents.len(), 3);
         assert_eq!(gemini_req.contents[0].role, "user");
         assert_eq!(gemini_req.contents[1].role, "model");
-        assert_eq!(gemini_req.contents[2].role, "function");
+        assert_eq!(gemini_req.contents[2].role, "user");
 
         // Verify thought signature in middle of chain
         if let Part::FunctionCall {
@@ -1488,8 +1489,48 @@ mod tests {
 
         let gemini_req = translate_ai_request(request)?;
         assert_eq!(gemini_req.contents.len(), 1);
-        assert_eq!(gemini_req.contents[0].role, "function");
+        assert_eq!(gemini_req.contents[0].role, "user");
         assert_eq!(gemini_req.contents[0].parts.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_ai_request_merges_user_text_and_tool_response() -> Result<()> {
+        let request = AiRequest {
+            system: None,
+            messages: vec![
+                AiMessage {
+                    role: AiRole::Tool,
+                    content: Some("{\"result\":\"res1\"}".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                },
+                AiMessage {
+                    role: AiRole::User,
+                    content: Some("Now continue.".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let gemini_req = translate_ai_request(request)?;
+        assert_eq!(gemini_req.contents.len(), 1);
+        assert_eq!(gemini_req.contents[0].role, "user");
+        assert_eq!(gemini_req.contents[0].parts.len(), 2);
+        assert!(matches!(
+            gemini_req.contents[0].parts[0],
+            Part::FunctionResponse { .. }
+        ));
+        assert!(matches!(gemini_req.contents[0].parts[1], Part::Text { .. }));
         Ok(())
     }
 }
