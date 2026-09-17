@@ -222,12 +222,25 @@ fn default_claude_max_tokens() -> u32 {
     4096
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 #[allow(unused)]
 pub struct GeminiSettings {
     #[serde(default)]
     pub explicit_prompt_caching: bool,
+    /// Optional custom base URL (overrides default https://generativelanguage.googleapis.com).
+    /// Can also be set via GOOGLE_GEMINI_BASE_URL or GEMINI_BASE_URL env vars.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Optional shell command to start a local HTTP proxy daemon on demand.
+    /// Can include `{port_file}` placeholder for dynamic port discovery.
+    /// Can also be set via GEMINI_PROXY_COMMAND env var.
+    #[serde(default)]
+    pub proxy_command: Option<String>,
+    /// Optional shell command to obtain a Bearer token for Authorization header.
+    /// Can also be set via GEMINI_AUTH_TOKEN_COMMAND env var.
+    #[serde(default)]
+    pub auth_token_command: Option<String>,
 }
 
 #[cfg(feature = "bedrock")]

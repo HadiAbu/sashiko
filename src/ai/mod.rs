@@ -439,7 +439,10 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
     match ai.provider.to_lowercase().as_str() {
         "gemini" => {
             let model = ai.model.clone();
-            Ok(Arc::new(gemini::GeminiClient::new(model)))
+            Ok(Arc::new(gemini::GeminiClient::new_with_settings(
+                model,
+                ai.gemini.as_ref(),
+            )))
         }
         "stdio-gemini" => Ok(Arc::new(gemini::StdioGeminiClient::new())),
         "claude" => {

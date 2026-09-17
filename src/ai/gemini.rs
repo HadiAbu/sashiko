@@ -235,21 +235,62 @@ impl ClassifyAiError for GeminiError {
     }
 }
 
+struct ProxyGuard {
+    child: std::sync::Mutex<Option<std::process::Child>>,
+    port_file: std::path::PathBuf,
+}
+
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.child.lock()
+            && let Some(mut child) = guard.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_file(&self.port_file);
+    }
+}
+
 pub struct GeminiClient {
     model: String,
     base_url: String,
     api_key: String,
+    proxy_command: Option<String>,
+    auth_token_command: Option<String>,
+    proxy_url: tokio::sync::OnceCell<String>,
+    proxy_guard: tokio::sync::Mutex<Option<std::sync::Arc<ProxyGuard>>>,
     client: RwLock<Client>,
 }
 
 impl GeminiClient {
     pub fn new(model: String) -> Self {
+        Self::new_with_settings(model, None)
+    }
+
+    pub fn new_with_settings(
+        model: String,
+        settings: Option<&crate::settings::GeminiSettings>,
+    ) -> Self {
         let api_key = std::env::var("GEMINI_API_KEY")
             .or_else(|_| std::env::var("LLM_API_KEY"))
             .unwrap_or_default();
         let base_url = std::env::var("GOOGLE_GEMINI_BASE_URL")
             .or_else(|_| std::env::var("GEMINI_BASE_URL"))
-            .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+            .ok()
+            .or_else(|| settings.and_then(|s| s.base_url.clone()))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "https://generativelanguage.googleapis.com".to_string());
+
+        let proxy_command = std::env::var("GEMINI_PROXY_COMMAND")
+            .ok()
+            .or_else(|| settings.and_then(|s| s.proxy_command.clone()))
+            .filter(|s| !s.trim().is_empty());
+
+        let auth_token_command = std::env::var("GEMINI_AUTH_TOKEN_COMMAND")
+            .ok()
+            .or_else(|| settings.and_then(|s| s.auth_token_command.clone()))
+            .filter(|s| !s.trim().is_empty());
 
         let client = Self::create_http_client(&api_key);
 
@@ -257,6 +298,10 @@ impl GeminiClient {
             model,
             base_url,
             api_key,
+            proxy_command,
+            auth_token_command,
+            proxy_url: tokio::sync::OnceCell::new(),
+            proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(client),
         }
     }
@@ -280,6 +325,149 @@ impl GeminiClient {
             .unwrap_or_else(|_| reqwest::Client::new())
     }
 
+    fn find_auto_proxy_helper() -> Option<String> {
+        let mut candidates = vec![std::path::PathBuf::from("scripts/gemini-proxy-helper.sh")];
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            candidates.push(dir.join("../../scripts/gemini-proxy-helper.sh"));
+            candidates.push(dir.join("../scripts/gemini-proxy-helper.sh"));
+        }
+        for candidate in candidates {
+            if !candidate.is_file() {
+                continue;
+            }
+            if let Ok(status) = std::process::Command::new(&candidate)
+                .arg("--check")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                && status.success()
+            {
+                return Some(format!("{} --port-file {{port_file}}", candidate.display()));
+            }
+        }
+        None
+    }
+
+    async fn start_proxy_command(
+        cmd_template: &str,
+    ) -> Result<(String, std::sync::Arc<ProxyGuard>)> {
+        static PROXY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = PROXY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let port_file = std::env::temp_dir().join(format!(
+            "sashiko-gemini-proxy-{}-{}.port",
+            std::process::id(),
+            seq
+        ));
+        let _ = std::fs::remove_file(&port_file);
+
+        let port_file_str = port_file.to_string_lossy();
+        let full_cmd = if cmd_template.contains("{port_file}") {
+            cmd_template.replace("{port_file}", &port_file_str)
+        } else {
+            format!("{} --port-file {}", cmd_template, port_file_str)
+        };
+
+        tracing::info!("Starting local Gemini proxy: {}", full_cmd);
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&full_cmd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("Failed to spawn Gemini proxy command: {}", full_cmd))?;
+
+        let guard = std::sync::Arc::new(ProxyGuard {
+            child: std::sync::Mutex::new(Some(child)),
+            port_file: port_file.clone(),
+        });
+
+        for _ in 0..150 {
+            if let Ok(content) = tokio::fs::read_to_string(&port_file).await {
+                let trimmed = content.trim();
+                if !trimmed.is_empty()
+                    && let Ok(port) = trimmed.parse::<u16>()
+                {
+                    let url = format!("http://localhost:{}", port);
+                    tracing::info!("Local Gemini proxy ready at {}", url);
+                    return Ok((url, guard));
+                }
+            }
+            if let Ok(mut child_lock) = guard.child.lock()
+                && let Some(ref mut child_proc) = *child_lock
+                && let Ok(Some(status)) = child_proc.try_wait()
+            {
+                anyhow::bail!(
+                    "Gemini proxy command exited prematurely with status {} before writing port file",
+                    status
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        anyhow::bail!(
+            "Timed out waiting for Gemini proxy command to write port file: {}",
+            port_file.display()
+        )
+    }
+
+    async fn effective_base_url(&self) -> Result<String> {
+        if self.base_url != "https://generativelanguage.googleapis.com" {
+            return Ok(self.base_url.clone());
+        }
+        if !self.api_key.is_empty() && self.proxy_command.is_none() {
+            return Ok(self.base_url.clone());
+        }
+        let url = self
+            .proxy_url
+            .get_or_try_init(|| async {
+                let cmd = self
+                    .proxy_command
+                    .clone()
+                    .or_else(Self::find_auto_proxy_helper);
+                if let Some(cmd_str) = cmd {
+                    let (url, guard) = Self::start_proxy_command(&cmd_str).await?;
+                    *self.proxy_guard.lock().await = Some(guard);
+                    Ok::<String, anyhow::Error>(url)
+                } else {
+                    Ok(self.base_url.clone())
+                }
+            })
+            .await?;
+        Ok(url.clone())
+    }
+
+    fn resolve_bearer_token(&self) -> Result<Option<String>> {
+        if let Ok(token) = std::env::var("GEMINI_AUTH_TOKEN") {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                return Ok(Some(trimmed.to_string()));
+            }
+        }
+        if let Some(ref cmd) = self.auth_token_command {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(cmd)
+                .output()
+                .with_context(|| format!("Failed to execute auth_token_command: {}", cmd))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!(
+                    "auth_token_command '{}' failed with status {}: {}",
+                    cmd,
+                    output.status,
+                    stderr.trim()
+                );
+            }
+            let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !token.is_empty() {
+                return Ok(Some(token));
+            }
+        }
+        Ok(None)
+    }
+
     /// Replaces the internal HTTP client with a fresh one.
     /// This is used to recover from degraded connection pools without restarting the service.
     async fn refresh_client(&self) {
@@ -295,10 +483,8 @@ impl GeminiClient {
     ) -> Result<GenerateContentResponse> {
         tracing::info!("Sending Gemini request...");
 
-        let url = format!(
-            "{}/v1beta/models/{}:generateContent",
-            self.base_url, self.model
-        );
+        let base_url = self.effective_base_url().await?;
+        let url = format!("{}/v1beta/models/{}:generateContent", base_url, self.model);
         self.post_request(&url, request).await
     }
 
@@ -310,7 +496,13 @@ impl GeminiClient {
         let re = Regex::new(r"Please retry in ([0-9.]+)s").unwrap();
 
         let client = self.client.read().await.clone();
-        let res = match client.post(url).json(body).send().await {
+        let mut req_builder = client.post(url).json(body);
+        if let Some(token) = self.resolve_bearer_token()? {
+            req_builder =
+                req_builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", token));
+        }
+
+        let res = match req_builder.send().await {
             Ok(res) => res,
             Err(e) => {
                 let err_str = redact_secret(&format!("{:#}", anyhow::Error::from(e)));
@@ -800,12 +992,95 @@ mod tests {
             model: "gemini-2.5-pro".to_string(),
             base_url: base_url.to_string(),
             api_key: String::new(),
+            proxy_command: None,
+            auth_token_command: None,
+            proxy_url: tokio::sync::OnceCell::new(),
+            proxy_guard: tokio::sync::Mutex::new(None),
             client: RwLock::new(Client::new()),
         };
         assert_ne!(
             client("https://generativelanguage.googleapis.com").cache_identity(),
             client("https://proxy.invalid").cache_identity()
         );
+    }
+
+    #[tokio::test]
+    async fn test_proxy_command_lifecycle_and_port_discovery() {
+        let client = GeminiClient {
+            model: "gemini-2.5-pro".to_string(),
+            base_url: "https://generativelanguage.googleapis.com".to_string(),
+            api_key: String::new(),
+            proxy_command: Some("echo 18432 > {port_file}; sleep 10".to_string()),
+            auth_token_command: None,
+            proxy_url: tokio::sync::OnceCell::new(),
+            proxy_guard: tokio::sync::Mutex::new(None),
+            client: RwLock::new(Client::new()),
+        };
+
+        let resolved = client.effective_base_url().await.unwrap();
+        assert_eq!(resolved, "http://localhost:18432");
+
+        let port_file = {
+            let guard = client.proxy_guard.lock().await;
+            guard.as_ref().unwrap().port_file.clone()
+        };
+        assert!(port_file.exists());
+
+        drop(client);
+        assert!(!port_file.exists());
+    }
+
+    #[test]
+    fn test_auth_token_command_resolution() {
+        let client = GeminiClient {
+            model: "gemini-2.5-pro".to_string(),
+            base_url: "https://generativelanguage.googleapis.com".to_string(),
+            api_key: String::new(),
+            proxy_command: None,
+            auth_token_command: Some("echo mock-bearer-token-xyz".to_string()),
+            proxy_url: tokio::sync::OnceCell::new(),
+            proxy_guard: tokio::sync::Mutex::new(None),
+            client: RwLock::new(Client::new()),
+        };
+
+        let token = client.resolve_bearer_token().unwrap();
+        assert_eq!(token, Some("mock-bearer-token-xyz".to_string()));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local proxy daemon"]
+    async fn test_live_auto_proxy_completion() {
+        let client = GeminiClient {
+            model: "gemini-3-flash-preview".to_string(),
+            base_url: "https://generativelanguage.googleapis.com".to_string(),
+            api_key: String::new(),
+            proxy_command: None,
+            auth_token_command: None,
+            proxy_url: tokio::sync::OnceCell::new(),
+            proxy_guard: tokio::sync::Mutex::new(None),
+            client: RwLock::new(Client::new()),
+        };
+        let req = AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("Reply with the exact word PONG".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            response_format: Some(AiResponseFormat::Text),
+            temperature: Some(0.0),
+            context_tag: None,
+        };
+        let resp = AiProvider::generate_content(&client, req)
+            .await
+            .expect("Live auto-proxy request should succeed");
+        let text = resp.content.unwrap_or_default();
+        println!("Live auto-proxy response: {}", text);
+        assert!(text.to_uppercase().contains("PONG"));
     }
 
     #[test]
