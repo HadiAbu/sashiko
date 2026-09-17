@@ -1078,7 +1078,63 @@ pub async fn run_worker_from_stdin(options: WorkerOptions) -> Result<Value> {
     }
     let input: ReviewInput = serde_json::from_str(&buffer)?;
     let repo_override = options.repo.clone();
-    run_worker(input, options, repo_override, None).await
+    run_worker(input, options, repo_override, Some(&progress_to_stderr)).await
+}
+
+/// The line prefix `progress_to_stderr` writes and `sashiko-cli local` keys
+/// on when it streams the worker's stderr.
+pub const PROGRESS_LINE_PREFIX: &str = "progress: ";
+
+/// Renders the AI-phase events as plain lines on stderr, one per event, for
+/// the worker subprocess. Its parent owns the terminal and decides what to
+/// show; without these lines the whole AI phase is silent from outside, and a
+/// slow review is indistinguishable from a hung one.
+pub fn progress_to_stderr(event: ProgressEvent) {
+    if let Some(line) = progress_line(event) {
+        eprintln!("{PROGRESS_LINE_PREFIX}{line}");
+    }
+}
+
+/// The text after the prefix for an AI-phase event; `None` for the events
+/// the worker's log lines already cover.
+pub fn progress_line(event: ProgressEvent) -> Option<String> {
+    let line = match event {
+        ProgressEvent::AiReviewStarted { patches } => format!(
+            "reviewing {} patch{}",
+            patches,
+            if patches == 1 { "" } else { "es" }
+        ),
+        ProgressEvent::AiReviewPreScreenStarted { patch_index } => {
+            format!("patch {patch_index}: pre-screen")
+        }
+        ProgressEvent::AiReviewPlanningStarted { patch_index } => {
+            format!("patch {patch_index}: planning")
+        }
+        ProgressEvent::AiReviewPlanReady {
+            patch_index,
+            planned_stages,
+        } => format!("patch {patch_index}: stages {}", planned_stages.join(", ")),
+        ProgressEvent::AiReviewStageStarted { patch_index, stage } => {
+            format!("patch {patch_index}: {stage} started")
+        }
+        ProgressEvent::AiReviewStageTurn {
+            patch_index,
+            stage,
+            turn,
+            max_turns,
+        } => format!("patch {patch_index}: {stage} turn {turn}/{max_turns}"),
+        ProgressEvent::AiReviewStageFinished { patch_index, stage } => {
+            format!("patch {patch_index}: {stage} finished")
+        }
+        ProgressEvent::AiReviewAttempt {
+            patch_index,
+            attempt,
+            max_attempts,
+        } if attempt > 1 => format!("patch {patch_index}: retry {attempt}/{max_attempts}"),
+        ProgressEvent::AiReviewFinished { patch_index } => format!("patch {patch_index}: done"),
+        _ => return None,
+    };
+    Some(line)
 }
 
 pub fn result_has_error(result: &Value) -> bool {
@@ -1872,5 +1928,62 @@ mod tests {
         assert_eq!(output["concerns"].as_array().unwrap().len(), 1);
         assert_eq!(output["concerns_count"], 3);
         assert_eq!(output["findings"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_worker_progress_lines_are_what_the_cli_keys_on() {
+        // sashiko-cli local strips PROGRESS_LINE_PREFIX and treats a line
+        // containing " turn " as a tick to overwrite rather than print.
+        let turn = progress_line(ProgressEvent::AiReviewStageTurn {
+            patch_index: 2,
+            stage: "security".to_string(),
+            turn: 3,
+            max_turns: 20,
+        })
+        .unwrap();
+        assert_eq!(turn, "patch 2: security turn 3/20");
+        assert!(turn.contains(" turn "));
+
+        for (event, expected) in [
+            (
+                ProgressEvent::AiReviewStageStarted {
+                    patch_index: 1,
+                    stage: "locking".to_string(),
+                },
+                "patch 1: locking started",
+            ),
+            (
+                ProgressEvent::AiReviewStageFinished {
+                    patch_index: 1,
+                    stage: "locking".to_string(),
+                },
+                "patch 1: locking finished",
+            ),
+            (
+                ProgressEvent::AiReviewAttempt {
+                    patch_index: 1,
+                    attempt: 2,
+                    max_attempts: 3,
+                },
+                "patch 1: retry 2/3",
+            ),
+        ] {
+            let line = progress_line(event).unwrap();
+            assert_eq!(line, expected);
+            assert!(!line.contains(" turn "), "a non-tick line reads as a tick");
+        }
+
+        // A first attempt and the pre-AI events are covered by the worker's
+        // log lines and print nothing here.
+        assert!(
+            progress_line(ProgressEvent::AiReviewAttempt {
+                patch_index: 1,
+                attempt: 1,
+                max_attempts: 3,
+            })
+            .is_none()
+        );
+        assert!(progress_line(ProgressEvent::PatchApplied { index: 1 }).is_none());
+        assert!(PROGRESS_LINE_PREFIX.ends_with(' '));
     }
 }

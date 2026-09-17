@@ -1675,8 +1675,14 @@ async fn handle_local(
         // without the tail a failed review would collapse to a bare "no output"
         // message with its actual cause (a stage error, an auth/quota failure)
         // discarded. On failure we replay the tail so the run explains itself.
+        // The worker's own progress lines (stage started, turn n/m, finished)
+        // are shown as they arrive: they are the only sign of life during the
+        // AI phase. Turn ticks overwrite one line on a terminal and are kept
+        // out of the tail, which they would otherwise fill.
         let stderr = child.stderr.take();
+        let stderr_is_terminal = std::io::stderr().is_terminal();
         let stderr_handle = tokio::spawn(async move {
+            use sashiko::local_review::PROGRESS_LINE_PREFIX;
             use std::collections::VecDeque;
             const STDERR_TAIL_LINES: usize = 100;
             let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
@@ -1686,6 +1692,7 @@ async fn handle_local(
                 let mut lines = reader.lines();
                 let mut saw_applying = false;
                 let mut saw_ai_review = false;
+                let mut turn_line_open = false;
                 while let Ok(Some(line)) = lines.next_line().await {
                     if !saw_applying && line.contains("Applying") {
                         saw_applying = true;
@@ -1697,6 +1704,20 @@ async fn handle_local(
                         eprint_phase(3, 4, "AI review in progress...");
                         eprintln!();
                     }
+                    if let Some(progress) = line.strip_prefix(PROGRESS_LINE_PREFIX) {
+                        if progress.contains(" turn ") {
+                            if stderr_is_terminal {
+                                eprint!("\r\x1b[2K      {progress}");
+                                turn_line_open = true;
+                            }
+                            continue;
+                        }
+                        if turn_line_open {
+                            eprint!("\r\x1b[2K");
+                            turn_line_open = false;
+                        }
+                        eprintln!("      {progress}");
+                    }
                     if line.contains("AI review completed") {
                         eprint_phase(4, 4, "Review complete.");
                         eprintln!();
@@ -1705,6 +1726,9 @@ async fn handle_local(
                         tail.pop_front();
                     }
                     tail.push_back(line);
+                }
+                if turn_line_open {
+                    eprintln!();
                 }
             }
             tail
