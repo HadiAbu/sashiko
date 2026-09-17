@@ -181,9 +181,13 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                 .map(|stage| stage.execute_isolated(env, state, event_cb));
             let results = futures::future::join_all(futures).await;
 
+            let mut successes = 0;
+            let mut first_error = None;
+
             for (stage, res) in stages.iter().zip(results) {
                 match res {
                     Ok((stage_outcome, mutation)) => {
+                        successes += 1;
                         mutation(state);
                         outcome.tokens_in += stage_outcome.tokens_in;
                         outcome.tokens_out += stage_outcome.tokens_out;
@@ -196,8 +200,22 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                             stage.name(),
                             err
                         );
+                        if first_error.is_none() {
+                            first_error = Some(err.context(format!(
+                                "All {} parallel stages failed under BestEffort policy (first failure in stage '{}')",
+                                stages.len(),
+                                stage.name()
+                            )));
+                        }
                     }
                 }
+            }
+
+            if !stages.is_empty()
+                && successes == 0
+                && let Some(err) = first_error
+            {
+                return Err(err);
             }
         }
     }
@@ -269,6 +287,9 @@ mod tests {
                     .pop_front()
                     .unwrap_or_else(|| self.response_json.clone())
             };
+            if content == "__ERROR__" {
+                anyhow::bail!("simulated fatal provider error");
+            }
             Ok(AiResponse {
                 content: Some(content),
                 thought: None,
@@ -400,5 +421,100 @@ mod tests {
         assert!(!outcome.early_exit);
         // The plan is reported as resolved, not guessed from the stage list.
         assert_eq!(*resolved.lock().unwrap(), vec!["stage_4", "stage_5"]);
+    }
+
+    #[tokio::test]
+    async fn test_workflow_best_effort_partial_success() {
+        let provider = Arc::new(MockProvider::queued(vec![
+            "__ERROR__".to_string(),
+            r#"{"items": ["concern_ok"]}"#.to_string(),
+        ]));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("best_effort_partial")
+            .parallel(
+                vec![
+                    Box::new(
+                        Stage::builder("stage_fail")
+                            .user_prompt(PromptTemplate::new("Fail"))
+                            .output_format(OutputFormat::json())
+                            .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                                s.concerns.extend(out.items);
+                            })
+                            .build(),
+                    ),
+                    Box::new(
+                        Stage::builder("stage_ok")
+                            .user_prompt(PromptTemplate::new("Succeed"))
+                            .output_format(OutputFormat::json())
+                            .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                                s.concerns.extend(out.items);
+                            })
+                            .build(),
+                    ),
+                ],
+                ParallelPolicy::BestEffort,
+            )
+            .build();
+
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .expect("BestEffort should succeed when at least one stage succeeds");
+        assert!(!outcome.early_exit);
+        assert_eq!(state.concerns, vec!["concern_ok".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_workflow_best_effort_total_failure() {
+        let provider = Arc::new(MockProvider::single("__ERROR__"));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("best_effort_total_fail")
+            .parallel(
+                vec![
+                    Box::new(
+                        Stage::builder("stage_fail_1")
+                            .user_prompt(PromptTemplate::new("Fail 1"))
+                            .output_format(OutputFormat::json())
+                            .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                                s.concerns.extend(out.items);
+                            })
+                            .build(),
+                    ),
+                    Box::new(
+                        Stage::builder("stage_fail_2")
+                            .user_prompt(PromptTemplate::new("Fail 2"))
+                            .output_format(OutputFormat::json())
+                            .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                                s.concerns.extend(out.items);
+                            })
+                            .build(),
+                    ),
+                ],
+                ParallelPolicy::BestEffort,
+            )
+            .build();
+
+        let res = WorkflowEngine::execute(&workflow, &env, &mut state, None).await;
+        assert!(
+            res.is_err(),
+            "BestEffort should fail when all parallel stages fail"
+        );
     }
 }
