@@ -1745,12 +1745,16 @@ async fn handle_local(
         let exit_code = output.status.code().unwrap_or(1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-        if stdout.trim().is_empty() {
-            // The subprocess failed before emitting a result; replay its log
-            // tail so the actual cause is visible rather than swallowed.
+        // A subprocess that failed before emitting a result, or emitted
+        // something that is not a result, has its cause in the log tail;
+        // replay it rather than reporting a bare exit code or parse error.
+        let replay_tail = || {
             for line in &stderr_tail {
                 eprintln!("{line}");
             }
+        };
+        if stdout.trim().is_empty() {
+            replay_tail();
             return Err(anyhow::anyhow!(
                 "Review subprocess produced no output (exit code: {})",
                 exit_code
@@ -1758,8 +1762,17 @@ async fn handle_local(
         }
 
         // Parse the review output
-        let result: Value =
-            serde_json::from_str(stdout.trim()).context("Failed to parse review output JSON")?;
+        let result: Value = match serde_json::from_str(stdout.trim()) {
+            Ok(value) => value,
+            Err(err) => {
+                replay_tail();
+                return Err(anyhow::anyhow!(
+                    "Failed to parse review output JSON: {} (exit code: {})",
+                    err,
+                    exit_code
+                ));
+            }
+        };
 
         match format {
             OutputFormat::Json => {
