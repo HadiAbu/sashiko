@@ -349,9 +349,109 @@ impl Reviewer {
             .await?;
         }
 
+        ctx.db.release_embargoed_forge_outbox(patchset.id).await?;
         ctx.db.clear_patchset_embargo(patchset.id).await?;
         info!("Embargo released successfully for patchset {}", patchset.id);
         Ok(())
+    }
+
+    async fn queue_forge_pr_comment(
+        ctx: &ReviewContext,
+        patchset: &PatchsetRow,
+        diffs: &[(i64, i64, String, String, String, i64, String)],
+    ) -> Result<()> {
+        let Some(mr_url) = patchset.mr_url.as_deref() else {
+            return Ok(());
+        };
+        let Some(repo) = crate::forge::extract_owner_repo_from_mr_url(mr_url) else {
+            return Ok(());
+        };
+        let Some(pr_number) = patchset.mr_number else {
+            return Ok(());
+        };
+
+        let provider = if mr_url.contains("gitlab") {
+            "gitlab"
+        } else {
+            "github"
+        };
+
+        let reviews = ctx
+            .db
+            .get_completed_reviews_for_release(patchset.id)
+            .await?;
+
+        let total_parts = patchset.total_parts.unwrap_or(diffs.len() as u32) as usize;
+        let mut series_summary: Option<String> = None;
+        let mut items = Vec::new();
+
+        for (patch_id, idx, _diff, subj, _auth, _date, msg_id) in diffs {
+            let matching_review = reviews
+                .iter()
+                .find(|r| r.patch_id == *patch_id || r.index == *idx);
+            if *idx == 0 {
+                if let Some(r) = matching_review
+                    && !r.summary.trim().is_empty()
+                {
+                    series_summary = Some(r.summary.clone());
+                }
+                continue;
+            }
+            let is_sha = msg_id.len() == 40 && msg_id.chars().all(|c| c.is_ascii_hexdigit());
+            let inline_review = matching_review
+                .map(|r| r.inline_review.clone())
+                .filter(|s| {
+                    let t = s.trim();
+                    !t.is_empty() && t != "No issues found."
+                });
+            items.push(crate::forge::PatchReviewSummaryItem {
+                part_index: *idx as usize,
+                total_parts,
+                commit_id: if is_sha { Some(msg_id.clone()) } else { None },
+                subject: subj.clone(),
+                inline_review,
+            });
+        }
+
+        let domain = if ctx.settings.project.domain.is_empty() {
+            "sashiko.sashiko.dev"
+        } else {
+            ctx.settings.project.domain.as_str()
+        };
+        let slug = patchset
+            .slug
+            .as_deref()
+            .or(patchset.message_id.as_deref())
+            .unwrap_or("");
+        let target_url = format!("https://{}/#/patchset/{}", domain, slug);
+
+        let version =
+            crate::forge::extract_mr_version_from_subject(patchset.subject.as_deref(), pr_number);
+        let body = crate::forge::compose_pr_review_comment(
+            version,
+            items.len(),
+            series_summary.as_deref(),
+            &items,
+            &target_url,
+        );
+
+        let head_sha = items.last().and_then(|p| p.commit_id.as_deref());
+        let now = chrono::Utc::now().timestamp();
+        let is_embargoed = patchset.embargo_until.is_some_and(|t| t > now);
+        let status = ctx.settings.forge.post_mode.outbox_status(is_embargoed);
+
+        ctx.db
+            .insert_forge_outbox(
+                patchset.id,
+                provider,
+                &repo,
+                pr_number,
+                head_sha,
+                &body,
+                &target_url,
+                status,
+            )
+            .await
     }
 
     async fn review_patchset_task(ctx: ReviewContext, patchset: PatchsetRow) {
@@ -748,14 +848,22 @@ impl Reviewer {
                     .update_patchset_status(patchset_id, &final_status)
                     .await;
 
-                if review_success
-                    && patchset.embargo_until.is_some()
-                    && let Err(e) = Self::release_patchset_results(&ctx, &patchset).await
-                {
-                    error!(
-                        "Failed to release clean patchset {} immediately: {}",
-                        patchset_id, e
-                    );
+                if review_success {
+                    if let Err(e) = Self::queue_forge_pr_comment(&ctx, &patchset, &diffs).await {
+                        error!(
+                            "Failed to queue forge PR comment for patchset {}: {}",
+                            patchset_id, e
+                        );
+                    }
+
+                    if patchset.embargo_until.is_some()
+                        && let Err(e) = Self::release_patchset_results(&ctx, &patchset).await
+                    {
+                        error!(
+                            "Failed to release clean patchset {} immediately: {}",
+                            patchset_id, e
+                        );
+                    }
                 }
             }
         } else {

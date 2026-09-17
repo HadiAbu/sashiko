@@ -553,6 +553,12 @@ pub fn compose_pr_review_comment(
         _ => "### Sashiko review".to_string(),
     };
 
+    let link_host = target_url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split('/').next())
+        .filter(|h| !h.is_empty())
+        .unwrap_or("sashiko.sashiko.dev");
+
     let commit_word = if total_commits == 1 {
         "1 commit".to_string()
     } else {
@@ -562,15 +568,16 @@ pub fn compose_pr_review_comment(
     let patches_with_findings: Vec<&PatchReviewSummaryItem> = patches
         .iter()
         .filter(|p| {
-            p.inline_review
-                .as_deref()
-                .is_some_and(|text| !text.trim().is_empty())
+            p.inline_review.as_deref().is_some_and(|text| {
+                let t = text.trim();
+                !t.is_empty() && t != "No issues found."
+            })
         })
         .collect();
 
     if patches_with_findings.is_empty() {
         return format!(
-            "{header}\n\n✓ **No issues found** across {commit_word}.\n\n[Full review log on sashiko.sashiko.dev]({target_url})\n"
+            "{header}\n\n✓ **No issues found** across {commit_word}.\n\n[Full review log on {link_host}]({target_url})\n"
         );
     }
 
@@ -608,7 +615,7 @@ pub fn compose_pr_review_comment(
         }
     }
 
-    let footer = format!("[Full review and stage logs on sashiko.sashiko.dev]({target_url})\n");
+    let footer = format!("[Full review and stage logs on {link_host}]({target_url})\n");
 
     if out.len() + footer.len() > MAX_GITHUB_COMMENT_BYTES {
         let mut cut = MAX_GITHUB_COMMENT_BYTES.saturating_sub(footer.len() + 64);
@@ -797,6 +804,25 @@ fn strip_existing_mr_prefix(title: &str, number: i64) -> &str {
         }
     }
     trimmed
+}
+
+/// Extract the version number from a pull request subject formatted by `format_mr_subject`.
+pub fn extract_mr_version_from_subject(subject: Option<&str>, number: i64) -> Option<u32> {
+    let trimmed = subject?.trim();
+    for pfx in ['#', '!'] {
+        let base = format!("{}{}", pfx, number);
+        if let Some(rest) = trimmed.strip_prefix(&base) {
+            let rest = rest.trim_start();
+            if let Some(after_v) = rest.strip_prefix("[v")
+                && let Some((digits, _)) = after_v.split_once(']')
+                && let Ok(v) = digits.parse::<u32>()
+            {
+                return Some(v);
+            }
+            return Some(1);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1493,7 +1519,7 @@ mod tests {
                 total_parts: 2,
                 commit_id: Some("fedcba0987654321fedcba0987654321fedcba09".to_string()),
                 subject: "second clean patch".to_string(),
-                inline_review: Some("   ".to_string()),
+                inline_review: Some("No issues found.".to_string()),
             },
         ];
         let body = compose_pr_review_comment(

@@ -928,6 +928,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
+    let forge_handle = if settings.forge.enabled {
+        let forge_worker = sashiko::worker::forge::ForgeWorker::new(
+            db.clone(),
+            settings.forge.clone(),
+            settings.review.max_retries,
+        );
+        Some(tokio::spawn(async move {
+            forge_worker.run().await;
+        }))
+    } else {
+        None
+    };
+
     let bug_worker_handle = {
         let provider =
             sashiko::ai::create_provider(&settings).expect("Provider setup failed for bug worker");
@@ -1073,6 +1086,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         h.abort();
     }
     patchwork_handle.abort();
+    if let Some(h) = forge_handle {
+        h.abort();
+    }
     bug_worker_handle.abort();
     compressor_handle.abort();
     commit_graph_handle.abort();

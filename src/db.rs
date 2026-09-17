@@ -7099,7 +7099,7 @@ impl Database {
 
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
         let mut rows = self.conn.query(
-            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug
+            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug, mr_url, mr_title, mr_number
              FROM patchsets WHERE status = 'Pending' ORDER BY date ASC LIMIT ?",
             libsql::params![limit as i64],
         ).await?;
@@ -7132,10 +7132,10 @@ impl Database {
                 baseline_logs: None,
                 provider: None,
                 embargo_until: row.get(14).ok(),
-                mr_url: None,
-                mr_title: None,
-                mr_number: None,
                 slug: row.get(15).ok(),
+                mr_url: row.get(16).ok(),
+                mr_title: row.get(17).ok(),
+                mr_number: row.get(18).ok(),
             });
         }
         Ok(patchsets)
@@ -7147,7 +7147,7 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<PatchsetRow>> {
         let sql = format!(
-            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until
+            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until, p.slug, p.mr_url, p.mr_title, p.mr_number
              FROM patchsets p
              WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
              AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
@@ -7192,10 +7192,10 @@ impl Database {
                         baseline_logs: None,
                         provider: None,
                         embargo_until: row.get(14).ok(),
-                        mr_url: None,
-                        mr_title: None,
-                        mr_number: None,
-                        slug: None,
+                        slug: row.get(15).ok(),
+                        mr_url: row.get(16).ok(),
+                        mr_title: row.get(17).ok(),
+                        mr_number: row.get(18).ok(),
                     });
                 }
                 Ok(None) => break,

@@ -15,6 +15,7 @@
 pub mod bug_worker;
 pub mod compressor;
 pub mod email;
+pub mod forge;
 pub mod patchwork;
 pub mod prefetch;
 pub mod prompts;

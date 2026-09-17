@@ -149,6 +149,8 @@ spec:
               value: "true"
             - name: SASHIKO__FORGE__PROVIDER
               value: "github"
+            - name: SASHIKO__FORGE__POST_MODE
+              value: "live"
             - name: GIT_CONFIG_COUNT
               value: "1"
             - name: GIT_CONFIG_KEY_0
@@ -183,6 +185,24 @@ spec:
                 secretKeyRef:
                   name: sashiko-self-secrets
                   key: SASHIKO__FORGE__API_TOKEN
+                  optional: true
+            - name: SASHIKO__FORGE__APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO__FORGE__APP_ID
+                  optional: true
+            - name: SASHIKO__FORGE__INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO__FORGE__INSTALLATION_ID
+                  optional: true
+            - name: SASHIKO__FORGE__APP_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-self-secrets
+                  key: SASHIKO__FORGE__APP_PRIVATE_KEY
                   optional: true
           volumeMounts:
             - name: sashiko-self-storage
