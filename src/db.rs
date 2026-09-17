@@ -1006,6 +1006,24 @@ pub struct PatchworkOutboxRow {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ForgeOutboxRow {
+    pub id: i64,
+    pub patchset_id: i64,
+    pub provider: String,
+    pub repo: String,
+    pub pr_number: i64,
+    pub head_sha: Option<String>,
+    pub body: String,
+    pub target_url: String,
+    pub status: String,
+    pub retry_count: i64,
+    pub next_retry_at: Option<i64>,
+    pub locked_at: Option<i64>,
+    pub error_log: Option<String>,
+    pub created_at: i64,
+}
+
 impl Database {
     pub fn has_bug_actor(&self) -> bool {
         self.bug_actor != "system" || self.bug_tool != "sashiko"
@@ -1534,7 +1552,20 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 9.");
+        if current_version < 10 {
+            info!("Applying database migration version 10 (forge outbox)...");
+            self.conn
+                .execute_batch(include_str!(
+                    "migrations/009_patchset_maintainer_sections.sql"
+                ))
+                .await?;
+            self.conn
+                .execute_batch(include_str!("migrations/010_forge_outbox.sql"))
+                .await?;
+            self.conn.execute("PRAGMA user_version = 10", ()).await?;
+        }
+
+        info!("Database schema is up to date at version 10.");
 
         Ok(())
     }
@@ -7965,6 +7996,156 @@ impl Database {
             .execute(
                 "UPDATE patchwork_outbox SET status = 'Pending', locked_at = NULL WHERE status = 'Sending' AND locked_at < ?",
                 libsql::params![ten_mins_ago],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    // -- Forge outbox operations --
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_forge_outbox(
+        &self,
+        patchset_id: i64,
+        provider: &str,
+        repo: &str,
+        pr_number: i64,
+        head_sha: Option<&str>,
+        body: &str,
+        target_url: &str,
+        status: &str,
+    ) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT 1 FROM forge_outbox WHERE patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            info!(
+                "Forge outbox entry already exists for patchset_id {}, skipping duplicate.",
+                patchset_id
+            );
+            return Ok(());
+        }
+
+        let created_at = chrono::Utc::now().timestamp();
+        self.conn
+            .execute(
+                "INSERT INTO forge_outbox (patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                libsql::params![
+                    patchset_id,
+                    provider,
+                    repo,
+                    pr_number,
+                    head_sha,
+                    body,
+                    target_url,
+                    status,
+                    created_at,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn lock_pending_forge_outbox(&self) -> Result<Option<ForgeOutboxRow>> {
+        let now = chrono::Utc::now().timestamp();
+        let mut rows = self
+            .conn
+            .query(
+                "UPDATE forge_outbox
+                 SET status = 'Sending', locked_at = ?
+                 WHERE id = (
+                     SELECT id FROM forge_outbox
+                     WHERE status = 'Pending'
+                       AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                     LIMIT 1
+                 )
+                 RETURNING id, patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, retry_count, next_retry_at, locked_at, error_log, created_at",
+                libsql::params![now, now],
+            )
+            .await?;
+
+        if let Ok(Some(row)) = rows.next().await {
+            Ok(Some(ForgeOutboxRow {
+                id: row.get(0)?,
+                patchset_id: row.get(1)?,
+                provider: row.get(2)?,
+                repo: row.get(3)?,
+                pr_number: row.get(4)?,
+                head_sha: row.get::<String>(5).ok(),
+                body: row.get(6)?,
+                target_url: row.get(7)?,
+                status: row.get(8)?,
+                retry_count: row.get(9)?,
+                next_retry_at: row.get::<i64>(10).ok(),
+                locked_at: row.get::<i64>(11).ok(),
+                error_log: row.get::<String>(12).ok(),
+                created_at: row.get(13)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn mark_forge_outbox_sent(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE forge_outbox SET status = 'Sent', locked_at = NULL WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn mark_forge_outbox_failed(&self, id: i64, error_log: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE forge_outbox SET status = 'Failed', error_log = ?, locked_at = NULL WHERE id = ?",
+                libsql::params![error_log.to_string(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn set_forge_outbox_retry_at(
+        &self,
+        id: i64,
+        next_retry_at: i64,
+        error_log: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE forge_outbox
+                 SET status = 'Pending', retry_count = retry_count + 1, next_retry_at = ?, error_log = ?, locked_at = NULL
+                 WHERE id = ?",
+                libsql::params![next_retry_at, error_log.to_string(), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn sweep_ghost_forge_outbox(&self) -> Result<u64> {
+        let ten_mins_ago = chrono::Utc::now().timestamp() - 600;
+        let count = self
+            .conn
+            .execute(
+                "UPDATE forge_outbox SET status = 'Pending', locked_at = NULL WHERE status = 'Sending' AND locked_at < ?",
+                libsql::params![ten_mins_ago],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    pub async fn release_embargoed_forge_outbox(&self, patchset_id: i64) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(
+                "UPDATE forge_outbox SET status = 'Pending' WHERE patchset_id = ? AND status = 'Embargoed'",
+                libsql::params![patchset_id],
             )
             .await?;
         Ok(count)
@@ -17447,5 +17628,89 @@ mod tests {
             rotated_v1["subject"].as_str(),
             Some("#513: baseline: route iwl-net and iwl-next series to dev-queue")
         );
+    }
+
+    #[tokio::test]
+    async fn test_forge_outbox_lifecycle_and_deduplication() {
+        let db = setup_db().await;
+
+        let ps_id = db
+            .create_fetching_patchset(
+                "mr-515-aaa..bbb@sashiko.local",
+                "Fetching GitHub PR/MR: #515",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/515"),
+                Some("Sashiko fixups"),
+                Some(515),
+                Some("sashiko-515"),
+            )
+            .await
+            .unwrap();
+
+        db.insert_forge_outbox(
+            ps_id,
+            "github",
+            "sashiko-dev/sashiko",
+            515,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "### Sashiko review\n\nNo issues found.",
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-515",
+            "Embargoed",
+        )
+        .await
+        .unwrap();
+
+        db.insert_forge_outbox(
+            ps_id,
+            "github",
+            "sashiko-dev/sashiko",
+            515,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            "different body",
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-515",
+            "Pending",
+        )
+        .await
+        .unwrap();
+
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        let released = db.release_embargoed_forge_outbox(ps_id).await.unwrap();
+        assert_eq!(released, 1);
+
+        let row = db
+            .lock_pending_forge_outbox()
+            .await
+            .unwrap()
+            .expect("should lock pending row");
+        assert_eq!(row.patchset_id, ps_id);
+        assert_eq!(row.repo, "sashiko-dev/sashiko");
+        assert_eq!(row.pr_number, 515);
+        assert_eq!(row.status, "Sending");
+        assert!(row.body.contains("No issues found."));
+
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        let future_ts = chrono::Utc::now().timestamp() + 60;
+        db.set_forge_outbox_retry_at(row.id, future_ts, "502 Bad Gateway")
+            .await
+            .unwrap();
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
+
+        let past_ts = chrono::Utc::now().timestamp() - 5;
+        db.set_forge_outbox_retry_at(row.id, past_ts, "502 Bad Gateway")
+            .await
+            .unwrap();
+        let retried = db
+            .lock_pending_forge_outbox()
+            .await
+            .unwrap()
+            .expect("should re-lock after backoff elapsed");
+        assert_eq!(retried.id, row.id);
+        assert_eq!(retried.retry_count, 2);
+
+        db.mark_forge_outbox_sent(retried.id).await.unwrap();
+        assert!(db.lock_pending_forge_outbox().await.unwrap().is_none());
     }
 }
