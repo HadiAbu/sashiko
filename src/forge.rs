@@ -205,6 +205,16 @@ pub fn event_label(headers: &HeaderMap) -> &str {
         .unwrap_or("(none)")
 }
 
+/// Whether an action reported for a change request asks for a review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewIntent {
+    /// The request carries commits that have not been reviewed yet.
+    Review,
+    /// The forge is reporting a change that leaves the commits untouched,
+    /// such as a label, an assignee or a title edit.
+    Skip,
+}
+
 /// Trait for forge provider implementations
 pub trait ForgeProvider: Send + Sync {
     /// Provider name (e.g., "GitHub", "GitLab")
@@ -225,6 +235,11 @@ pub trait ForgeProvider: Send + Sync {
 
     /// Parse webhook payload and extract metadata
     fn parse_payload(&self, body: &Bytes) -> Result<(String, ForgeMetadata), StatusCode>;
+
+    /// Decide whether the action reported by `parse_payload` describes new
+    /// commits. The action vocabulary belongs to the provider, so each one
+    /// answers for itself.
+    fn review_intent(&self, action: &str) -> ReviewIntent;
 }
 
 /// GitHub forge provider
@@ -326,6 +341,16 @@ impl ForgeProvider for GitHubForge {
         };
 
         Ok((action, metadata))
+    }
+
+    fn review_intent(&self, action: &str) -> ReviewIntent {
+        // GitHub reports roughly twenty actions on a pull request and sends
+        // every one of them to a subscriber. Only these four can leave the
+        // head commit different from the last time it was seen.
+        match action {
+            "opened" | "reopened" | "synchronize" | "ready_for_review" => ReviewIntent::Review,
+            _ => ReviewIntent::Skip,
+        }
     }
 }
 
@@ -443,6 +468,15 @@ impl ForgeProvider for GitLabForge {
         };
 
         Ok((action, metadata))
+    }
+
+    fn review_intent(&self, _action: &str) -> ReviewIntent {
+        // parse_payload reports the object kind here, not the action inside
+        // object_attributes, so there is nothing to discriminate on yet and
+        // every merge request hook is reviewed as it always was. Narrowing
+        // this needs the action and oldrev fields, which is a change to
+        // GitLab parsing rather than to the route.
+        ReviewIntent::Review
     }
 }
 
@@ -1149,6 +1183,47 @@ mod tests {
             forge.validate_event(&headers, &body, None).unwrap_err(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn test_github_review_intent_accepts_commit_changing_actions() {
+        let forge = GitHubForge;
+        for action in ["opened", "reopened", "synchronize", "ready_for_review"] {
+            assert_eq!(
+                forge.review_intent(action),
+                ReviewIntent::Review,
+                "{action} should be reviewed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_github_review_intent_skips_metadata_actions() {
+        let forge = GitHubForge;
+        for action in [
+            "labeled",
+            "unlabeled",
+            "edited",
+            "assigned",
+            "review_requested",
+            "closed",
+            "converted_to_draft",
+            // An action GitHub has not invented yet is skipped rather than
+            // charged a review on the guess that it moved the head commit.
+            "some_future_action",
+        ] {
+            assert_eq!(
+                forge.review_intent(action),
+                ReviewIntent::Skip,
+                "{action} should be skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gitlab_review_intent_reviews_every_merge_request_hook() {
+        let forge = GitLabForge;
+        assert_eq!(forge.review_intent("merge_request"), ReviewIntent::Review);
     }
 
     #[test]

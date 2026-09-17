@@ -1941,10 +1941,25 @@ async fn forge_webhook(
     info!(
         "{} {}: {} - {}",
         forge.name(),
-        action,
+        crate::forge::loggable(&action),
         metadata.pr_title.as_deref().unwrap_or("(no title)"),
         metadata.pr_url.as_deref().unwrap_or("(no url)")
     );
+
+    // A forge reports far more than new commits, and the base sha it sends
+    // moves with the target branch. Reviewing an action that changed only a
+    // label would spend a full review re-reading code that did not change.
+    if forge.review_intent(&action) == crate::forge::ReviewIntent::Skip {
+        info!(
+            "{} {} carries no new commits, skipping review",
+            forge.name(),
+            crate::forge::loggable(&action)
+        );
+        return Ok(Json(serde_json::json!({
+            "status": "ignored",
+            "message": format!("{} action carries no new commits", forge.name())
+        })));
+    }
 
     let default_subject = format!("{} #{}", forge.name(), metadata.pr_number);
     let subject = metadata.pr_title.as_deref().unwrap_or(&default_subject);
