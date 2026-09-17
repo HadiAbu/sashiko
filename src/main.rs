@@ -2086,6 +2086,21 @@ async fn process_parsed_article(
         subsystems.extend(path_subsystems);
     }
 
+    // The MAINTAINERS sections this part touches, which is a different
+    // question from the mailing list labels above and answered from different
+    // evidence. Those come from Cc: and name lists that anyone can address;
+    // these come from the files the patch actually changes and name the people
+    // the kernel trusts with that code. Only these decide who may later read
+    // the series' review transcripts, so they are kept apart all the way down
+    // to their own table rather than merged into the labels here.
+    let maintainer_sections: Vec<sashiko::db::AttributedSubsystem> = patch_opt
+        .as_ref()
+        .map(|p| sashiko::maintainers::sections_for_diff(&p.diff))
+        .unwrap_or_default()
+        .into_iter()
+        .map(sashiko::db::AttributedSubsystem::from_maintainers)
+        .collect();
+
     if group.starts_with("git-import") || group == "git-fetch" {
         let (label, email) = if let Some(url) = &mr_url {
             if let Some(repo_name) = sashiko::forge::extract_repo_name_from_mr_url(url) {
@@ -2328,6 +2343,23 @@ async fn process_parsed_article(
                     if let Err(e) = worker_db.add_subsystem_to_patchset(patchset_id, sid).await {
                         error!("Failed to link patchset to subsystem: {}", e);
                     }
+                }
+
+                // Added rather than replaced: a series arrives one part at a
+                // time, and the attribution is the union of what every part
+                // touches. A failure here is logged and not fatal, because it
+                // can only leave the series attributed to fewer sections than
+                // it should be, which withholds transcripts rather than
+                // disclosing them. Dropping the whole part instead would lose
+                // the patch itself over a permissions detail.
+                if let Err(e) = worker_db
+                    .add_patchset_maintainer_sections(patchset_id, &maintainer_sections)
+                    .await
+                {
+                    error!(
+                        "Failed to attribute patchset {} to MAINTAINERS sections: {}",
+                        patchset_id, e
+                    );
                 }
 
                 if let Some(patch) = patch_opt {

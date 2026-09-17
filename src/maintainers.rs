@@ -575,6 +575,29 @@ pub fn get_global_maintainers() -> Option<Arc<MaintainersIndex>> {
     GLOBAL_MAINTAINERS.read().unwrap().clone()
 }
 
+/// The MAINTAINERS sections that own the files a diff touches.
+///
+/// This is the one place that turns changed code into the people responsible
+/// for it, so that every caller attributing a patchset agrees on the answer.
+///
+/// An empty result means nobody was identified, and callers must read it that
+/// way. It is returned both when no index is loaded and when nothing matched,
+/// and the two are deliberately indistinguishable: a caller that could tell
+/// them apart would be tempted to fall back to something weaker, such as a
+/// directory prefix, and a directory prefix names nobody. Attributing a series
+/// to a guess is worse than attributing it to no one, because the guess would
+/// silently hand the series' transcripts to whoever happened to match.
+pub fn sections_for_diff(diff: &str) -> Vec<String> {
+    let files = crate::baseline::extract_files_from_diff(diff);
+    if files.is_empty() {
+        return Vec::new();
+    }
+    match get_global_maintainers() {
+        Some(index) => index.match_files(&files),
+        None => Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,6 +795,9 @@ F:	*/
         assert!(lists.contains(&"linux-btrfs@vger.kernel.org".to_string()));
     }
 
+    /// Also covers `sections_for_diff`, which reads the same global index.
+    /// Keeping both in one test keeps a single owner of that singleton; a
+    /// second test asserting against it would race this one.
     #[test]
     fn test_global_maintainers_lifecycle() {
         let index = MaintainersIndex::from_reader(SAMPLE_MAINTAINERS.as_bytes()).unwrap();
@@ -784,7 +810,41 @@ F:	*/
             retrieved.match_file("fs/btrfs/inode.c"),
             vec!["BTRFS FILE SYSTEM"]
         );
+
+        // A diff is attributed to the sections owning every file it touches.
+        let diff = "diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c\n\
+                    @@ -1 +1 @@\n\
+                    diff --git a/net/core/dev.c b/net/core/dev.c\n\
+                    @@ -1 +1 @@\n";
+        let mut sections = sections_for_diff(diff);
+        sections.sort();
+        assert_eq!(
+            sections,
+            vec![
+                "BTRFS FILE SYSTEM".to_string(),
+                "NETWORKING [GENERAL]".to_string()
+            ]
+        );
+
+        // A file no section claims attributes the diff to nobody rather than
+        // to a directory prefix standing in for one.
+        assert!(
+            sections_for_diff("diff --git a/unclaimed/thing.c b/unclaimed/thing.c\n").is_empty()
+        );
+
         clear_global_maintainers();
         assert!(get_global_maintainers().is_none());
+
+        // Without an index nothing is attributed, so a series ingested before
+        // MAINTAINERS loads stays closed rather than open.
+        assert!(sections_for_diff(diff).is_empty());
+    }
+
+    /// Returns before the global index is consulted, so this cannot race the
+    /// test above.
+    #[test]
+    fn test_sections_for_diff_without_file_names() {
+        assert!(sections_for_diff("").is_empty());
+        assert!(sections_for_diff("just a cover letter body\n").is_empty());
     }
 }
