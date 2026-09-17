@@ -330,6 +330,112 @@ impl FromRequestParts<Arc<crate::api::AppState>> for OptionalPrincipal {
     }
 }
 
+/// Whether a caller may read a patchset's raw review transcripts.
+///
+/// Two states rather than a bool so that the decision cannot be confused with
+/// any other predicate at a call site, and so that a future third state has
+/// somewhere to go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptAccess {
+    Denied,
+    Granted,
+}
+
+impl TranscriptAccess {
+    /// Whether this decision permits reading raw transcripts.
+    pub fn is_granted(self) -> bool {
+        self == TranscriptAccess::Granted
+    }
+}
+
+/// A principal together with the local-token evidence the HTTP edge saw.
+///
+/// Extracted infallibly: an anonymous caller resolves to a principal holding
+/// nothing rather than a rejection, because the routes this guards also serve
+/// public data and must not start refusing it.
+#[derive(Debug, Clone)]
+pub struct TranscriptPrincipal {
+    principal: Principal,
+    local_operator: bool,
+}
+
+impl TranscriptPrincipal {
+    /// Constructs a transcript principal from a resolved standing and whether
+    /// the local operator token was presented.
+    pub fn new(principal: Principal, local_operator: bool) -> Self {
+        Self {
+            principal,
+            local_operator,
+        }
+    }
+
+    /// A caller who proved nothing and presented no local token.
+    pub fn anonymous() -> Self {
+        Self {
+            principal: Principal::anonymous(),
+            local_operator: false,
+        }
+    }
+
+    /// The underlying standing, without the local operator token grant.
+    ///
+    /// Routes that also redact embedded bugs must pass this to the bug
+    /// redactor rather than consulting [`Self::access_to_patchset`], because
+    /// the local token never grants bug visibility.
+    pub fn principal(&self) -> &Principal {
+        &self.principal
+    }
+
+    /// Resolves whether this caller may read a patchset's raw transcripts from
+    /// the MAINTAINERS sections attributed to it and the series author string.
+    ///
+    /// A patchset with no attributed sections fails closed: section-maintainer
+    /// standing cannot match an empty list, so only the local token, global
+    /// visibility, or being the series author remains.
+    pub fn access_to_patchset(
+        &self,
+        attributed: &[SectionTitle],
+        author: Option<&str>,
+    ) -> TranscriptAccess {
+        if self.local_operator || self.principal.has_global_bug_visibility() {
+            return TranscriptAccess::Granted;
+        }
+        if attributed
+            .iter()
+            .any(|title| self.principal.maintained_sections.contains(title))
+        {
+            return TranscriptAccess::Granted;
+        }
+        if !self.principal.email.is_empty()
+            && let Some(author) = author
+            && let Some(author_email) = crate::maintainers::maintainer_address(author)
+            && self.principal.email.eq_ignore_ascii_case(&author_email)
+        {
+            return TranscriptAccess::Granted;
+        }
+        TranscriptAccess::Denied
+    }
+}
+
+impl FromRequestParts<Arc<crate::api::AppState>> for TranscriptPrincipal {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<crate::api::AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let local_operator = crate::api::presents_local_token(&parts.headers, state);
+        let principal = match Principal::from_request_parts(parts, state).await {
+            Ok(principal) => principal,
+            Err(_) => Principal::anonymous(),
+        };
+        Ok(Self {
+            principal,
+            local_operator,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +601,113 @@ F:	*/
         assert!(BugAccess::Comment.can_comment());
         assert!(!BugAccess::Comment.can_manage());
         assert!(BugAccess::Manage.can_manage());
+    }
+
+    #[test]
+    fn test_transcript_access_granted_by_local_token() {
+        let caller = TranscriptPrincipal::new(Principal::anonymous(), true);
+        assert_eq!(
+            caller.access_to_patchset(&[], None),
+            TranscriptAccess::Granted
+        );
+        assert!(caller.access_to_patchset(&btrfs(), None).is_granted());
+        // The local token grants transcript access without mutating underlying
+        // bug visibility.
+        assert!(!caller.principal().has_global_bug_visibility());
+    }
+
+    #[test]
+    fn test_transcript_access_granted_by_global_roles() {
+        let index = index();
+        for email in [
+            "operator@example.org",
+            "security@example.org",
+            "torvalds@linux-foundation.org",
+        ] {
+            let caller =
+                TranscriptPrincipal::new(Principal::resolve(email, &acl(), Some(&index)), false);
+            assert_eq!(
+                caller.access_to_patchset(&[], None),
+                TranscriptAccess::Granted
+            );
+            assert_eq!(
+                caller.access_to_patchset(&btrfs(), Some("Someone Else <other@example.org>")),
+                TranscriptAccess::Granted
+            );
+        }
+    }
+
+    #[test]
+    fn test_transcript_access_granted_to_section_maintainer_fails_closed_when_empty() {
+        let davem = TranscriptPrincipal::new(
+            Principal::resolve(
+                "davem@davemloft.net",
+                &AclSettings::default(),
+                Some(&index()),
+            ),
+            false,
+        );
+        assert_eq!(
+            davem.access_to_patchset(&[SectionTitle::new("NETWORKING [GENERAL]")], None),
+            TranscriptAccess::Granted
+        );
+        // Someone else's subsystem is denied.
+        assert_eq!(
+            davem.access_to_patchset(&btrfs(), None),
+            TranscriptAccess::Denied
+        );
+        // Unattributed patchset fails closed for section maintainers.
+        assert_eq!(
+            davem.access_to_patchset(&[], None),
+            TranscriptAccess::Denied
+        );
+    }
+
+    #[test]
+    fn test_transcript_access_granted_to_series_author() {
+        let stranger = TranscriptPrincipal::new(
+            Principal::resolve("stranger@example.org", &acl(), Some(&index())),
+            false,
+        );
+        assert_eq!(
+            stranger.access_to_patchset(&[], Some("A Stranger <Stranger@Example.ORG>")),
+            TranscriptAccess::Granted
+        );
+        assert_eq!(
+            stranger.access_to_patchset(&btrfs(), Some("stranger@example.org")),
+            TranscriptAccess::Granted
+        );
+        assert_eq!(
+            stranger.access_to_patchset(&[], Some("Someone Else <other@example.org>")),
+            TranscriptAccess::Denied
+        );
+        assert_eq!(
+            stranger.access_to_patchset(&[], Some("not a parsable email")),
+            TranscriptAccess::Denied
+        );
+        assert_eq!(
+            stranger.access_to_patchset(&[], None),
+            TranscriptAccess::Denied
+        );
+
+        // An anonymous caller holds no email and never matches an author string.
+        let anon = TranscriptPrincipal::anonymous();
+        assert_eq!(
+            anon.access_to_patchset(&[], Some("Anonymous <stranger@example.org>")),
+            TranscriptAccess::Denied
+        );
+    }
+
+    #[test]
+    fn test_blocklisted_caller_denied_transcript_access() {
+        let blocklisted = TranscriptPrincipal::new(
+            Principal::resolve("clm@fb.com", &acl(), Some(&index())),
+            false,
+        );
+        // Blocklisted maintainer and author still gets Denied.
+        assert_eq!(
+            blocklisted.access_to_patchset(&btrfs(), Some("Chris Mason <clm@fb.com>")),
+            TranscriptAccess::Denied
+        );
     }
 }

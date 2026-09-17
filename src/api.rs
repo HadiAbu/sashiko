@@ -4245,7 +4245,10 @@ pub fn is_authorized(
 /// The token shares the Authorization header with session JWTs, which is safe
 /// because the two cannot be confused: a JWT never has the shape of a token,
 /// and a token never carries the signature a JWT is accepted on.
-fn presents_local_token(headers: &axum::http::HeaderMap, state: &std::sync::Arc<AppState>) -> bool {
+pub(crate) fn presents_local_token(
+    headers: &axum::http::HeaderMap,
+    state: &std::sync::Arc<AppState>,
+) -> bool {
     let Some(token) = state.local_token.as_ref() else {
         return false;
     };
