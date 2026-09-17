@@ -738,6 +738,15 @@ const UPSERT_BUG_SUBSYSTEM_SQL: &str = "INSERT INTO bug_subsystems (bug_id, subs
      VALUES (?, ?, ?) \
      ON CONFLICT(bug_id, subsystem) DO UPDATE SET source = excluded.source";
 
+/// The same statement for a patchset. Separate rather than generic over the
+/// table name, because building this SQL by interpolation would put a table
+/// name into a string that already carries a column named `source`, and the
+/// one thing that must never be interpolated here is which table decides who
+/// may read a transcript.
+const UPSERT_PATCHSET_SECTION_SQL: &str = "INSERT INTO patchset_maintainer_sections (patchset_id, subsystem, source) \
+     VALUES (?, ?, ?) \
+     ON CONFLICT(patchset_id, subsystem) DO UPDATE SET source = excluded.source";
+
 /// A subsystem name together with the provenance of that name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AttributedSubsystem {
@@ -1514,7 +1523,18 @@ impl Database {
             self.conn.execute("PRAGMA user_version = 8", ()).await?;
         }
 
-        info!("Database schema is up to date at version 8.");
+        if current_version < 9 {
+            info!("Applying database migration version 9 (patchset maintainer sections)...");
+            let tx = self.conn.transaction().await?;
+            tx.execute_batch(include_str!(
+                "migrations/009_patchset_maintainer_sections.sql"
+            ))
+            .await?;
+            tx.execute("PRAGMA user_version = 9", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 9.");
 
         Ok(())
     }
@@ -2221,6 +2241,144 @@ impl Database {
             let bug_id: i64 = row.get(0)?;
             let subsystem: String = row.get(1)?;
             sections.entry(bug_id).or_default().push(subsystem);
+        }
+        Ok(sections)
+    }
+
+    /// Adds MAINTAINERS sections to a patchset without removing any.
+    ///
+    /// Ingestion is the caller. A series arrives one part at a time and each
+    /// part contributes the sections its own files touch, so the attribution
+    /// is a union that grows as the series lands. Replacing here would let the
+    /// last part to arrive narrow the series to its own files, which for a
+    /// patch touching only Documentation would quietly strip the maintainers
+    /// of the code the rest of the series changes.
+    pub async fn add_patchset_maintainer_sections(
+        &self,
+        patchset_id: i64,
+        sections: &[AttributedSubsystem],
+    ) -> Result<()> {
+        if sections.is_empty() {
+            return Ok(());
+        }
+        for section in sections {
+            let name = section.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            self.conn
+                .execute(
+                    UPSERT_PATCHSET_SECTION_SQL,
+                    libsql::params![patchset_id, name, section.source.as_str()],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Sets a patchset's MAINTAINERS sections to exactly this list.
+    ///
+    /// The backfill is the caller, because it computes the whole union from
+    /// every stored diff in one pass and a stale row from an earlier attempt
+    /// must not survive. Pruning matters for the same reason the bug side
+    /// prunes: a section that no longer matches has to stop conferring
+    /// authority.
+    pub async fn replace_patchset_maintainer_sections(
+        &self,
+        patchset_id: i64,
+        sections: &[AttributedSubsystem],
+    ) -> Result<()> {
+        let wanted: std::collections::BTreeMap<&str, SubsystemSource> = sections
+            .iter()
+            .map(|s| (s.name.trim(), s.source))
+            .filter(|(name, _)| !name.is_empty())
+            .collect();
+
+        // The read is drained and the cursor dropped before any write, because
+        // libsql refuses to commit a transaction that still has a statement in
+        // progress, and deleting while iterating leaves the cursor open.
+        let existing: Vec<String> = {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT subsystem FROM patchset_maintainer_sections WHERE patchset_id = ?",
+                    libsql::params![patchset_id],
+                )
+                .await?;
+            let mut found = Vec::new();
+            while let Some(row) = rows.next().await? {
+                found.push(row.get::<String>(0)?);
+            }
+            found
+        };
+
+        for section in existing {
+            if !wanted.contains_key(section.as_str()) {
+                self.conn
+                    .execute(
+                        "DELETE FROM patchset_maintainer_sections \
+                         WHERE patchset_id = ? AND subsystem = ?",
+                        libsql::params![patchset_id, section],
+                    )
+                    .await?;
+            }
+        }
+        for (name, source) in wanted {
+            self.conn
+                .execute(
+                    UPSERT_PATCHSET_SECTION_SQL,
+                    libsql::params![patchset_id, name, source.as_str()],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Returns the MAINTAINERS section titles that grant authority over this
+    /// patchset.
+    ///
+    /// Rows whose provenance is a directory prefix or a caller-supplied string
+    /// are excluded, because they name nobody. An empty result is meaningful
+    /// rather than a failure: it says nobody was identified as responsible for
+    /// this series, and the transcript rules treat that as closed.
+    pub async fn authorizing_sections_for_patchset(&self, patchset_id: i64) -> Result<Vec<String>> {
+        let sql = format!(
+            "SELECT subsystem FROM patchset_maintainer_sections
+             WHERE source = '{}' AND patchset_id = ?
+             ORDER BY subsystem ASC",
+            SubsystemSource::MaintainersSection.as_str()
+        );
+        let mut rows = self.conn.query(&sql, libsql::params![patchset_id]).await?;
+        let mut sections = Vec::new();
+        while let Some(row) = rows.next().await? {
+            sections.push(row.get(0)?);
+        }
+        Ok(sections)
+    }
+
+    /// Every section attributed to a patchset, with its provenance, for
+    /// display. Authorization must not call this: it would see rows that
+    /// confer nothing.
+    pub async fn patchset_maintainer_sections(
+        &self,
+        patchset_id: i64,
+    ) -> Result<Vec<AttributedSubsystem>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT subsystem, source FROM patchset_maintainer_sections
+                 WHERE patchset_id = ? ORDER BY subsystem ASC",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut sections = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let name: String = row.get(0)?;
+            let source: String = row.get(1)?;
+            sections.push(AttributedSubsystem::new(
+                name,
+                SubsystemSource::from_stored(&source),
+            ));
         }
         Ok(sections)
     }
@@ -8715,6 +8873,185 @@ mod tests {
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
+    }
+
+    /// A bare patchset row, for tests that only care about what is attributed
+    /// to it.
+    async fn patchset_for_sections(db: &Database, id: i64) -> Result<i64> {
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status)
+                 VALUES (?, '[PATCH] subject', 'An Author <a@b.com>', 1000, 'Pending')",
+                libsql::params![id],
+            )
+            .await?;
+        Ok(id)
+    }
+
+    #[tokio::test]
+    async fn test_patchset_sections_union_across_parts() -> Result<()> {
+        let db = setup_db().await;
+        let ps = patchset_for_sections(&db, 1).await?;
+
+        // Each part of a series contributes the sections its own files touch.
+        db.add_patchset_maintainer_sections(
+            ps,
+            &[AttributedSubsystem::from_maintainers(
+                "NETWORKING [GENERAL]",
+            )],
+        )
+        .await?;
+        db.add_patchset_maintainer_sections(
+            ps,
+            &[
+                AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                // A section a previous part already contributed.
+                AttributedSubsystem::from_maintainers("NETWORKING [GENERAL]"),
+            ],
+        )
+        .await?;
+
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec![
+                "BTRFS FILE SYSTEM".to_string(),
+                "NETWORKING [GENERAL]".to_string()
+            ],
+            "a later part adds to the attribution rather than replacing it"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_sections_only_maintainers_rows_confer_authority() -> Result<()> {
+        let db = setup_db().await;
+        let ps = patchset_for_sections(&db, 1).await?;
+
+        db.add_patchset_maintainer_sections(
+            ps,
+            &[
+                AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                AttributedSubsystem::from_path_prefix("drivers/misc"),
+                AttributedSubsystem::new("whatever was supplied", SubsystemSource::CallerSupplied),
+            ],
+        )
+        .await?;
+
+        // A directory prefix and an invented name are shown but grant nothing.
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec!["BTRFS FILE SYSTEM".to_string()]
+        );
+        assert_eq!(
+            db.patchset_maintainer_sections(ps)
+                .await?
+                .into_iter()
+                .map(|s| (s.name, s.source))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "BTRFS FILE SYSTEM".to_string(),
+                    SubsystemSource::MaintainersSection
+                ),
+                ("drivers/misc".to_string(), SubsystemSource::PathPrefix),
+                (
+                    "whatever was supplied".to_string(),
+                    SubsystemSource::CallerSupplied
+                ),
+            ],
+            "provenance survives the round trip"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_with_no_sections_authorizes_nobody() -> Result<()> {
+        let db = setup_db().await;
+        let ps = patchset_for_sections(&db, 1).await?;
+
+        assert!(db.authorizing_sections_for_patchset(ps).await?.is_empty());
+
+        // Writing nothing must not invent an attribution either.
+        db.add_patchset_maintainer_sections(ps, &[]).await?;
+        db.add_patchset_maintainer_sections(ps, &[AttributedSubsystem::from_maintainers("  ")])
+            .await?;
+        assert!(db.authorizing_sections_for_patchset(ps).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_replacing_patchset_sections_prunes_and_reattributes() -> Result<()> {
+        let db = setup_db().await;
+        let ps = patchset_for_sections(&db, 1).await?;
+
+        db.add_patchset_maintainer_sections(
+            ps,
+            &[
+                AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                AttributedSubsystem::from_maintainers("NETWORKING [GENERAL]"),
+            ],
+        )
+        .await?;
+
+        // A section that no longer matches has to stop conferring authority,
+        // and one that has been rematched has to start.
+        db.replace_patchset_maintainer_sections(
+            ps,
+            &[
+                AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM"),
+                AttributedSubsystem::from_path_prefix("net"),
+            ],
+        )
+        .await?;
+
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec!["BTRFS FILE SYSTEM".to_string()],
+            "the dropped section is gone and the path prefix grants nothing"
+        );
+
+        db.replace_patchset_maintainer_sections(
+            ps,
+            &[AttributedSubsystem::from_maintainers("net")],
+        )
+        .await?;
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec!["net".to_string()],
+            "a name rematched out of MAINTAINERS starts conferring authority"
+        );
+        Ok(())
+    }
+
+    /// A patchset's attribution must not be reachable from another patchset.
+    #[tokio::test]
+    async fn test_patchset_sections_do_not_leak_between_patchsets() -> Result<()> {
+        let db = setup_db().await;
+        let btrfs = patchset_for_sections(&db, 1).await?;
+        let net = patchset_for_sections(&db, 2).await?;
+
+        db.add_patchset_maintainer_sections(
+            btrfs,
+            &[AttributedSubsystem::from_maintainers("BTRFS FILE SYSTEM")],
+        )
+        .await?;
+        db.add_patchset_maintainer_sections(
+            net,
+            &[AttributedSubsystem::from_maintainers(
+                "NETWORKING [GENERAL]",
+            )],
+        )
+        .await?;
+
+        assert_eq!(
+            db.authorizing_sections_for_patchset(btrfs).await?,
+            vec!["BTRFS FILE SYSTEM".to_string()]
+        );
+        assert_eq!(
+            db.authorizing_sections_for_patchset(net).await?,
+            vec!["NETWORKING [GENERAL]".to_string()]
+        );
+        Ok(())
     }
 
     #[tokio::test]
