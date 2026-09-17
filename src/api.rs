@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bug_access::{BugAccess, BugPrincipal, OptionalBugPrincipal, SectionTitle};
+use crate::access::{BugAccess, OptionalPrincipal, Principal, SectionTitle};
 use crate::db::Database;
 use crate::events::{Event, MessageSource};
 use crate::fetcher::FetchRequest;
@@ -952,7 +952,7 @@ async fn list_messages(
 }
 
 async fn get_patchset(
-    OptionalBugPrincipal(principal): OptionalBugPrincipal,
+    OptionalPrincipal(principal): OptionalPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1003,7 +1003,7 @@ async fn get_patchset(
 }
 
 async fn get_review(
-    OptionalBugPrincipal(principal): OptionalBugPrincipal,
+    OptionalPrincipal(principal): OptionalPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1083,7 +1083,7 @@ async fn get_patchset_summary(
 }
 
 async fn get_review_log(
-    OptionalBugPrincipal(principal): OptionalBugPrincipal,
+    OptionalPrincipal(principal): OptionalPrincipal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<ReviewQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1118,7 +1118,7 @@ async fn get_review_log(
 /// the reporter name nobody and are excluded by the accessor.
 async fn bug_access(
     state: &AppState,
-    principal: &BugPrincipal,
+    principal: &Principal,
     bug_id: i64,
 ) -> Result<BugAccess, StatusCode> {
     let sections = state
@@ -1136,7 +1136,7 @@ async fn bug_access(
 /// The subset of the given bugs the caller may read, resolved in one query.
 async fn readable_bug_ids(
     state: &AppState,
-    principal: &BugPrincipal,
+    principal: &Principal,
     bug_ids: &[i64],
 ) -> Result<std::collections::HashSet<i64>, StatusCode> {
     let sections = state
@@ -1167,7 +1167,7 @@ async fn readable_bug_ids(
 /// two it was.
 async fn readable_bug(
     state: &AppState,
-    principal: &BugPrincipal,
+    principal: &Principal,
     query: &BugQuery,
 ) -> Result<crate::db::Bug, StatusCode> {
     let bug = if let Some(id) = query.id {
@@ -1202,7 +1202,7 @@ async fn readable_bug(
 /// passing the read check, so the bug's existence is already known to them.
 async fn transcript_bug(
     state: &AppState,
-    principal: &BugPrincipal,
+    principal: &Principal,
     query: &BugQuery,
 ) -> Result<crate::db::Bug, StatusCode> {
     let bug = readable_bug(state, principal, query).await?;
@@ -1220,7 +1220,7 @@ async fn transcript_bug(
 /// the single-bug endpoints to protect.
 async fn redact_embedded_bugs(
     state: &AppState,
-    principal: &BugPrincipal,
+    principal: &Principal,
     payload: &mut serde_json::Value,
 ) -> Result<(), StatusCode> {
     let Some(bugs) = payload.get("bugs").and_then(|b| b.as_array()) else {
@@ -1238,7 +1238,7 @@ async fn redact_embedded_bugs(
 }
 
 async fn get_bug(
-    principal: BugPrincipal,
+    principal: Principal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1298,7 +1298,7 @@ async fn get_bug(
 /// exists and what it is about.
 async fn attach_duplicate_relations(
     state: &AppState,
-    principal: &BugPrincipal,
+    principal: &Principal,
     bug: &crate::db::Bug,
     val: &mut serde_json::Value,
 ) -> Result<(), StatusCode> {
@@ -1344,7 +1344,7 @@ async fn attach_duplicate_relations(
 }
 
 async fn get_bug_raw(
-    principal: BugPrincipal,
+    principal: Principal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1363,7 +1363,7 @@ async fn get_bug_raw(
 /// Duplicates keep their own candidate records, so each one resolves to the
 /// input that produced it rather than the canonical bug's input.
 async fn get_bug_input(
-    principal: BugPrincipal,
+    principal: Principal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1394,7 +1394,7 @@ async fn get_bug_input(
 }
 
 async fn get_bug_enrichments(
-    principal: BugPrincipal,
+    principal: Principal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1405,7 +1405,7 @@ async fn get_bug_enrichments(
 }
 
 async fn get_bug_logs(
-    principal: BugPrincipal,
+    principal: Principal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -1435,7 +1435,7 @@ struct AnalyzeBugPayload {
 }
 
 async fn analyze_bug(
-    principal: BugPrincipal,
+    principal: Principal,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<AnalyzeBugPayload>,
@@ -1958,7 +1958,7 @@ async fn forge_webhook(
 }
 
 async fn list_bugs(
-    principal: BugPrincipal,
+    principal: Principal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugListQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -2098,7 +2098,7 @@ async fn list_bugs(
 }
 
 async fn list_bug_subsystems(
-    principal: BugPrincipal,
+    principal: Principal,
     State(state): State<Arc<AppState>>,
     Query(query): Query<BugSubsystemsQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -2230,7 +2230,7 @@ fn bug_lookup_denial(status: StatusCode) -> (StatusCode, String) {
 }
 
 async fn bug_action(
-    principal: BugPrincipal,
+    principal: Principal,
     axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<BugQuery>,
@@ -3929,7 +3929,7 @@ mod tests {
             ("b@example.org", ids[1], 1, vec!["canonical", "sibling"]),
             ("operator@example.org", ids[0], 3, vec![]),
         ] {
-            let principal = BugPrincipal::resolve(email, &acl, Some(&index));
+            let principal = Principal::resolve(email, &acl, Some(&index));
             let Json(body) = get_bug(
                 principal,
                 State(state.clone()),

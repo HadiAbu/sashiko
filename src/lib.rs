@@ -13,11 +13,11 @@ pub mod metrics;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod access;
 pub mod ai;
 pub mod api;
 pub mod auth;
 pub mod baseline;
-pub mod bug_access;
 pub mod compression;
 pub mod db;
 pub mod email_policy;

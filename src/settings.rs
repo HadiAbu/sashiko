@@ -506,7 +506,7 @@ impl Permission {
     /// The token exists so a developer running the server can drive it without
     /// configuring a JWT secret, and it is tolerable only where the blast
     /// radius is that local instance. Authority over a Linux kernel bug is
-    /// deliberately not a Permission: it is resolved per bug by BugPrincipal,
+    /// deliberately not a Permission: it is resolved per bug by Principal,
     /// which never reaches this path, so no amount of local access opens the
     /// bug database.
     ///

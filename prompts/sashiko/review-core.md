@@ -51,7 +51,7 @@ Output and state:
 | `src/email_policy.rs`, `src/email_router.rs` | Who gets told, and whether |
 | `src/worker/email.rs`, `src/worker/patchwork.rs` | Outbox delivery workers |
 | `src/settings.rs` | Configuration |
-| `src/auth.rs`, `src/bug_access.rs` | Identity and capabilities |
+| `src/auth.rs`, `src/access.rs` | Identity and capabilities |
 | `src/project.rs` | Which codebase this instance reviews |
 
 ## Core Priorities (Checked on Every Change)

@@ -1,6 +1,6 @@
 # API and Authorization
 
-Covers `src/api.rs`, `src/auth.rs`, `src/bug_access.rs` and the ACL parts of
+Covers `src/api.rs`, `src/auth.rs`, `src/access.rs` and the ACL parts of
 `src/settings.rs`.
 
 This area decides who may do what over HTTP. It guarantees three things, and
@@ -19,7 +19,7 @@ nothing else:
 capability check.** Nothing in the type system forces `submit_patch`-shaped
 handlers to call `is_authorized`. If a diff adds a route and the handler body
 does not contain both a `state.read_only` check and either an `is_authorized`
-call or a `BugPrincipal`/`may_create`/`bug_access` check, say so and name the
+call or a `Principal`/`may_create`/`bug_access` check, say so and name the
 capability it should have used.
 
 ## 1. The two credential types
@@ -67,7 +67,7 @@ never an authorization decision. A diff that feeds `extract_client_ip` or
 never match an ACL entry, stand in for a maintainer, or reach a bug route.
 `Permission::granted_by_local_token` in `src/settings.rs` is an exhaustive
 match — a capability added later is unreachable by the token until someone
-writes it down. `BugPrincipal::from_request_parts` never consults it.
+writes it down. `Principal::from_request_parts` never consults it.
 `test_local_token_authorizes_ingest_but_grants_no_identity` in `src/api.rs`
 pins both halves.
 
@@ -84,7 +84,7 @@ Matching is `list_contains`: trimmed, `eq_ignore_ascii_case` on both sides.
 no bug permission; `AclSettings::has_permission` matches them exhaustively,
 with `admins` granting all three.
 
-Non-`Permission` capabilities, resolved in `BugPrincipal::resolve`:
+Non-`Permission` capabilities, resolved in `Principal::resolve`:
 - `admins` → `operator`: `BugAccess::Manage` on every bug, plus `may_create`.
 - `security` → `BugAccess::Comment` on every bug and
   `has_global_bug_visibility()`, and *no* `Permission` at all.
@@ -96,7 +96,7 @@ Non-`Permission` capabilities, resolved in `BugPrincipal::resolve`:
 
 **Blocklist overrides everything.** `AclSettings::has_permission` checks
 `is_blocklisted` before `is_admin`; `is_authorized` checks it before
-`testing_mode` and before `allow_all_submit`; `BugPrincipal::resolve` returns
+`testing_mode` and before `allow_all_submit`; `Principal::resolve` returns
 `Self::anonymous()` for a blocklisted address, so every later question answers
 no without the caller remembering to ask. `is_known_identity` and
 `is_sign_in_eligible` both exclude blocklisted addresses, and `verify_link` and
@@ -140,9 +140,9 @@ enforcement; the enforcement is the handler's own early return.
   blocklisted addresses excepted;
 - the secretless-webhook precondition in `forge_webhook`.
 
-It does **not** relax bug routes: `BugPrincipal` never reads it, so
+It does **not** relax bug routes: `Principal` never reads it, so
 `/api/bug/*` still needs a session. `testing_mode` is the broader hammer — it
-short-circuits `is_authorized` *and* makes `BugPrincipal` resolve
+short-circuits `is_authorized` *and* makes `Principal` resolve
 `testing_operator()` (operator, `may_create`, empty email).
 
 ## 3. Bug access control
@@ -151,10 +151,10 @@ short-circuits `is_authorized` *and* makes `BugPrincipal` resolve
 is a maximum, so a security-list member who also maintains the affected
 subsystem gets `Manage` (`test_strongest_grant_wins`).
 
-- `BugPrincipal` is a **fallible** extractor: no valid session ⇒ 401, so a bug
+- `Principal` is a **fallible** extractor: no valid session ⇒ 401, so a bug
   route cannot reach bug data without naming it in its signature. That is the
   only structural protection in this file; everything past it is hand-written.
-- `OptionalBugPrincipal` degrades to `BugPrincipal::anonymous()`. Used by
+- `OptionalPrincipal` degrades to `Principal::anonymous()`. Used by
   `get_patchset`, `get_review`, `get_review_log`, which stay publicly readable
   and instead call `redact_embedded_bugs` to drop the `bugs` array members the
   caller may not read.
@@ -206,9 +206,9 @@ when the payload changes.
 | `GET /api/message` | `get_message` | — |
 | `GET /api/patchset` | `get_patchset_summary` | — (payload carries no `bugs` key) |
 | `GET /api/stats`, `/api/stats/timeline`, `/api/stats/reviews`, `/api/stats/tools` | `get_stats`, `stats_*` | — |
-| `GET /api/patch` | `get_patchset` | `OptionalBugPrincipal` + `redact_embedded_bugs` |
-| `GET /api/review` | `get_review` | `OptionalBugPrincipal` + `redact_embedded_bugs` |
-| `GET /api/review_log` | `get_review_log` | `OptionalBugPrincipal` + `redact_embedded_bugs` |
+| `GET /api/patch` | `get_patchset` | `OptionalPrincipal` + `redact_embedded_bugs` |
+| `GET /api/review` | `get_review` | `OptionalPrincipal` + `redact_embedded_bugs` |
+| `GET /api/review_log` | `get_review_log` | `OptionalPrincipal` + `redact_embedded_bugs` |
 | `POST /api/submit` | `submit_patch` | `read_only` + `Permission::Ingest` |
 | `POST /api/patchset/rerun` | `rerun_patchset` | `read_only` + `Permission::Review` |
 | `POST /api/patch/rerun` | `rerun_patch` | `read_only` + `Permission::Review` |
@@ -217,12 +217,12 @@ when the payload changes.
 | `POST /api/auth/request-link` | `request_link` | rate limiter + `is_sign_in_eligible`; always answers 200 |
 | `GET /api/auth/verify` | `verify_link` | `typ == "sign_in_link"` + blocklist |
 | `POST /api/auth/refresh` | `refresh_token` | session + blocklist + 30-day `iat` cap |
-| `GET /api/bug` | `get_bug` | `BugPrincipal` + `readable_bug` (Read) |
-| `GET /api/bug/enrichments` | `get_bug_enrichments` | `BugPrincipal` + `readable_bug` |
-| `GET /api/bugs` | `list_bugs` | `BugPrincipal` + `visibility()` in SQL |
-| `GET /api/bugs/subsystems`, `GET /api/subsystems` | `list_bug_subsystems` | `BugPrincipal` + `visibility()`, scope-keyed cache |
-| `GET /api/bug/raw`, `/api/bug/input`, `/api/bug/logs` | `get_bug_raw`, `get_bug_input`, `get_bug_logs` | `BugPrincipal` + `transcript_bug` (global visibility) |
-| `POST /api/bug/analyze` | `analyze_bug` | `read_only` + `BugPrincipal::may_create()` |
+| `GET /api/bug` | `get_bug` | `Principal` + `readable_bug` (Read) |
+| `GET /api/bug/enrichments` | `get_bug_enrichments` | `Principal` + `readable_bug` |
+| `GET /api/bugs` | `list_bugs` | `Principal` + `visibility()` in SQL |
+| `GET /api/bugs/subsystems`, `GET /api/subsystems` | `list_bug_subsystems` | `Principal` + `visibility()`, scope-keyed cache |
+| `GET /api/bug/raw`, `/api/bug/input`, `/api/bug/logs` | `get_bug_raw`, `get_bug_input`, `get_bug_logs` | `Principal` + `transcript_bug` (global visibility) |
+| `POST /api/bug/analyze` | `analyze_bug` | `read_only` + `Principal::may_create()` |
 | `POST /api/bug/action` | `bug_action` | `read_only` + `readable_bug` + `required_access(action)` |
 | `GET /bug/{bugid}` | `redirect_bug` | — (redirect only) |
 
@@ -294,7 +294,7 @@ a new arm should not copy it for non-database errors.
 ## 6. Things that are conventions, not guarantees
 
 - Nothing forces a handler to check `read_only` or a capability. Only
-  `BugPrincipal`'s fallibility is structural.
+  `Principal`'s fallibility is structural.
 - `is_authorized` is `pub`, so a caller outside `src/api.rs` could use it with
   a hand-built `HeaderMap`. Nothing prevents that.
 - `AclSettings` matching is ASCII-case-insensitive only
@@ -305,7 +305,7 @@ a new arm should not copy it for non-database errors.
   `test_local_token_authorizes_ingest_but_grants_no_identity`,
   `test_bug_reads_require_an_authorized_principal`,
   `test_acl_blocklist_authorization_and_auth_endpoints`) and in
-  `src/bug_access.rs`/`src/settings.rs`. `tests/integration/` contains **no**
+  `src/access.rs`/`src/settings.rs`. `tests/integration/` contains **no**
   authorization coverage. A new gate with no unit test has nothing holding it.
 - Patchset review embargo (`embargo_until`) is enforced inside the db queries
   `get_patchset_details`/`get_patchset_summary`, not at the handler. It is a
@@ -324,7 +324,7 @@ a new arm should not copy it for non-database errors.
       is it reachable from `is_known_identity` so those principals can sign in?
 - [ ] Reordered `is_authorized`: is the blocklist still ahead of
       `testing_mode` and `allow_all_submit`?
-- [ ] Bug route: `BugPrincipal` (not `OptionalBugPrincipal`), and the right
+- [ ] Bug route: `Principal` (not `OptionalPrincipal`), and the right
       helper — `readable_bug` for bug data, `transcript_bug` for anything that
       can embed other bugs, `bug_access` compared against `required_access`
       for mutations?

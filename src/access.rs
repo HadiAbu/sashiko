@@ -1,10 +1,15 @@
-//! Who may see and change a Linux kernel bug.
+//! What one caller is allowed to see and change.
 //!
-//! Authority over a bug comes from three independent sources, composed by
-//! taking the strongest: the capability lists in the configuration, the
-//! MAINTAINERS file, and, for operators, the local token handled at the HTTP
-//! edge. This module owns the first two and the composition; it does not know
-//! about HTTP.
+//! Authority comes from three independent sources, composed by taking the
+//! strongest: the capability lists in the configuration, the MAINTAINERS file,
+//! and, for operators, the local token handled at the HTTP edge. This module
+//! owns the first two and the composition; it does not know about HTTP.
+//!
+//! A caller's standing is resolved once, into [`Principal`], and each domain
+//! then asks its own question of it. Today that is bug access, via
+//! [`BugAccess`]. The resolution is deliberately domain neutral, because the
+//! evidence it rests on, who the configuration names and what MAINTAINERS says
+//! they own, is the same evidence whatever is being protected.
 
 use crate::maintainers::MaintainersIndex;
 use crate::settings::AclSettings;
@@ -101,7 +106,7 @@ pub enum BugAccess {
     None,
     /// May read the bug, its report, its enrichments and its comments.
     /// Deliberately excludes the raw analysis transcripts, which disclose
-    /// other bugs; see [`BugPrincipal::has_global_bug_visibility`].
+    /// other bugs; see [`Principal::has_global_bug_visibility`].
     Read,
     /// Read, plus may attach a comment.
     Comment,
@@ -141,10 +146,14 @@ impl BugAccess {
     }
 }
 
-/// The bug-domain authority of one caller, resolved once per request from the
+/// The standing of one caller, resolved once per request from the
 /// configuration and the MAINTAINERS index.
+///
+/// This records what the caller is, not what they may do. Turning that into a
+/// decision is each domain's own business, because the same maintainer may be
+/// owed different answers about different things.
 #[derive(Debug, Clone, Default)]
-pub struct BugPrincipal {
+pub struct Principal {
     email: String,
     /// Sashiko operator. Manage on every bug.
     operator: bool,
@@ -159,7 +168,7 @@ pub struct BugPrincipal {
     may_create: bool,
 }
 
-impl BugPrincipal {
+impl Principal {
     /// A caller who proved nothing. Holds no authority over any bug.
     pub fn anonymous() -> Self {
         Self::default()
@@ -282,7 +291,7 @@ impl BugPrincipal {
 /// naming this extractor in its signature, so forgetting the check does not
 /// compile into an open route. The local token accepted by `is_authorized` is
 /// deliberately not consulted here.
-impl FromRequestParts<Arc<crate::api::AppState>> for BugPrincipal {
+impl FromRequestParts<Arc<crate::api::AppState>> for Principal {
     type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(
@@ -290,10 +299,10 @@ impl FromRequestParts<Arc<crate::api::AppState>> for BugPrincipal {
         state: &Arc<crate::api::AppState>,
     ) -> Result<Self, Self::Rejection> {
         if state.settings.server.testing_mode {
-            return Ok(BugPrincipal::testing_operator());
+            return Ok(Principal::testing_operator());
         }
         let user = crate::auth::AuthUser::from_request_parts(parts, state).await?;
-        Ok(BugPrincipal::resolve(
+        Ok(Principal::resolve(
             &user.email,
             &state.settings.server.acl,
             crate::maintainers::get_global_maintainers().as_deref(),
@@ -305,18 +314,18 @@ impl FromRequestParts<Arc<crate::api::AppState>> for BugPrincipal {
 /// as the patchset and review views. Those stay readable without a session, so
 /// a missing or invalid token resolves to the anonymous principal and the
 /// embedded bugs are filtered out rather than the whole page being refused.
-pub struct OptionalBugPrincipal(pub BugPrincipal);
+pub struct OptionalPrincipal(pub Principal);
 
-impl FromRequestParts<Arc<crate::api::AppState>> for OptionalBugPrincipal {
+impl FromRequestParts<Arc<crate::api::AppState>> for OptionalPrincipal {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &Arc<crate::api::AppState>,
     ) -> Result<Self, Self::Rejection> {
-        match BugPrincipal::from_request_parts(parts, state).await {
-            Ok(principal) => Ok(OptionalBugPrincipal(principal)),
-            Err(_) => Ok(OptionalBugPrincipal(BugPrincipal::anonymous())),
+        match Principal::from_request_parts(parts, state).await {
+            Ok(principal) => Ok(OptionalPrincipal(principal)),
+            Err(_) => Ok(OptionalPrincipal(Principal::anonymous())),
         }
     }
 }
@@ -380,7 +389,7 @@ F:	*/
     fn test_maintainer_manages_own_subsystem_only() {
         let index = index();
         let acl = AclSettings::default();
-        let davem = BugPrincipal::resolve("davem@davemloft.net", &acl, Some(&index));
+        let davem = Principal::resolve("davem@davemloft.net", &acl, Some(&index));
         assert_eq!(
             davem.access_to(&[SectionTitle::new("NETWORKING [GENERAL]")]),
             BugAccess::Manage
@@ -396,7 +405,7 @@ F:	*/
         // The database stores titles verbatim, so the projection that feeds the
         // query has to hand back the original spelling, not the normalized one
         // used for comparison.
-        let davem = BugPrincipal::resolve(
+        let davem = Principal::resolve(
             "davem@davemloft.net",
             &AclSettings::default(),
             Some(&index()),
@@ -405,17 +414,13 @@ F:	*/
             davem.maintained_section_names(),
             vec!["NETWORKING [GENERAL]".to_string()]
         );
-        assert!(
-            BugPrincipal::anonymous()
-                .maintained_section_names()
-                .is_empty()
-        );
+        assert!(Principal::anonymous().maintained_section_names().is_empty());
     }
 
     #[test]
     fn test_security_list_comments_everywhere_but_manages_nothing() {
         let index = index();
-        let principal = BugPrincipal::resolve("security@example.org", &acl(), Some(&index));
+        let principal = Principal::resolve("security@example.org", &acl(), Some(&index));
         assert_eq!(principal.access_to(&btrfs()), BugAccess::Comment);
         // Including bugs nobody could attribute to a section at all.
         assert_eq!(principal.access_to(&[]), BugAccess::Comment);
@@ -427,16 +432,15 @@ F:	*/
     fn test_operator_and_catch_all_maintainer_manage_everything() {
         let index = index();
         for email in ["operator@example.org", "torvalds@linux-foundation.org"] {
-            let principal = BugPrincipal::resolve(email, &acl(), Some(&index));
+            let principal = Principal::resolve(email, &acl(), Some(&index));
             assert_eq!(principal.access_to(&btrfs()), BugAccess::Manage);
             assert_eq!(principal.access_to(&[]), BugAccess::Manage);
             assert!(principal.has_global_bug_visibility());
         }
         // Only the operator may file bugs; being Linus is not a reporter role.
-        assert!(BugPrincipal::resolve("operator@example.org", &acl(), Some(&index)).may_create());
+        assert!(Principal::resolve("operator@example.org", &acl(), Some(&index)).may_create());
         assert!(
-            !BugPrincipal::resolve("torvalds@linux-foundation.org", &acl(), Some(&index))
-                .may_create()
+            !Principal::resolve("torvalds@linux-foundation.org", &acl(), Some(&index)).may_create()
         );
     }
 
@@ -446,7 +450,7 @@ F:	*/
             security: vec!["davem@davemloft.net".to_string()],
             ..Default::default()
         };
-        let principal = BugPrincipal::resolve("davem@davemloft.net", &acl, Some(&index()));
+        let principal = Principal::resolve("davem@davemloft.net", &acl, Some(&index()));
         // Maintainer of the affected subsystem and on the security list.
         assert_eq!(
             principal.access_to(&[SectionTitle::new("NETWORKING [GENERAL]")]),
@@ -458,7 +462,7 @@ F:	*/
 
     #[test]
     fn test_blocklisted_maintainer_holds_nothing() {
-        let principal = BugPrincipal::resolve("clm@fb.com", &acl(), Some(&index()));
+        let principal = Principal::resolve("clm@fb.com", &acl(), Some(&index()));
         assert_eq!(principal.access_to(&btrfs()), BugAccess::None);
         assert!(!principal.has_global_bug_visibility());
         assert!(!principal.may_create());
@@ -468,10 +472,10 @@ F:	*/
     #[test]
     fn test_unknown_and_anonymous_callers_see_nothing() {
         for principal in [
-            BugPrincipal::anonymous(),
-            BugPrincipal::resolve("stranger@example.org", &acl(), Some(&index())),
+            Principal::anonymous(),
+            Principal::resolve("stranger@example.org", &acl(), Some(&index())),
             // A missing index must not accidentally widen anyone's access.
-            BugPrincipal::resolve("davem@davemloft.net", &AclSettings::default(), None),
+            Principal::resolve("davem@davemloft.net", &AclSettings::default(), None),
         ] {
             assert_eq!(principal.access_to(&btrfs()), BugAccess::None);
             assert_eq!(principal.access_to(&[]), BugAccess::None);
