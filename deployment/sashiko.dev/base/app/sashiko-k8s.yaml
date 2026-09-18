@@ -113,6 +113,14 @@ spec:
             # that reason.
             - name: SASHIKO__SERVER__ACL__ADMINS
               value: "roman.gushchin@linux.dev"
+            # The kernel security list lives in sashiko-secrets rather than in
+            # the manifest so that membership stays private.
+            - name: SASHIKO__SERVER__ACL__SECURITY
+              valueFrom:
+                secretKeyRef:
+                  name: sashiko-secrets
+                  key: SASHIKO__SERVER__ACL__SECURITY
+                  optional: true
             - name: SASHIKO__PROJECT__DOMAIN
               value: "sashiko.dev"
             - name: SASHIKO__AI__MODEL

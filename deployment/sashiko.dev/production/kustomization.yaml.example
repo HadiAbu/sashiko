@@ -13,6 +13,13 @@ kind: Component
 #   SECRET=$(openssl rand -hex 32)
 #   kubectl -n sashiko patch secret sashiko-secrets --type=merge \
 #     -p "{\"stringData\":{\"SASHIKO__SERVER__JWT_SECRET\":\"$SECRET\"}}"
+#
+# Optional keys in 'sashiko-secrets':
+#   SASHIKO__SERVER__ACL__SECURITY - comma-separated list of kernel security
+#                                    list addresses with global bug access.
+#
+#   kubectl -n sashiko patch secret sashiko-secrets --type=merge \
+#     -p '{"stringData":{"SASHIKO__SERVER__ACL__SECURITY":"first@example.org,second@example.org"}}'
 
 patches:
   # 1. Deployment: Update image
