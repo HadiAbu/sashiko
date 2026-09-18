@@ -6,11 +6,11 @@ kind: Component
 # This file is ignored by git.
 #
 # The base manifest expects a 'sashiko-self-secrets' Secret in the
-# sashiko-self namespace holding LLM_API_KEY, SASHIKO__SERVER__JWT_SECRET and
-# SASHIKO__FORGE__WEBHOOK_SECRET; a container referencing a missing key never
-# starts. SASHIKO__FORGE__API_TOKEN is optional and only raises the GitHub API
-# rate limit. Generate the JWT secret once and keep it, because replacing it
-# invalidates every session and sign-in link:
+# sashiko-self namespace holding LLM_API_KEY, SASHIKO_SMTP__PASSWORD,
+# SASHIKO__SERVER__JWT_SECRET and SASHIKO__FORGE__WEBHOOK_SECRET; a container
+# referencing a missing key never starts. SASHIKO__FORGE__API_TOKEN is optional
+# and only raises the GitHub API rate limit. Generate the JWT secret once and
+# keep it, because replacing it invalidates every session and sign-in link:
 #
 #   SECRET=$(openssl rand -hex 32)
 #   kubectl -n sashiko-self patch secret sashiko-self-secrets --type=merge \

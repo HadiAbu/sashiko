@@ -30,7 +30,7 @@ git. Copy the example and edit it before the first apply.
 ## What exists in the cluster already
 
 - Namespace `sashiko-self`.
-- Secret `sashiko-self-secrets` with `LLM_API_KEY`,
+- Secret `sashiko-self-secrets` with `LLM_API_KEY`, `SASHIKO_SMTP__PASSWORD`,
   `SASHIKO__SERVER__JWT_SECRET` and `SASHIKO__FORGE__WEBHOOK_SECRET`.
   `SASHIKO__FORGE__API_TOKEN` is optional and raises the GitHub API rate limit
   for pull request fetches.
