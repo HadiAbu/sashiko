@@ -15,6 +15,24 @@ the [LLM Provider Configuration Guide](llm-providers.md).
 
 ## Settings.toml sections
 
+### Top-level keys
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `log_level` | string | `"info"` | Default log filter for the daemon (e.g. `"warn"`, `"info"`, `"debug"`). `RUST_LOG` overrides it when set, `--debug` forces `"info"`, and `sashiko review` defaults to `"warn"` regardless of this value. |
+
+### `[project]`
+
+Optional. Describes the project this configuration is for.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `kind` | string | -- | Project this file is for: `"linux"` or `"sashiko"`. When set, it is checked against the project selected by `--project` / `SASHIKO_PROJECT`, and a mismatch is an error. When absent, the file is accepted for any project. |
+| `name` | string | `""` | Display name shown in the web UI. |
+| `description` | string | `""` | Short description shown in the web UI. |
+| `domain` | string | `""` | Public hostname used to build links to the web UI in forge comments (`https://<domain>/#/patchset/...`). Falls back to `sashiko.sashiko.dev` when empty. |
+| `attribution` | string | -- | Actor name recorded on bug discoveries. Defaults to `domain`, or `"sashiko"` when neither is set. |
+
 ### `[forge]`
 
 Optional. Controls forge (GitHub/GitLab) webhook integration.
