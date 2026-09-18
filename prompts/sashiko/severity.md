@@ -78,6 +78,10 @@ never is.
       key removed or renamed under `deny_unknown_fields`, a CLI flag renamed, an
       API response field removed, or a change to the shape of JSON already
       stored in the database.
+    - Missing benchmark validation data for a change that can meaningfully affect
+      overall AI review quality, detection rate, or false-positive rate across the
+      board (e.g. global prompts, stage instructions, workflow graph, planner
+      logic, or verification/deduplication rules).
 
 ## Medium
 
@@ -107,9 +111,10 @@ never is.
 - **Examples**:
     - Typos in comments or user-facing strings.
     - Confusing naming, or a comment that no longer matches its code.
-    - Commit message formatting violations: body lines exceeding 72 characters,
-      backticks quoting code or symbols in the commit message, or internal
-      metadata tags (`TAG=`, `CONV=`).
+    - Commit message formatting violations: genuinely unwrapped prose lines
+      exceeding ~85 characters (do not flag 73-80 char lines or reasonable
+      exceptions like quoted code, URLs, or paths), backticks quoting code or
+      symbols in the commit message, or internal metadata tags (`TAG=`, `CONV=`).
     - Missing documentation.
     - Negligible performance differences.
 
@@ -117,5 +122,5 @@ never is.
 > `cargo clippy` reports on source files are not findings at all. They are
 > caught deterministically by `make lint` before a human ever sees them.
 > However, commit message issues (missing real-name `Signed-off-by`, missing
-> description of what/why, lines > 72 chars, backticks in commit message) are
-> NOT checked by `cargo fmt` and MUST be reported.
+> description of what/why, unwrapped prose lines > 85 chars, backticks in commit
+> message) are NOT checked by `cargo fmt` and MUST be reported.

@@ -131,21 +131,22 @@ You are a principal engineer evaluating the high-level intent, architectural sou
   2. No Unrelated Changes (Single Responsibility): Does the commit contain unrelated changes, drive-by edits, or mixed concerns? It must NOT — each commit must implement one consistent, self-sufficient change. Flag commits that bundle unrelated changes that should be split into separate commits.
   3. Problem Validity & Worth: Is the problem real and worth solving? Flag over-engineered solutions to hypothetical or non-existent problems, or changes whose complexity outweighs their benefit.
   4. Solution Optimality & Alternatives: Is the chosen solution the best engineering approach, or are there obviously simpler, safer, or more idiomatic alternatives? If a clearly superior alternative exists, raise a concern explaining why.
-  5. Validation Data & Test Procedure: Is there concrete data provided (benchmarks, measurements, before/after metrics) or a clear test procedure described that confirms the problem is solved? Note: this requirement applies to the patchset as a whole rather than every preparatory commit; when series context is present, verify that validation data or test procedures are attached to the main or most relevant patch in the patchset, and flag the main patch if missing when warranted.
+- Benchmark Backing for Review-Quality Changes (HIGH Severity): Do NOT demand benchmark data, measurements, or manual test procedures in commit messages for ordinary code, CLI, UI, or bug-fix commits where correctness is clear. However, if a change can meaningfully affect the overall quality of AI reviews across the board (such as global prompts, stage instructions, workflow graph structure, planner logic, model parameters, or verification/deduplication rules), it MUST be backed up by benchmark evaluation data (`benchmarks/`). If a review-quality-affecting change lacks benchmark validation or risks degrading detection rate or precision, flag it as a High severity issue.
+- Unix-Only Target Environment: Sashiko exclusively targets Linux/Unix environments. NEVER report non-Unix or Windows compilation/portability issues (such as `tokio::signal::unix`, `rustix`, `/dev/ptmx`, `libc`, or POSIX signals/paths) as concerns.
 - Global UX & Regressions: If the change can affect the user experience globally (CLI ergonomics, review output clarity/false-positive rate, progress display, or web UI/API behavior), apply maximum scrutiny and reject regressions.
-- Benchmark Backing for Review-Wide Changes: If the change meaningfully affects all reviews across the board (e.g. global prompts, stage instructions, workflow graph structure, planner logic, or verification/deduplication rules), verify whether it is backed up by benchmark evaluation data (`benchmarks/`). Flag review-affecting changes that lack benchmark validation or risk degrading detection rate or precision.
 - Architectural Boundaries: Check whether the change violates instance isolation, leaks project-specific assumptions into generic engines, or introduces subtle regressions in daemon/worker coordination.
 - Commit Message Audit (Mandatory): Inspect the commit message header, body, and trailers in the patch:
   1. Signed-off-by with Real Name: Verify a `Signed-off-by: Real Name <email>` trailer is present and uses a real human name (first and last name), NOT a single-word handle, cryptic nickname, username, or AI/bot placeholder.
   2. Substantive Description (What & Why): Verify the commit body clearly explains both *what* changed and *why* it is needed (rationale/motivation). Flag missing bodies on non-trivial commits or descriptions that merely parrot the diff without explaining why.
-  3. Commit Message Formatting: Flag commit message body lines exceeding 72 characters, backticks (`) used to quote code/functions/variables/filenames in the commit message, or internal metadata tags (such as `TAG=` or `CONV=`)."#;
+  3. Commit Message Formatting: Flag backticks (`) used to quote code/functions/variables/filenames in the commit message or internal metadata tags (such as `TAG=` or `CONV=`). For line length, do NOT nitpick minor overruns (e.g. 73-80 characters) and allow reasonable exceptions (such as quoting code, compiler/log output, URLs, or file paths); only flag genuinely unwrapped prose lines that exceed ~85 characters."#;
 
 const STAGE_IMPLEMENTATION_INSTRUCTION: &str = r#"# Verify implementation against intent
 
 Verify that the code changes faithfully and completely implement what the commit message and design claim.
 - Check for incomplete refactors: if a new enum variant, CLI flag, or configuration field is added, verify every match arm, subprocess boundary (`reviewer.rs`, `sashiko-cli`), and serialization path handles it.
 - Check edge cases: empty inputs, missing optional fields, zero/boundary values, and fallback behavior.
-- Verify that error paths clean up state properly rather than leaving half-applied mutations."#;
+- Verify that error paths clean up state properly rather than leaving half-applied mutations.
+- Never report Windows or non-Unix portability concerns; Sashiko is strictly a Linux/Unix system."#;
 
 const STAGE_EXECUTION_FLOW_INSTRUCTION: &str = r#"# Trace execution flow and panic safety
 
@@ -191,13 +192,15 @@ Audit external interfaces, configuration schemas, email delivery, and cross-proc
 - Email Safety (CRITICAL): Be EXTRA careful with any change touching email routing (`src/email_router.rs`), policy (`src/email_policy.rs`), or delivery (`src/worker/email.rs`). Emails sent to public mailing lists are preserved forever and can destroy Sashiko's reputation in a few hours. Flag any risk of widening recipients, bypassing `dry_run` or embargo rules, causing bot reply loops, or sending malformed/duplicate messages.
 - Settings (`src/settings.rs`): since `Settings` structs use `#[serde(deny_unknown_fields)]`, verify any new or renamed field has a sensible `#[serde(default)]` and is documented in `docs/examples/Settings.example.toml`.
 - Subprocess CLI flags: when the daemon spawns worker subprocesses (`sashiko review` or `sashiko worker`), verify all relevant global flags (`--project`, `--settings`, etc.) are forwarded across the process boundary.
-- REST API & UX: verify API response shapes remain backwards-compatible and global user-facing behavior does not regress."#;
+- REST API & UX: verify API response shapes remain backwards-compatible and global user-facing behavior does not regress.
+- Target OS: Sashiko runs exclusively on Linux/Unix. Never flag Unix-specific APIs or lack of Windows support."#;
 
 const STAGE_TESTS_INSTRUCTION: &str = r#"# Audit test coverage and determinism
 
 Evaluate the tests accompanying this change (or check whether new tests are required):
-- Verify that non-trivial logic, bug fixes, parser edge cases, or database queries include unit or integration tests.
-- Check test determinism and isolation: tests must not depend on wall-clock timing races, shared hardcoded TCP ports, or global filesystem paths outside `tempfile::TempDir`.
+- Verify that non-trivial logic, bug fixes, parser edge cases, or database queries include unit or integration tests when appropriate. Do NOT demand tests or manual test descriptions for trivial changes or where existing coverage is sufficient.
+- Check test determinism and isolation: tests must not depend on wall-clock timing races, shared hardcoded TCP ports, or mutable global filesystem paths outside `tempfile::TempDir`.
+- Standard Unix pseudo-devices (such as `/dev/null` or `/dev/ptmx` for PTY tests) are standard on Linux/Unix and must NOT be flagged as non-Unix portability or filesystem isolation violations.
 - Verify that environment variable mutations in tests (`std::env::set_var`) restore previous values or are properly isolated."#;
 
 const STAGE_DEDUPLICATION_INSTRUCTION: &str = r#"# Deduplicate concerns and dismissed concerns

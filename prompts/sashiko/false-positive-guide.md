@@ -28,12 +28,16 @@ else clippy emits on Rust source files.
 
 Note: `make lint` does NOT check commit messages. Commit message defects —
 such as missing or cryptic/nickname `Signed-off-by` trailers, missing
-explanation of *what* and *why*, lines exceeding 72 characters, backticks
-quoting code/symbols in the commit message, or internal metadata tags (`TAG=`,
-`CONV=`) — are valid findings and must NOT be dismissed as linter issues.
+explanation of *what* and *why*, genuinely unwrapped prose lines exceeding ~85
+characters, backticks quoting code/symbols in the commit message, or internal
+metadata tags (`TAG=`, `CONV=`) — are valid findings and must NOT be dismissed
+as linter issues. However, do NOT nitpick commit message lines that are 73-80
+characters long or lines that exceed the margin for reasonable reasons (quoting
+code, compiler/log output, URLs, or file paths).
 
 - Bad: "Consider using `iter()` instead of `into_iter()` here."
 - Bad: "This `clone()` looks unnecessary."
+- Bad: "The commit message body has lines that are 74 characters long."
 - Good: "This `clone()` copies the full patch body on every stage, and
   `max_input_tokens` is already the binding constraint" — a consequence, not a
   style preference.
@@ -101,10 +105,28 @@ broke. Check the surrounding context, not just the `+` lines.
 
 ### 9. Test code
 
-Tests are held to a different standard than production code. A `unwrap` in a
-test is fine. A fixed port, a shared database file, or a dependency on global
-state in a test is *not* fine, because it makes the suite flaky for everyone —
-report those.
+Tests are held to a different standard than production code. An `unwrap` in a
+test is fine. Standard Unix pseudo-devices (such as `/dev/null` or `/dev/ptmx`
+for PTY tests) are completely normal in this Unix-only codebase and must NOT be
+flagged as filesystem isolation or portability violations. A fixed port, a
+shared mutable database file, or a dependency on mutable global state across
+concurrent tests is *not* fine — report those when they cause real cross-test
+interference.
+
+### 10. Non-Unix / Windows compatibility is a non-goal
+
+Sashiko exclusively targets Linux/Unix operating systems. Never report Windows
+or non-Unix portability issues (such as `tokio::signal::unix`, `rustix`,
+`/dev/ptmx`, `libc`, POSIX paths, or Unix signals) as findings.
+
+### 11. Unnecessary demands for validation or benchmark data
+
+Do not ask authors to add manual test procedures, validation logs, or benchmark
+numbers to commit messages for ordinary code, CLI, UI, or bug-fix commits. Only
+demand benchmark validation when a change can meaningfully affect overall AI
+review quality across the board (prompts, stage instructions, workflow graph,
+planner rules, or verification/deduplication logic) — and when such a change
+lacks benchmark backing, classify it as **High** severity.
 
 ## Before you report
 

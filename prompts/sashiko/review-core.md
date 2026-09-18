@@ -89,13 +89,15 @@ design. Any path where untrusted input can influence *which files are read*
 prompts are loaded* (`sanitize_guide_name`), or bypass API/webhook
 authentication is a security boundary.
 
-**5. Benchmark Backing for Global Review Changes.**
-Any change that might meaningfully affect all reviews across the board — such as
+**5. Benchmark Backing for Review-Quality Changes (HIGH Severity).**
+Do not demand benchmark data, measurements, or manual test procedures for ordinary
+code, CLI, UI, or bug-fix commits where correctness is clear. However, any change
+that can meaningfully affect overall AI review quality across the board — such as
 global prompts (`review-core.md`, `severity.md`), stage instructions, workflow
-graph structure, planner rules, or verification/deduplication logic — must be
-backed up by benchmark data (`benchmarks/`). Flag global review changes that
-lack benchmark validation or risk silent regressions in detection rate or
-precision.
+graph structure, planner rules, model parameters, or verification/deduplication
+logic — must be backed up by benchmark data (`benchmarks/`). Flag review-quality
+changes that lack benchmark validation or risk silent regressions in detection
+rate or precision as **High** severity.
 
 **6. Zero Regressions and No Silent Failures.**
 Avoid regressions in CLI flags, `Settings.toml` parsing, or API contracts.
@@ -111,9 +113,12 @@ Every commit message must meet Sashiko's repository standards:
 - **Clear Description (What & Why):** The commit body must explain both *what*
   the change does and *why* it is necessary (motivation/rationale), rather than
   having an empty body or merely repeating the diff.
-- **Formatting & Wrapping:** Commit message lines must not exceed 72 characters,
-  must never use backticks (`) to quote code, function names, or variables, and
-  must not contain internal metadata tags (such as `TAG=` or `CONV=`).
+- **Formatting & Wrapping:** Commit messages must never use backticks (`) to
+  quote code, function names, or variables, and must not contain internal metadata
+  tags (such as `TAG=` or `CONV=`). Do NOT nitpick minor line-length overruns
+  (e.g. 73-80 characters) and allow reasonable exceptions (such as quoting code,
+  compiler/log output, URLs, or file paths); only flag genuinely unwrapped prose
+  lines that exceed ~85 characters.
 
 **8. High-Level Engineering & Patchset Discipline.**
 Evaluate every change for fundamental engineering soundness:
@@ -127,13 +132,13 @@ Evaluate every change for fundamental engineering soundness:
 - **Solution Optimality & Better Alternatives:** Is the chosen solution the best
   engineering approach, or are there obviously simpler, safer, or more idiomatic
   alternatives?
-- **Validation Data & Test Procedure:** Is there concrete data provided (such as
-  benchmarks or measurements) or a clear test procedure described to confirm that
-  the problem is solved? For multi-patch series, this validation evidence should
-  be attached to the main or most relevant patch in the patchset.
 
 ## How to review here
 
+- **Unix-only target environment:** Sashiko exclusively targets Linux/Unix
+  operating systems. Never report Windows or non-Unix portability concerns (such as
+  `tokio::signal::unix`, `rustix`, `/dev/ptmx`, `libc`, or POSIX signals/paths) as
+  issues.
 - **Verify against concrete code, not assumptions.** Read the subsystem guide
   for the area the diff touches and check every invariant. Do not give code the
   benefit of the doubt: if a check is removed or weakened, verify the caller
@@ -141,7 +146,7 @@ Evaluate every change for fundamental engineering soundness:
 - **`cargo` and `clippy` have already run on Rust source code.** Rust source
   formatting, unused imports, and compiler/clippy lints are not findings.
   However, *commit message* defects (missing/nickname SOB, missing rationale,
-  lines > 72 chars, backticks in commit message) are NOT caught by `cargo fmt`
-  and MUST be reported.
+  unwrapped prose lines > 85 chars, backticks in commit message) are NOT caught by
+  `cargo fmt` and MUST be reported.
 - **Prefer one proven finding to three speculative ones.** Every false positive
   spends the author's trust.

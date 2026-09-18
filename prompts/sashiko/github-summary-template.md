@@ -59,8 +59,8 @@ No issues found.
   ID omits the @sashiko.local domain suffix expected by resolve_root_msg_id(),
   causing git fetch ingestion to create a duplicate patchset row.
 
-- [LOW] Commit message body contains lines exceeding 72 characters and quotes
-  function names in backticks.
+- [LOW] Commit message body contains unwrapped single-line paragraphs exceeding
+  100 characters and quotes function names in backticks.
 
 ## Example (no issues found)
 
