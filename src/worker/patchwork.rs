@@ -106,10 +106,19 @@ impl PatchworkWorker {
                             }
                         }
                         Err(e) => {
-                            error!("Patchwork check failed for ID {}: {}", entry.id, e);
+                            match &e {
+                                crate::patchwork::PatchworkCheckError::NotIndexedYet => {
+                                    info!("Patchwork check ID {} not ready yet: {}", entry.id, e);
+                                }
+                                crate::patchwork::PatchworkCheckError::Api(_) => {
+                                    error!("Patchwork check failed for ID {}: {}", entry.id, e);
+                                }
+                            }
                             if entry.retry_count + 1 >= self.max_retries as i64 {
-                                if let Err(db_err) =
-                                    self.db.mark_patchwork_failed(entry.id, &e).await
+                                if let Err(db_err) = self
+                                    .db
+                                    .mark_patchwork_failed(entry.id, &e.to_string())
+                                    .await
                                 {
                                     error!(
                                         "Failed to mark patchwork {} as failed: {}",
